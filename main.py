@@ -176,6 +176,22 @@ class TradingBot:
 
 async def main():
     """메인 함수"""
+    # 프로그램 시작 알림 보내기
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start_message = f"""
+    *주식 자동매매 프로그램 시작*
+    시작 시간: {current_time}
+    
+    자동매매 프로그램이 시작되었습니다.
+    이제부터 거래 및 주요 이벤트에 대한 알림을 받게 됩니다.
+    """
+    
+    try:
+        await alert_system.send_alert(start_message, level="INFO", channel="telegram")
+        logger.log_system("Start notification sent successfully")
+    except Exception as e:
+        logger.log_error(e, "Failed to send start notification")
+    
     bot = TradingBot()
     
     # 시그널 핸들러 설정
