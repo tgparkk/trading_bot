@@ -12,6 +12,7 @@ from utils.logger import logger
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from utils.database import db
 
 class KISAPIClient:
     """한국투자증권 REST API 클라이언트"""
@@ -39,6 +40,11 @@ class KISAPIClient:
         if self.access_token and self.token_expire_time:
             # 만료 1시간 전까지는 기존 토큰 재사용
             if current_time < self.token_expire_time - 3600:
+                db.save_token_log(
+                    event_type="ACCESS",
+                    token=self.access_token,
+                    status="SUCCESS"
+                )
                 return self.access_token
             
             # 만료 1시간 전이면 토큰 갱신
@@ -63,10 +69,25 @@ class KISAPIClient:
             # 토큰 만료 시간 설정 (24시간)
             self.token_expire_time = current_time + (24 * 60 * 60)
             
+            # 토큰 발급 로그 저장
+            db.save_token_log(
+                event_type="ISSUE",
+                token=self.access_token,
+                issue_time=datetime.fromtimestamp(current_time),
+                expire_time=datetime.fromtimestamp(self.token_expire_time),
+                status="SUCCESS"
+            )
+            
             logger.log_system("Access token refreshed successfully")
             return self.access_token
             
         except Exception as e:
+            # 토큰 발급 실패 로그 저장
+            db.save_token_log(
+                event_type="FAIL",
+                status="FAIL",
+                error_message=str(e)
+            )
             logger.log_error(e, "Failed to get access token")
             raise
     

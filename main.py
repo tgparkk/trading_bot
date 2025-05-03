@@ -14,10 +14,12 @@ from config.settings import config
 from core.api_client import api_client
 from core.websocket_client import ws_client
 from core.order_manager import order_manager
+from core.stock_explorer import stock_explorer
 from strategies.scalping_strategy import scalping_strategy
 from utils.logger import logger
 from utils.database import db
 from monitoring.alert_system import alert_system
+from flask import Flask, render_template, jsonify
 
 # 1) .env 파일 경로 지정 (현재 파일 기준)
 env_path = Path(__file__).parent / '.env'
@@ -86,7 +88,7 @@ class TradingBot:
                 
                 # 장 시간 체크
                 if self._is_market_open(current_time):
-                    # 30분마다 종목 재탐색
+                    # 10분마다 종목 재탐색
                     # Note: 2분은 너무 짧은 주기로, API 호출 제한과 서버 부하를 고려하여 10분으로 설정
                     if (datetime.now() - last_symbol_search).total_seconds() >= 600:
                         new_symbols = await self._get_tradable_symbols()
@@ -115,62 +117,8 @@ class TradingBot:
     
     async def _get_tradable_symbols(self) -> List[str]:
         """거래 가능 종목 조회 (필터링 포함)"""
-        # 1) 거래량 순위 API 호출
-        vol_data = api_client.get_market_trading_volume()  # :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
-        if vol_data.get("rt_cd") != "0":
-            logger.log_error("거래량 순위 조회 실패")
-            return []
-
-        raw_list = vol_data["output2"][:200]  # 상위 200개만 우선 추출 :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
-        f = self.trading_config.filters
-
-        end_date   = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=f["avg_vol_days"])).strftime("%Y%m%d")
-
-        candidates = []
-        for item in raw_list:
-            symbol = item["mksc_shrn_iscd"]
-            today_vol = int(item.get("prdy_vrss_vol", 0))  # 실제 필드명 확인 필요
-
-            # 2) 30일 일별 시세 조회 → 거래량·종가 리스트 확보
-            daily = api_client.get_daily_price(symbol, start_date, end_date)
-            if daily.get("rt_cd") != "0":
-                continue
-            days = daily["output2"]
-            vols   = [int(d["acml_vol"])  for d in days]      # 일별 누적거래량
-            closes = [float(d["stck_clpr"]) for d in days]     # 일별 종가
-
-            # 3) 평균 거래량 필터
-            avg_vol = sum(vols) / len(vols)
-            if avg_vol < f["min_avg_volume"]:
-                continue
-
-            # 4) 거래량 급증 필터
-            if today_vol / avg_vol < f["vol_spike_ratio"]:
-                continue
-
-            # 5) 현재가 필터
-            price_data = api_client.get_current_price(symbol)
-            if price_data.get("rt_cd") != "0":
-                continue
-            price = float(price_data["output"]["stck_prpr"])
-            if not (f["price_min"] <= price <= f["price_max"]):
-                continue
-
-            # 6) 단기 변동성 필터 (절대 수익률의 평균)
-            changes = [
-                abs((closes[i] - closes[i-1]) / closes[i-1])
-                for i in range(1, len(closes))
-            ]
-            volat = sum(changes) / len(changes)
-            if volat > f["max_volatility"]:
-                continue
-
-            candidates.append((symbol, today_vol))
-
-        # 7) 거래량 기준 내림차순 정렬 후 상위 N개 심볼 반환
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return [sym for sym, _ in candidates[: f["max_symbols"]]]
+        # 새로운 StockExplorer 활용
+        return await stock_explorer.get_tradable_symbols()
     
     def _is_market_open(self, current_time: time) -> bool:
         """장 시간 확인"""
@@ -246,8 +194,6 @@ async def main():
         await bot.shutdown(error=str(e))
 
 if __name__ == "__main__":
-
-
     # 환경 변수 체크
     required_env_vars = [
         "KIS_BASE_URL",
