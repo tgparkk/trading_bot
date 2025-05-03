@@ -3,7 +3,7 @@
 """
 import asyncio
 from typing import Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from collections import deque
 from config.settings import config
 from core.api_client import api_client
@@ -102,10 +102,70 @@ class ScalpingStrategy:
         except Exception as e:
             logger.log_error(e, "Error handling orderbook update")
     
+    async def _handle_market_close(self):
+        """장 마감 처리"""
+        try:
+            logger.log_system("Handling market close...")
+            
+            # 1. 모든 포지션 청산
+            for symbol, position in list(self.positions.items()):
+                try:
+                    # 현재가 조회
+                    price_data = api_client.get_current_price(symbol)
+                    if price_data.get("rt_cd") == "0":
+                        current_price = float(price_data["output"]["stck_prpr"])
+                        
+                        # 포지션 청산
+                        await order_manager.place_order(
+                            symbol=symbol,
+                            side="SELL" if position["side"] == "BUY" else "BUY",
+                            quantity=position["quantity"],
+                            order_type="MARKET",
+                            strategy="scalping",
+                            reason="market_close"
+                        )
+                        
+                        logger.log_system(f"Closed position for {symbol} at market close")
+                        
+                except Exception as e:
+                    logger.log_error(e, f"Failed to close position for {symbol}")
+            
+            # 2. 웹소켓 구독 해제
+            for symbol in self.watched_symbols:
+                try:
+                    await ws_client.unsubscribe(symbol, "price")
+                    await ws_client.unsubscribe(symbol, "orderbook")
+                except Exception as e:
+                    logger.log_error(e, f"Failed to unsubscribe {symbol}")
+            
+            # 3. 데이터 초기화
+            self.price_data.clear()
+            self.volume_data.clear()
+            self.positions.clear()
+            self.watched_symbols.clear()
+            
+            # 4. 전략 중지
+            self.running = False
+            
+            logger.log_system("Market close handling completed")
+            
+        except Exception as e:
+            logger.log_error(e, "Market close handling error")
+            await alert_system.notify_error(e, "Market close error")
+    
     async def _strategy_loop(self):
         """전략 실행 루프"""
         while self.running:
             try:
+                # 장 시간 체크
+                current_time = datetime.now().time()
+                if not (time(9, 0) <= current_time <= time(15, 30)):
+                    if current_time > time(15, 30):
+                        await self._handle_market_close()
+                        break
+                    await asyncio.sleep(60)
+                    continue
+                
                 for symbol in self.watched_symbols:
                     await self._analyze_and_trade(symbol)
                 
@@ -332,6 +392,43 @@ class ScalpingStrategy:
                     
         except Exception as e:
             logger.log_error(e, "Position monitoring error")
+
+    async def update_symbols(self, new_symbols: List[str]):
+        """관심 종목 업데이트"""
+        try:
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
+            
+            # 구독 해제할 종목들 (기존에 있던 종목 중 새로운 목록에 없는 것)
+            to_unsubscribe = self.watched_symbols - new_set
+            
+            # 새로 구독할 종목들 (새로운 목록에 있던 종목 중 기존에 없던 것)
+            to_subscribe = new_set - self.watched_symbols
+            
+            # 구독 해제
+            for symbol in to_unsubscribe:
+                await ws_client.unsubscribe(symbol, "price")
+                await ws_client.unsubscribe(symbol, "orderbook")
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.volume_data:
+                    del self.volume_data[symbol]
+            
+            # 새로 구독
+            for symbol in to_subscribe:
+                self.price_data[symbol] = deque(maxlen=self.params["tick_window"])
+                self.volume_data[symbol] = deque(maxlen=self.params["tick_window"])
+                await ws_client.subscribe_price(symbol, self._handle_price_update)
+                await ws_client.subscribe_orderbook(symbol, self._handle_orderbook_update)
+            
+            # 관심 종목 업데이트
+            self.watched_symbols = new_set
+            
+            logger.log_system(f"Updated watched symbols: {len(self.watched_symbols)}")
+            
+        except Exception as e:
+            logger.log_error(e, "Failed to update symbols")
+            await alert_system.notify_error(e, "Symbol update error")
 
 # 싱글톤 인스턴스
 scalping_strategy = ScalpingStrategy()

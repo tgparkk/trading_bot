@@ -60,6 +60,7 @@ class OrderManager:
                 if price is None:
                     price_data = api_client.get_current_price(symbol)
                     price = float(price_data["output"]["stck_prpr"])
+                
                 order_result = api_client.place_order(
                     symbol=symbol,
                     order_type="LIMIT",
@@ -205,16 +206,50 @@ class OrderManager:
                 )
                 return False
             
-            # 손실 한도 체크
+            # 일일 손실 한도 체크
             if self.daily_pnl < -self.trading_config.max_loss_rate * 100000000:  # 1억 기준
                 logger.log_system("Risk check failed: Daily loss limit reached")
                 return False
+            
+            # 종목별 최대 포지션 수량 체크
+            current_position = self.positions.get(symbol, {"quantity": 0})
+            if side == "BUY" and current_position["quantity"] + quantity > self.trading_config.max_position_per_symbol:
+                logger.log_system(f"Risk check failed: Max position per symbol reached for {symbol}")
+                return False
+            
+            # 변동성 체크
+            price_data = api_client.get_daily_price(symbol)
+            if price_data.get("rt_cd") == "0":
+                prices = [float(d["stck_clpr"]) for d in price_data["output2"]]
+                volatility = self._calculate_volatility(prices)
+                if volatility > self.trading_config.max_volatility:
+                    logger.log_system(f"Risk check failed: High volatility for {symbol}")
+                    return False
+            
+            # 거래량 체크
+            volume_data = api_client.get_market_trading_volume()
+            if volume_data.get("rt_cd") == "0":
+                symbol_volume = next((item for item in volume_data["output2"] if item["mksc_shrn_iscd"] == symbol), None)
+                if symbol_volume and int(symbol_volume.get("prdy_vrss_vol", 0)) < self.trading_config.min_daily_volume:
+                    logger.log_system(f"Risk check failed: Low trading volume for {symbol}")
+                    return False
             
             return True
             
         except Exception as e:
             logger.log_error(e, "Risk check error")
             return False
+            
+    def _calculate_volatility(self, prices: List[float]) -> float:
+        """변동성 계산"""
+        if len(prices) < 2:
+            return 0
+            
+        returns = []
+        for i in range(1, len(prices)):
+            returns.append((prices[i] - prices[i-1]) / prices[i-1])
+            
+        return sum(abs(r) for r in returns) / len(returns)
     
     async def check_positions(self):
         """포지션 체크 - 손절/익절"""

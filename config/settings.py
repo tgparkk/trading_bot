@@ -29,6 +29,7 @@ class TradingConfig:
     market_close: time = time(15, 30)
     scalping_params: Dict[str, Any] = None
     filters: Dict[str, Any] = None
+    risk_params: Dict[str, Any] = None
 
     def __post_init__(self):
         if self.scalping_params is None:
@@ -37,8 +38,8 @@ class TradingConfig:
                 "volume_multiplier": 1.5,
                 "price_change_threshold": 0.002,
                 "hold_time": 60,
-                "stop_loss": 0.005,
-                "take_profit": 0.01,
+                "stop_loss": 0.02,  # -2% 손절
+                "take_profit": 0.015,  # 1.5% 익절
             }
         if self.filters is None:
             self.filters = {
@@ -49,6 +50,16 @@ class TradingConfig:
                 "vol_spike_ratio": 2.0,
                 "max_volatility": 0.03,
                 "max_symbols": 50,
+            }
+        if self.risk_params is None:
+            self.risk_params = {
+                "max_position_size": 10_000_000,  # 최대 포지션 크기 (1천만원)
+                "max_position_per_symbol": 5_000_000,  # 종목별 최대 포지션 (5백만원)
+                "max_loss_rate": 0.02,  # 일일 최대 손실률 (2%)
+                "max_volatility": 0.05,  # 최대 허용 변동성 (5%)
+                "min_daily_volume": 100_000,  # 최소 일일 거래량
+                "max_trades_per_day": 50,  # 일일 최대 거래 횟수
+                "max_open_positions": 10,  # 최대 동시 포지션 수
             }
 
 @dataclass

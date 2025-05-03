@@ -29,13 +29,22 @@ class KISAPIClient:
         
         self.access_token      = None
         self.token_expire_time = None
+        self.token_issue_time  = None
         
     def _get_access_token(self) -> str:
         """접근 토큰 발급/갱신"""
-        if self.access_token and self.token_expire_time:
-            if datetime.now().timestamp() < self.token_expire_time:
-                return self.access_token
+        current_time = datetime.now().timestamp()
         
+        # 토큰이 있고 만료되지 않았으면 재사용
+        if self.access_token and self.token_expire_time:
+            # 만료 1시간 전까지는 기존 토큰 재사용
+            if current_time < self.token_expire_time - 3600:
+                return self.access_token
+            
+            # 만료 1시간 전이면 토큰 갱신
+            logger.log_system("Token will expire soon, refreshing...")
+        
+        # 토큰 발급/갱신
         url = f"{self.base_url}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
         body = {
@@ -50,8 +59,9 @@ class KISAPIClient:
             token_data = response.json()
             
             self.access_token = token_data["access_token"]
-            # 토큰 만료 시간 설정 (12시간)
-            self.token_expire_time = datetime.now().timestamp() + (12 * 60 * 60)
+            self.token_issue_time = current_time
+            # 토큰 만료 시간 설정 (24시간)
+            self.token_expire_time = current_time + (24 * 60 * 60)
             
             logger.log_system("Access token refreshed successfully")
             return self.access_token
@@ -80,7 +90,7 @@ class KISAPIClient:
             raise
     
     def _make_request(self, method: str, path: str, headers: Dict = None, 
-                     params: Dict = None, data: Dict = None) -> Dict[str, Any]:
+                     params: Dict = None, data: Dict = None, max_retries: int = 3) -> Dict[str, Any]:
         """API 요청 실행"""
         url = f"{self.base_url}{path}"
         
@@ -94,18 +104,39 @@ class KISAPIClient:
         if headers:
             default_headers.update(headers)
         
-        try:
-            if method.upper() == "GET":
-                response = requests.get(url, headers=default_headers, params=params)
-            else:
-                response = requests.post(url, headers=default_headers, json=data)
+        for attempt in range(max_retries):
+            try:
+                if method.upper() == "GET":
+                    response = requests.get(url, headers=default_headers, params=params)
+                else:
+                    response = requests.post(url, headers=default_headers, json=data)
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                # API 응답 코드 체크
+                if result.get("rt_cd") != "0":
+                    error_msg = result.get("msg1", "Unknown error")
+                    logger.log_error(f"API error: {error_msg}")
+                    
+                    # 토큰 만료 에러인 경우 토큰 갱신 후 재시도
+                    if "token" in error_msg.lower() and attempt < max_retries - 1:
+                        self.access_token = None  # 토큰 강제 갱신
+                        continue
+                    
+                    raise Exception(f"API error: {error_msg}")
+                
+                return result
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 지수 백오프
+                    logger.log_error(f"Request failed, retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                raise
             
-            response.raise_for_status()
-            return response.json()
-            
-        except Exception as e:
-            logger.log_error(e, f"API request failed: {method} {path}")
-            raise
+        raise Exception("Max retries exceeded")
     
     def get_current_price(self, symbol: str) -> Dict[str, Any]:
         """현재가 조회"""

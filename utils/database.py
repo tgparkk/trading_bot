@@ -12,9 +12,17 @@ from utils.logger import logger
 class Database:
     """트레이딩 데이터베이스"""
     
-    def __init__(self):
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+    
+    def _initialize(self):
         db_cfg = config.get("database", DatabaseConfig())
-        self.db_path         = db_cfg.db_path
+        self.db_path = db_cfg.db_path
         self.backup_interval = db_cfg.backup_interval
         self._initialize_db()
     
@@ -313,5 +321,5 @@ class Database:
         
         logger.log_system(f"Database backed up to {backup_path}")
 
-# 싱글톤 인스턴스
+# 싱글톤 인스턴스 생성
 db = Database()
