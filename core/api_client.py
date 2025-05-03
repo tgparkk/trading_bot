@@ -393,15 +393,30 @@ class KISAPIClient:
         return self._make_request("GET", path, headers=headers, params=params)
     
     def get_market_trading_volume(self, market: str = "ALL") -> Dict[str, Any]:
-        """시장 전체 거래량 조회"""
+        """시장 전체 거래량 조회
+        
+        Args:
+            market (str): 시장 구분 (ALL: 전체, KOSPI: 코스피, KOSDAQ: 코스닥)
+        
+        Returns:
+            Dict[str, Any]: API 응답 데이터
+        """
         path = "/uapi/domestic-stock/v1/quotations/volume-rank"
         headers = {
             "tr_id": "FHPST01710000"
         }
+        
+        # 시장 코드 변환
+        market_code = {
+            "ALL": "0000",     # 전체
+            "KOSPI": "0001",   # 코스피
+            "KOSDAQ": "1001"   # 코스닥
+        }.get(market, "0000")  # 기본값은 전체
+        
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_COND_SCR_DIV_CODE": "20171",
-            "FID_INPUT_ISCD": "0000" if market == "ALL" else "0001",  # 0000: 전체, 0001: 코스피
+            "FID_INPUT_ISCD": market_code,
             "FID_DIV_CLS_CODE": "0",
             "FID_BLNG_CLS_CODE": "0",
             "FID_TRGT_CLS_CODE": "111111111",

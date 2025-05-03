@@ -16,11 +16,25 @@ class StockExplorer:
         self.config = config["trading"]
         self.filters = self.config.filters
     
-    async def get_tradable_symbols(self) -> List[str]:
-        """거래 가능 종목 조회 (필터링 포함)"""
+    async def get_tradable_symbols(self, market_type: str = "ALL") -> List[str]:
+        """거래 가능 종목 조회 (필터링 포함)
+        
+        Args:
+            market_type (str): 시장 구분 ("ALL": 전체, "KOSPI": 코스피, "KOSDAQ": 코스닥)
+        
+        Returns:
+            List[str]: 거래 가능 종목 목록
+        """
         try:
             # 1) 거래량 순위 API 호출
-            vol_data = api_client.get_market_trading_volume()
+            # 시장 코드 변환 (ALL: 전체, KOSPI: 코스피, KOSDAQ: 코스닥)
+            market_code = {
+                "ALL": "ALL", 
+                "KOSPI": "KOSPI", 
+                "KOSDAQ": "KOSDAQ"
+            }.get(market_type, "ALL")
+            
+            vol_data = api_client.get_market_trading_volume(market=market_code)
             if vol_data.get("rt_cd") != "0":
                 logger.log_error("거래량 순위 조회 실패")
                 self._log_search_failure("거래량 순위 조회 실패")

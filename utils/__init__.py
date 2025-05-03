@@ -1,3 +1,6 @@
-from .logger import logger
+"""
+유틸리티 모듈
+"""
 
-__all__ = ['logger']
+# 직접 import 방지 (순환 참조 문제)
+__all__ = ['logger', 'dotenv_helper']

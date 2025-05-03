@@ -1,5 +1,5 @@
 @echo off
-echo Starting Trading Bot Dashboard (Backend and Frontend)...
+echo Starting Trading Bot Dashboard (Backend, Frontend, and Telegram Bot)...
 
 REM 현재 디렉토리 저장
 set ORIGINAL_DIR=%CD%
@@ -16,7 +16,14 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-REM 먼저 백엔드 서버를 별도의 프로세스로 시작
+REM 텔레그램 봇을 별도의 프로세스로 시작
+echo Starting Telegram bot service...
+start cmd /k "cd %ORIGINAL_DIR% && python start_telegram_bot.py"
+
+REM 잠시 대기
+timeout /t 2 /nobreak > nul
+
+REM 백엔드 서버를 별도의 프로세스로 시작
 echo Starting backend server at http://localhost:5050...
 start cmd /k "cd %ORIGINAL_DIR%\backend && python app.py"
 
