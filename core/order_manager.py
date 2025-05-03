@@ -57,6 +57,9 @@ class OrderManager:
                     quantity=quantity
                 )
             else:
+                if price is None:
+                    price_data = api_client.get_current_price(symbol)
+                    price = float(price_data["output"]["stck_prpr"])
                 order_result = api_client.place_order(
                     symbol=symbol,
                     order_type="LIMIT",
@@ -149,11 +152,11 @@ class OrderManager:
                         (current_position["quantity"] * current_position["avg_price"]) +
                         (quantity * price)
                     ) / new_quantity
+                    current_position["quantity"] = new_quantity
+                    current_position["avg_price"] = new_avg_price
                 else:
-                    new_avg_price = price
-                
-                current_position["quantity"] = new_quantity
-                current_position["avg_price"] = new_avg_price
+                    current_position["quantity"] = 0
+                    current_position["avg_price"] = 0
                 
             else:  # SELL
                 # 매도 - 실현손익 계산
