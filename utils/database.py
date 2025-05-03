@@ -20,23 +20,80 @@ class Database:
             cls._instance._initialize()
         return cls._instance
     
-    def _initialize(self):
+    def _initialize(self, _force_initialize=False):
         db_cfg = config.get("database", DatabaseConfig())
         self.db_path = db_cfg.db_path
         self.backup_interval = db_cfg.backup_interval
-        self._initialize_db()
+        self._initialize_db(_force_initialize)
     
     @contextmanager
-    def get_connection(self):
-        """데이터베이스 연결 컨텍스트 매니저"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
-        try:
-            yield conn
-        finally:
-            conn.close()
+    def get_connection(self, max_retries=3, retry_delay=0.5):
+        """데이터베이스 연결 컨텍스트 매니저
+        
+        Args:
+            max_retries: 연결 시도 최대 횟수
+            retry_delay: 재시도 간 대기 시간(초)
+            
+        Yields:
+            sqlite3.Connection: 데이터베이스 연결 객체
+        """
+        conn = None
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=10)  # 10초 타임아웃 설정
+                conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
+                yield conn
+                
+                # 예외 없이 종료된 경우 커밋
+                if conn:
+                    conn.commit()
+                
+                # 성공적으로 완료됨
+                return
+            except sqlite3.OperationalError as e:
+                last_exception = e
+                
+                # 데이터베이스 잠금 오류인 경우 재시도
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    conn = None
+                    logger.log_system(f"데이터베이스 잠금 오류, {retry_delay}초 후 재시도 ({attempt+1}/{max_retries})", level="WARNING")
+                    time.sleep(retry_delay)
+                else:
+                    # 최대 시도 횟수 초과하거나 다른 오류
+                    if conn:
+                        try:
+                            conn.rollback()
+                            conn.close()
+                        except Exception:
+                            pass
+                    logger.log_error(e, f"데이터베이스 연결 오류 (시도 {attempt+1}/{max_retries})")
+                    raise
+            except Exception as e:
+                last_exception = e
+                if conn:
+                    try:
+                        conn.rollback()
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                # 마지막 시도에서 실패했고 아직 연결이 열려있으면 닫기
+                if attempt == max_retries - 1 and conn and last_exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
     
-    def _initialize_db(self):
+    def _initialize_db(self, force_initialize=False):
         """데이터베이스 초기화"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -150,6 +207,47 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # 텔레그램 메시지 로그 테이블이 존재하는지 확인
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_messages'")
+            telegram_table_exists = cursor.fetchone() is not None
+            
+            # 테이블이 없거나 강제 초기화가 요청된 경우 생성
+            if not telegram_table_exists or force_initialize:
+                # 기존 테이블이 있으면 삭제
+                if telegram_table_exists and force_initialize:
+                    cursor.execute("DROP TABLE telegram_messages")
+                
+                # 텔레그램 메시지 로그 테이블
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS telegram_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        direction TEXT NOT NULL,  -- INCOMING/OUTGOING
+                        chat_id TEXT NOT NULL,
+                        message_text TEXT,
+                        command TEXT,  -- 명령어인 경우 해당 명령어
+                        message_id TEXT,  -- 텔레그램에서 제공하는 메시지 ID
+                        update_id INTEGER,  -- 텔레그램 업데이트 ID
+                        is_command BOOLEAN DEFAULT 0,  -- 명령어 여부
+                        processed BOOLEAN DEFAULT 0,  -- 처리 완료 여부
+                        status TEXT,  -- SUCCESS/FAIL
+                        error_message TEXT,
+                        reply_to TEXT,  -- 답장 대상 메시지 ID
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                logger.log_system("Telegram messages table created or re-initialized")
+            else:
+                # 테이블이 존재하는 경우 reply_to 필드가 있는지 확인
+                cursor.execute("PRAGMA table_info(telegram_messages)")
+                columns = cursor.fetchall()
+                column_names = [column[1] for column in columns]
+                
+                # reply_to 필드가 없으면 추가
+                if 'reply_to' not in column_names:
+                    cursor.execute("ALTER TABLE telegram_messages ADD COLUMN reply_to TEXT")
+                    logger.log_system("Added reply_to column to telegram_messages table")
             
             conn.commit()
             logger.log_system("Database initialized successfully")
@@ -442,6 +540,162 @@ class Database:
             
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def save_telegram_message(self, direction: str, chat_id: str, message_text: str,
+                             message_id: str = None, update_id: int = None, 
+                             is_command: bool = False, command: str = None,
+                             processed: bool = False, status: str = "SUCCESS",
+                             error_message: str = None, reply_to: str = None):
+        """텔레그램 메시지 저장
+        
+        Args:
+            direction: 메시지 방향 (INCOMING/OUTGOING)
+            chat_id: 텔레그램 채팅 ID
+            message_text: 메시지 내용
+            message_id: 텔레그램 메시지 ID (수신 메시지인 경우)
+            update_id: 텔레그램 업데이트 ID (수신 메시지인 경우)
+            is_command: 명령어 여부
+            command: 명령어 (is_command가 True인 경우)
+            processed: 처리 완료 여부
+            status: 상태 (SUCCESS/FAIL)
+            error_message: 오류 메시지 (status가 FAIL인 경우)
+            reply_to: 답장 대상 메시지 ID
+            
+        Returns:
+            새로운 메시지의 ID
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO telegram_messages (
+                    direction, chat_id, message_text, message_id, update_id,
+                    is_command, command, processed, status, error_message, reply_to
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                direction,
+                str(chat_id),
+                message_text,
+                message_id,
+                update_id,
+                1 if is_command else 0,
+                command,
+                1 if processed else 0,
+                status,
+                error_message,
+                reply_to
+            ))
+            
+            db_message_id = cursor.lastrowid
+            conn.commit()
+            return db_message_id
+    
+    def update_telegram_message(self, db_message_id: int, message_id: str = None, 
+                              status: str = None, error_message: str = None):
+        """텔레그램 메시지 업데이트 (outgoing 메시지의 실제 전송 결과를 업데이트)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            set_parts = []
+            params = []
+            
+            if message_id is not None:
+                set_parts.append("message_id = ?")
+                params.append(message_id)
+                
+            if status is not None:
+                set_parts.append("status = ?")
+                params.append(status)
+                
+            if error_message is not None:
+                set_parts.append("error_message = ?")
+                params.append(error_message)
+                
+            if not set_parts:
+                return  # 업데이트할 내용이 없음
+                
+            params.append(db_message_id)
+            
+            query = f"UPDATE telegram_messages SET {', '.join(set_parts)} WHERE id = ?"
+            cursor.execute(query, params)
+            
+            conn.commit()
+            
+    def update_telegram_message_status(self, message_id: str, processed: bool = True, 
+                                     status: str = "SUCCESS", error_message: str = None):
+        """텔레그램 메시지 상태 업데이트"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE telegram_messages
+                SET processed = ?, status = ?, error_message = ?
+                WHERE message_id = ?
+            """, (
+                1 if processed else 0,
+                status,
+                error_message,
+                message_id
+            ))
+            
+            conn.commit()
+    
+    def get_telegram_messages(self, direction: str = None, chat_id: str = None,
+                            is_command: bool = None, processed: bool = None,
+                            start_date: str = None, end_date: str = None,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+        """텔레그램 메시지 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            query = "SELECT * FROM telegram_messages WHERE 1=1"
+            params = []
+            
+            if direction:
+                query += " AND direction = ?"
+                params.append(direction)
+            
+            if chat_id:
+                query += " AND chat_id = ?"
+                params.append(str(chat_id))
+            
+            if is_command is not None:
+                query += " AND is_command = ?"
+                params.append(1 if is_command else 0)
+            
+            if processed is not None:
+                query += " AND processed = ?"
+                params.append(1 if processed else 0)
+            
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date)
+            
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """현재 시스템 상태 조회"""
+        status = self.get_latest_system_status()
+        if not status:
+            return {
+                "status": "UNKNOWN",
+                "updated_at": datetime.now().isoformat(),
+                "error_message": None
+            }
+        
+        return {
+            "status": status["status"],
+            "updated_at": status["created_at"],
+            "error_message": status["error_message"]
+        }
 
 # 싱글톤 인스턴스 생성
 db = Database()

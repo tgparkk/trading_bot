@@ -295,28 +295,60 @@ class OrderManager:
             logger.log_error(e, "Position check error")
     
     async def get_daily_summary(self) -> Dict[str, Any]:
-        """일일 요약"""
+        """일일 거래 요약"""
         try:
-            trades = db.get_trades(start_date=datetime.now().strftime("%Y-%m-%d"))
-            
-            winning_trades = sum(1 for t in trades if t.get("pnl", 0) > 0)
-            losing_trades = sum(1 for t in trades if t.get("pnl", 0) < 0)
-            
-            win_rate = winning_trades / len(trades) if trades else 0
-            
             return {
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_trades": len(trades),
-                "winning_trades": winning_trades,
-                "losing_trades": losing_trades,
-                "win_rate": win_rate,
-                "total_pnl": self.daily_pnl,
-                "positions": len(self.positions)
+                "daily_pnl": self.daily_pnl,
+                "daily_trades": self.daily_trades
             }
-            
         except Exception as e:
-            logger.log_error(e, "Daily summary error")
-            return {}
+            logger.log_error(e, "Failed to get daily summary")
+            return {"daily_pnl": 0, "daily_trades": 0}
+    
+    async def get_today_orders(self) -> List[Dict[str, Any]]:
+        """오늘 생성된 주문 목록 조회"""
+        try:
+            # 오늘 날짜 기준 시작 시간과 종료 시간
+            today = datetime.now().date()
+            start_date = f"{today.strftime('%Y-%m-%d')} 00:00:00"
+            end_date = f"{today.strftime('%Y-%m-%d')} 23:59:59"
+            
+            # DB에서 오늘 생성된 주문 조회
+            with db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM orders 
+                    WHERE created_at BETWEEN ? AND ?
+                    ORDER BY created_at DESC
+                """, (start_date, end_date))
+                
+                today_orders = [dict(row) for row in cursor.fetchall()]
+            
+            return today_orders
+        except Exception as e:
+            logger.log_error(e, "Failed to get today's orders")
+            return []
+    
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """보유 포지션 목록 조회"""
+        try:
+            # DB에서 보유 중인 포지션 조회
+            positions = db.get_all_positions()
+            
+            # 메모리에 있는 포지션 정보도 확인하여 최신 정보 유지
+            result = []
+            for pos in positions:
+                symbol = pos["symbol"]
+                # 메모리에 있는 정보가 있으면 그것을 사용, 없으면 DB에서 조회한 정보 사용
+                if symbol in self.positions:
+                    result.append(self.positions[symbol])
+                else:
+                    result.append(pos)
+            
+            return result
+        except Exception as e:
+            logger.log_error(e, "Failed to get positions")
+            return []
 
 # 싱글톤 인스턴스
 order_manager = OrderManager()

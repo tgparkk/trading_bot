@@ -10,13 +10,39 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 from config.settings import config, AlertConfig
 from utils.logger import logger
+import os
 
 class AlertSystem:
     """알림 시스템"""
     
     def __init__(self):
         self.alert_config = config.get("alert", AlertConfig())
-        self.telegram_bot_url = f"https://api.telegram.org/bot{self.alert_config.telegram_token}/sendMessage"
+        # 토큰과 채팅 ID 설정 확인
+        self.token = self.alert_config.telegram_token
+        self.chat_id = self.alert_config.telegram_chat_id
+        
+        # 하드코딩된 기본값 대신 환경변수나 설정에서 로드된 값 사용
+        if self.token == "your_telegram_bot_token" or not self.token:
+            logger.log_warning("텔레그램 토큰이 기본값이거나 설정되지 않았습니다.")
+            # 환경변수에서 직접 로드 시도
+            env_token = os.getenv("TELEGRAM_TOKEN")
+            if env_token:
+                self.token = env_token
+                logger.log_system(f"환경변수에서 텔레그램 토큰을 로드했습니다: {self.token[:10]}...")
+        
+        if self.chat_id == "your_chat_id" or not self.chat_id:
+            logger.log_warning("텔레그램 채팅 ID가 기본값이거나 설정되지 않았습니다.")
+            # 환경변수에서 직접 로드 시도
+            env_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+            if env_chat_id:
+                self.chat_id = env_chat_id
+                logger.log_system(f"환경변수에서 텔레그램 채팅 ID를 로드했습니다: {self.chat_id}")
+        
+        # 로그 남기기
+        logger.log_system(f"텔레그램 설정 - 토큰: {self.token[:10]}..., 채팅 ID: {self.chat_id}")
+        
+        # URL 생성
+        self.telegram_bot_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
     
     async def send_alert(self, message: str, level: str = "INFO", 
                         channel: str = "all"):
@@ -52,7 +78,7 @@ class AlertSystem:
             formatted_message = f"{emoji} *{level}*\n\n{message}"
             
             payload = {
-                "chat_id": self.alert_config.telegram_chat_id,
+                "chat_id": self.chat_id,
                 "text": formatted_message,
                 "parse_mode": "Markdown"
             }

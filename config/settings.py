@@ -2,6 +2,10 @@ import os
 from typing import Dict, Any
 from dataclasses import dataclass
 from datetime import time
+from utils.dotenv_helper import dotenv_helper
+
+# 환경 변수 로드 확인
+dotenv_helper.load_env()
 
 @dataclass
 class APIConfig:
@@ -15,11 +19,11 @@ class APIConfig:
     @classmethod
     def from_env(cls) -> "APIConfig":
         return cls(
-            base_url=os.getenv("KIS_BASE_URL", ""),
-            app_key=os.getenv("KIS_APP_KEY", ""),
-            app_secret=os.getenv("KIS_APP_SECRET", ""),
-            account_no=os.getenv("KIS_ACCOUNT_NO", ""),
-            ws_url=os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000"),
+            base_url=dotenv_helper.get_value("KIS_BASE_URL", ""),
+            app_key=dotenv_helper.get_value("KIS_APP_KEY", ""),
+            app_secret=dotenv_helper.get_value("KIS_APP_SECRET", ""),
+            account_no=dotenv_helper.get_value("KIS_ACCOUNT_NO", ""),
+            ws_url=dotenv_helper.get_value("KIS_WS_URL", "ws://ops.koreainvestment.com:21000"),
         )
 
 @dataclass
@@ -80,11 +84,12 @@ class DatabaseConfig:
 
 class AlertConfig:
     """알림 설정"""
-    telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
-    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    email_sender: str = os.getenv("EMAIL_SENDER", "")
-    email_password: str = os.getenv("EMAIL_PASSWORD", "")
-    email_receiver: str = os.getenv("EMAIL_RECEIVER", "")
+    # 환경 변수에서 텔레그램과 이메일 설정 로드
+    telegram_token: str = dotenv_helper.get_value("TELEGRAM_TOKEN", "")
+    telegram_chat_id: str = dotenv_helper.get_value("TELEGRAM_CHAT_ID", "")
+    email_sender: str = dotenv_helper.get_value("EMAIL_SENDER", "")
+    email_password: str = dotenv_helper.get_value("EMAIL_PASSWORD", "")
+    email_receiver: str = dotenv_helper.get_value("EMAIL_RECEIVER", "")
 
     # 알림 조건
     alert_on_error: bool = True

@@ -1,22 +1,13 @@
 @echo off
-echo Starting Trading Bot...
+echo 주식 자동매매 프로그램 시작 스크립트 v1.0
+echo =================================================
 
-REM 가상환경 활성화
-call venv\Scripts\activate
+:: Python 환경 설정
+set PYTHONPATH=%~dp0
+set PYTHONUNBUFFERED=1
 
-REM 환경 변수 로드
-if exist .env (
-    echo Loading environment variables...
-    for /f "delims== tokens=1,2" %%G in (.env) do set %%G=%%H
-) else (
-    echo Error: .env file not found!
-    echo Please copy .env.example to .env and fill in your API credentials.
-    pause
-    exit /b 1
-)
-
-REM 봇 실행
+:: 프로그램 실행
 python main.py
 
-REM 종료 시 일시 정지
+:: 종료 대기
 pause
