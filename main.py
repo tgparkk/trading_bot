@@ -77,12 +77,25 @@ class TradingBot:
             # 전략 시작
             await scalping_strategy.start(symbols[:50])  # 상위 50종목만
             
+            # 마지막 종목 탐색 시간
+            last_symbol_search = datetime.now()
+            
             # 메인 루프
             while self.running:
                 current_time = datetime.now().time()
                 
                 # 장 시간 체크
                 if self._is_market_open(current_time):
+                    # 30분마다 종목 재탐색
+                    # Note: 2분은 너무 짧은 주기로, API 호출 제한과 서버 부하를 고려하여 10분으로 설정
+                    if (datetime.now() - last_symbol_search).total_seconds() >= 600:
+                        new_symbols = await self._get_tradable_symbols()
+                        if new_symbols:
+                            symbols = new_symbols
+                            await scalping_strategy.update_symbols(symbols[:50])
+                            last_symbol_search = datetime.now()
+                            logger.log_system(f"Updated tradable symbols: {len(symbols)}")
+                    
                     # 포지션 체크
                     await order_manager.check_positions()
                     
