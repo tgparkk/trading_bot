@@ -123,6 +123,34 @@ class Database:
                 )
             """)
             
+            # 토큰 관리 테이블
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS token_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,  -- ISSUE/ACCESS/FAIL
+                    token TEXT,
+                    issue_time TIMESTAMP,
+                    expire_time TIMESTAMP,
+                    status TEXT,  -- SUCCESS/FAIL
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # 종목 탐색 테이블
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_search_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    search_time TIMESTAMP NOT NULL,
+                    total_symbols INTEGER,
+                    filtered_symbols INTEGER,
+                    search_criteria TEXT,  -- JSON 형식으로 저장
+                    status TEXT,  -- SUCCESS/FAIL
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             conn.commit()
             logger.log_system("Database initialized successfully")
     
@@ -320,6 +348,100 @@ class Database:
             backup_conn.close()
         
         logger.log_system(f"Database backed up to {backup_path}")
+    
+    def save_token_log(self, event_type: str, token: str = None, 
+                      issue_time: datetime = None, expire_time: datetime = None,
+                      status: str = None, error_message: str = None):
+        """토큰 관련 로그 저장"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO token_logs (
+                    event_type, token, issue_time, expire_time, 
+                    status, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                event_type,
+                token,
+                issue_time.isoformat() if issue_time else None,
+                expire_time.isoformat() if expire_time else None,
+                status,
+                error_message
+            ))
+            
+            conn.commit()
+    
+    def save_symbol_search_log(self, total_symbols: int, filtered_symbols: int,
+                             search_criteria: Dict[str, Any], status: str,
+                             error_message: str = None):
+        """종목 탐색 로그 저장"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO symbol_search_logs (
+                    search_time, total_symbols, filtered_symbols,
+                    search_criteria, status, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now().isoformat(),
+                total_symbols,
+                filtered_symbols,
+                json.dumps(search_criteria),
+                status,
+                error_message
+            ))
+            
+            conn.commit()
+    
+    def get_token_logs(self, start_date: str = None, end_date: str = None,
+                      event_type: str = None) -> List[Dict[str, Any]]:
+        """토큰 로그 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            query = "SELECT * FROM token_logs WHERE 1=1"
+            params = []
+            
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date)
+            
+            if event_type:
+                query += " AND event_type = ?"
+                params.append(event_type)
+            
+            query += " ORDER BY created_at DESC"
+            
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_symbol_search_logs(self, start_date: str = None, 
+                             end_date: str = None) -> List[Dict[str, Any]]:
+        """종목 탐색 로그 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            query = "SELECT * FROM symbol_search_logs WHERE 1=1"
+            params = []
+            
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date)
+            
+            query += " ORDER BY created_at DESC"
+            
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
 # 싱글톤 인스턴스 생성
 db = Database()
