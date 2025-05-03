@@ -6,14 +6,14 @@ import asyncio
 import websockets
 from typing import Dict, Any, Callable, List, Optional
 from datetime import datetime
-from config.settings import config
+from config.settings import config, APIConfig
 from utils.logger import logger
 
 class KISWebSocketClient:
     """한국투자증권 웹소켓 클라이언트"""
     
     def __init__(self):
-        self.config = config["api"]
+        self.config = config.get("api", APIConfig.from_env())
         self.ws_url = self.config.ws_url
         self.app_key = self.config.app_key
         self.app_secret = self.config.app_secret

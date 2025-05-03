@@ -5,13 +5,13 @@ import logging
 import os
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from config.settings import config
+from config.settings import config, LoggingConfig
 
 class TradingLogger:
     """트레이딩 전용 로거"""
     
     def __init__(self):
-        self.config = config["logging"]
+        self.config = config.get("logging", LoggingConfig())
         self._setup_directories()
         self._setup_loggers()
     

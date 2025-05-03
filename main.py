@@ -8,7 +8,7 @@ import os
 from dotenv import load_dotenv
 import os
 from pathlib import Path
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import List
 from config.settings import config
 from core.api_client import api_client
@@ -101,22 +101,63 @@ class TradingBot:
             await self.shutdown(error=str(e))
     
     async def _get_tradable_symbols(self) -> List[str]:
-        """거래 가능 종목 조회"""
-        try:
-            # 거래량 상위 종목 조회
-            volume_data = api_client.get_market_trading_volume()
-            
-            symbols = []
-            if volume_data.get("rt_cd") == "0":
-                output2 = volume_data.get("output2", [])
-                for item in output2[:100]:  # 상위 100종목
-                    symbols.append(item["mksc_shrn_iscd"])
-            
-            return symbols
-            
-        except Exception as e:
-            logger.log_error(e, "Failed to get tradable symbols")
+        """거래 가능 종목 조회 (필터링 포함)"""
+        # 1) 거래량 순위 API 호출
+        vol_data = api_client.get_market_trading_volume()  # :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+        if vol_data.get("rt_cd") != "0":
+            logger.log_error("거래량 순위 조회 실패")
             return []
+
+        raw_list = vol_data["output2"][:200]  # 상위 200개만 우선 추출 :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+        f = self.trading_config.filters
+
+        end_date   = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=f["avg_vol_days"])).strftime("%Y%m%d")
+
+        candidates = []
+        for item in raw_list:
+            symbol = item["mksc_shrn_iscd"]
+            today_vol = int(item.get("prdy_vrss_vol", 0))  # 실제 필드명 확인 필요
+
+            # 2) 30일 일별 시세 조회 → 거래량·종가 리스트 확보
+            daily = api_client.get_daily_price(symbol, start_date, end_date)
+            if daily.get("rt_cd") != "0":
+                continue
+            days = daily["output2"]
+            vols   = [int(d["acml_vol"])  for d in days]      # 일별 누적거래량
+            closes = [float(d["stck_clpr"]) for d in days]     # 일별 종가
+
+            # 3) 평균 거래량 필터
+            avg_vol = sum(vols) / len(vols)
+            if avg_vol < f["min_avg_volume"]:
+                continue
+
+            # 4) 거래량 급증 필터
+            if today_vol / avg_vol < f["vol_spike_ratio"]:
+                continue
+
+            # 5) 현재가 필터
+            price_data = api_client.get_current_price(symbol)
+            if price_data.get("rt_cd") != "0":
+                continue
+            price = float(price_data["output"]["stck_prpr"])
+            if not (f["price_min"] <= price <= f["price_max"]):
+                continue
+
+            # 6) 단기 변동성 필터 (절대 수익률의 평균)
+            changes = [
+                abs((closes[i] - closes[i-1]) / closes[i-1])
+                for i in range(1, len(closes))
+            ]
+            volat = sum(changes) / len(changes)
+            if volat > f["max_volatility"]:
+                continue
+
+            candidates.append((symbol, today_vol))
+
+        # 7) 거래량 기준 내림차순 정렬 후 상위 N개 심볼 반환
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in candidates[: f["max_symbols"]]]
     
     def _is_market_open(self, current_time: time) -> bool:
         """장 시간 확인"""

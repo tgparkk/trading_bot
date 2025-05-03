@@ -6,14 +6,16 @@ import json
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from contextlib import contextmanager
-from config.settings import config
+from config.settings import config, DatabaseConfig
 from utils.logger import logger
 
 class Database:
     """트레이딩 데이터베이스"""
     
     def __init__(self):
-        self.db_path = config["database"].db_path
+        db_cfg = config.get("database", DatabaseConfig())
+        self.db_path         = db_cfg.db_path
+        self.backup_interval = db_cfg.backup_interval
         self._initialize_db()
     
     @contextmanager

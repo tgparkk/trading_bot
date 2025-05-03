@@ -8,14 +8,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from typing import Dict, Any, Optional
-from config.settings import config
+from config.settings import config, AlertConfig
 from utils.logger import logger
 
 class AlertSystem:
     """알림 시스템"""
     
     def __init__(self):
-        self.alert_config = config["alert"]
+        self.alert_config = config.get("alert", AlertConfig())
         self.telegram_bot_url = f"https://api.telegram.org/bot{self.alert_config.telegram_token}/sendMessage"
     
     async def send_alert(self, message: str, level: str = "INFO", 
