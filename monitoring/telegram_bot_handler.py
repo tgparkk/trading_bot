@@ -203,6 +203,24 @@ class TelegramBotHandler:
             update_id = update.get("update_id")
             text = message.get("text", "")
             
+            # 메시지가 없거나 텍스트가 없는 경우 무시
+            if not message or not text:
+                return
+                
+            # 메시지 ID가 있는 경우 이미 처리된 메시지인지 확인
+            if message_id:
+                # DB에서 이 메시지 ID로 저장된 메시지가 있는지 확인
+                existing_messages = db.get_telegram_messages(
+                    direction="INCOMING",
+                    message_id=str(message_id),
+                    limit=1
+                )
+                
+                # 메시지가 이미 저장되어 있고 처리된 경우 건너뜀
+                if existing_messages and existing_messages[0].get("processed"):
+                    logger.log_system(f"이미 처리된 메시지 무시: ID {message_id}", level="INFO")
+                    return
+            
             # 수신 메시지 DB에 저장
             is_command = text.startswith('/')
             command = text.split()[0].lower() if is_command else None
@@ -625,17 +643,58 @@ class TelegramBotHandler:
     
     async def get_balance(self, args: List[str]) -> str:
         """계좌 잔고 조회"""
-        balance_data = await order_manager.get_account_balance()
-        
-        if not balance_data:
-            return "❌ 계좌 잔고를 조회할 수 없습니다."
-        
-        total_balance = float(balance_data.get("output1", {}).get("tot_evlu_amt", "0"))
-        deposit = float(balance_data.get("output1", {}).get("dnca_tot_amt", "0"))
-        stock_value = float(balance_data.get("output1", {}).get("scts_evlu_amt", "0"))
-        available = float(balance_data.get("output1", {}).get("nass_amt", "0"))
-        
-        return f"""
+        try:
+            balance_data = await order_manager.get_account_balance()
+            
+            # 데이터 형식 로깅하여 확인
+            logger.log_system(f"계좌 잔고 데이터 형식: {type(balance_data)}, 데이터: {balance_data}")
+            
+            if not balance_data:
+                return "❌ 계좌 잔고를 조회할 수 없습니다."
+            
+            # 리스트인 경우 처리
+            if isinstance(balance_data, list):
+                if not balance_data:
+                    return "❌ 계좌 잔고 정보가 비어 있습니다."
+                    
+                # 첫 번째 항목을 사용
+                first_item = balance_data[0]
+                if isinstance(first_item, dict):
+                    total_balance = float(first_item.get("tot_evlu_amt", "0"))
+                    deposit = float(first_item.get("dnca_tot_amt", "0"))
+                    stock_value = float(first_item.get("scts_evlu_amt", "0"))
+                    available = float(first_item.get("nass_amt", "0"))
+                else:
+                    return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {first_item}"
+            # 딕셔너리인 경우 처리
+            elif isinstance(balance_data, dict):
+                # output1이 비어있거나 리스트인 경우 output2 확인
+                output1 = balance_data.get("output1", {})
+                output2 = balance_data.get("output2", [])
+                
+                if (not output1 or isinstance(output1, list) and not output1) and output2 and isinstance(output2, list) and len(output2) > 0:
+                    # output2의 첫 번째 항목 사용
+                    first_item = output2[0]
+                    if isinstance(first_item, dict):
+                        total_balance = float(first_item.get("tot_evlu_amt", "0"))
+                        deposit = float(first_item.get("dnca_tot_amt", "0"))
+                        stock_value = float(first_item.get("scts_evlu_amt", "0"))
+                        available = float(first_item.get("nass_amt", "0"))
+                    else:
+                        return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {first_item}"
+                else:
+                    # 기존 코드 - output1에서 시도
+                    if isinstance(output1, dict):
+                        total_balance = float(output1.get("tot_evlu_amt", "0"))
+                        deposit = float(output1.get("dnca_tot_amt", "0"))
+                        stock_value = float(output1.get("scts_evlu_amt", "0"))
+                        available = float(output1.get("nass_amt", "0"))
+                    else:
+                        return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {output1}"
+            else:
+                return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {type(balance_data)}"
+            
+            return f"""
 💵 *계좌 잔고 정보*
 
 총 평가금액: {total_balance:,.0f}원
@@ -643,6 +702,9 @@ class TelegramBotHandler:
 주식 평가금액: {stock_value:,.0f}원
 매수 가능금액: {available:,.0f}원
 """
+        except Exception as e:
+            logger.log_error(e, "계좌 잔고 조회 중 오류 발생")
+            return f"❌ 계좌 잔고 조회 중 오류 발생: {str(e)}"
     
     async def get_performance(self, args: List[str]) -> str:
         """성과 조회"""

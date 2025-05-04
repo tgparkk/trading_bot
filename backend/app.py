@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from flask import Flask, jsonify, request
+from flask_cors import CORS  # CORS 추가
 from utils.database import db
 from core.api_client import api_client
 from core.order_manager import order_manager
@@ -14,8 +15,17 @@ import asyncio
 from datetime import datetime
 from monitoring.telegram_bot_handler import telegram_bot_handler
 from utils.logger import logger
+import threading
+import time
+import atexit
 
 app = Flask(__name__)
+# CORS 설정 추가 - 모든 오리진에서의 요청 허용
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+# 텔레그램 봇 상태 관리 전역 변수
+telegram_bot_initialized = False
+telegram_lock_file = os.path.join(Path(__file__).parent.parent, "telegram_bot.lock")
 
 # KIS API 접속 테스트 및 결과 텔레그램 전송 함수
 async def test_kis_api_connection():
@@ -101,6 +111,13 @@ async def test_kis_api_connection():
 
 # 텔레그램 봇 핸들러 초기화 및 시작 메시지 전송
 async def init_telegram_handler():
+    global telegram_bot_initialized
+    
+    # 이미 초기화된 경우 건너뛰기
+    if telegram_bot_initialized:
+        logger.log_system("텔레그램 봇이 이미 초기화되어 있습니다.")
+        return
+    
     try:
         # 텔레그램 봇 핸들러 준비 대기
         logger.log_system("대시보드 백엔드: 텔레그램 봇 핸들러 준비 대기...")
@@ -123,11 +140,56 @@ async def init_telegram_handler():
         # KIS API 접속 테스트 및 결과 전송
         await test_kis_api_connection()
         
+        # 초기화 완료 표시
+        telegram_bot_initialized = True
+        
+        # 잠금 파일 생성
+        with open(telegram_lock_file, "w") as f:
+            f.write(str(datetime.now().timestamp()))
+            
     except Exception as e:
         logger.log_error(e, "대시보드 시작 알림 전송 실패")
 
+# 텔레그램 봇 종료 처리
+def cleanup_telegram_bot():
+    # 잠금 파일 제거
+    try:
+        if os.path.exists(telegram_lock_file):
+            os.remove(telegram_lock_file)
+            logger.log_system("텔레그램 봇 잠금 파일 제거 완료")
+    except Exception as e:
+        logger.log_error(e, "텔레그램 봇 잠금 파일 제거 실패")
+
+# 프로그램 종료 시 정리 작업 등록
+atexit.register(cleanup_telegram_bot)
+
+# 텔레그램 봇 잠금 파일 확인
+def check_telegram_lock():
+    if os.path.exists(telegram_lock_file):
+        try:
+            # 파일이 있지만 5분(300초) 이상 지난 경우 무시하고 제거
+            file_time = os.path.getmtime(telegram_lock_file)
+            current_time = time.time()
+            if current_time - file_time > 300:
+                logger.log_system("오래된 텔레그램 봇 잠금 파일 발견. 제거합니다.")
+                os.remove(telegram_lock_file)
+                return False
+            return True
+        except Exception as e:
+            logger.log_error(e, "텔레그램 봇 잠금 파일 확인 실패")
+            return False
+    return False
+
 # 비동기 작업을 처리하기 위한 이벤트 루프 생성 및 실행
 def start_telegram_handler():
+    global telegram_bot_initialized
+    
+    # 이미 실행 중인 텔레그램 봇이 있는지 확인
+    if check_telegram_lock():
+        logger.log_system("다른 프로세스에서 실행 중인 텔레그램 봇이 감지되었습니다. 텔레그램 초기화를 건너뜁니다.")
+        telegram_bot_initialized = True
+        return
+    
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -139,7 +201,6 @@ def start_telegram_handler():
         loop.run_until_complete(init_telegram_handler())
         
         # 이벤트 루프 계속 실행 (백그라운드 스레드에서)
-        import threading
         def run_event_loop(loop):
             asyncio.set_event_loop(loop)
             try:
@@ -191,10 +252,50 @@ def api_account():
     # 계좌 정보 반환
     try:
         # KIS API 접속 시도
-        info = api_client.get_account_balance()
+        raw_info = api_client.get_account_balance()
         
         # API 응답 결과 저장
-        is_success = info.get("rt_cd") == "0" if info else False
+        is_success = raw_info.get("rt_cd") == "0" if raw_info else False
+        
+        # 응답 데이터 가공 (프론트엔드용)
+        info = {}
+        if is_success:
+            # 데이터 추출 (output1이 리스트이거나 비어 있는 경우 output2 사용)
+            output1 = raw_info.get("output1", {})
+            output2 = raw_info.get("output2", [])
+            
+            if isinstance(output1, list) and not output1 and isinstance(output2, list) and len(output2) > 0:
+                # output2에서 첫 번째 항목 사용
+                account_data = output2[0]
+            elif isinstance(output1, dict) and output1:
+                # output1이 딕셔너리인 경우 직접 사용
+                account_data = output1
+            elif isinstance(output2, list) and len(output2) > 0:
+                # output1이 비어있고 output2가 있는 경우
+                account_data = output2[0]
+            else:
+                # 기본값
+                account_data = {}
+            
+            # 가공된 정보
+            info = {
+                "status": "success",
+                "balance": {
+                    "totalAssets": float(account_data.get("tot_evlu_amt", "0")),
+                    "cashBalance": float(account_data.get("dnca_tot_amt", "0")),
+                    "stockValue": float(account_data.get("scts_evlu_amt", "0")),
+                    "availableAmount": float(account_data.get("nass_amt", "0"))
+                },
+                "timestamp": datetime.now().isoformat(),
+                "message": raw_info.get("msg1", "정상")
+            }
+        else:
+            # 실패 시 오류 메시지
+            info = {
+                "status": "error",
+                "message": raw_info.get("msg1", "알 수 없는 오류") if raw_info else "응답 없음",
+                "timestamp": datetime.now().isoformat()
+            }
         
         # 비동기 작업을 동기적으로 실행하여 결과 텔레그램 전송
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -206,10 +307,10 @@ def api_account():
             조회 시간: {current_time}
             
             한국투자증권 API 계좌 정보 조회에 성공했습니다.
-            응답 메시지: {info.get("msg1", "정상")}
+            응답 메시지: {raw_info.get("msg1", "정상")}
             """
         else:
-            error_msg = info.get("msg1", "알 수 없는 오류") if info else "응답 없음"
+            error_msg = raw_info.get("msg1", "알 수 없는 오류") if raw_info else "응답 없음"
             message = f"""
             *계좌 정보 조회 실패* ❌
             조회 시간: {current_time}
@@ -229,7 +330,6 @@ def api_account():
                 logger.log_error(e, "계좌 정보 조회 결과 메시지 전송 실패")
         
         # 비동기 함수를 백그라운드 스레드에서 실행
-        import threading
         def run_background_task():
             asyncio.set_event_loop(loop)
             loop.run_until_complete(send_account_result())
@@ -260,7 +360,6 @@ def api_account():
                 except Exception as msg_error:
                     logger.log_error(msg_error, "계좌 정보 조회 오류 메시지 전송 실패")
             
-            import threading
             def run_background_task():
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(send_error_message())
@@ -271,7 +370,12 @@ def api_account():
         except Exception as thread_error:
             logger.log_error(thread_error, "텔레그램 메시지 스레드 생성 실패")
         
-        return jsonify({'error': str(e)}), 500
+        # 사용자 친화적인 오류 응답
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
 @app.route('/api/positions')
 def api_positions():
@@ -354,4 +458,4 @@ def api_test_kis_connection():
         else:
             return jsonify({'success': False, 'message': 'KIS API 접속 실패'})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 500 

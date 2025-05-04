@@ -32,6 +32,29 @@ class KISAPIClient:
         self.token_expire_time = None
         self.token_issue_time  = None
         
+        # 앱 시작 시 DB에서 유효한 토큰 로드
+        try:
+            logger.log_system("앱 시작 시 저장된 토큰 확인 중...")
+            latest_token = db.get_latest_token()
+            
+            if latest_token and latest_token.get('token') and latest_token.get('expire_time'):
+                expire_time = datetime.fromisoformat(latest_token['expire_time']).timestamp()
+                current_time = datetime.now().timestamp()
+                
+                # 토큰이 아직 유효한지 확인 (만료 1시간 이상 남은 경우)
+                if current_time < expire_time - 3600:
+                    self.access_token = latest_token['token']
+                    self.token_expire_time = expire_time
+                    self.token_issue_time = datetime.fromisoformat(latest_token['issue_time']).timestamp() if latest_token.get('issue_time') else None
+                    
+                    logger.log_system(f"저장된 유효한 토큰을 로드했습니다. 만료까지 {((expire_time - current_time) / 3600):.1f}시간 남음")
+                else:
+                    logger.log_system("저장된 토큰이 곧 만료되거나 이미 만료되었습니다. 새 토큰을 발급합니다.")
+            else:
+                logger.log_system("저장된 유효한 토큰이 없습니다. 필요시 새 토큰을 발급합니다.")
+        except Exception as e:
+            logger.log_error(e, "저장된 토큰 로드 중 오류 발생. 필요시 새 토큰을 발급합니다.")
+        
     def _get_access_token(self) -> str:
         """접근 토큰 발급/갱신"""
         current_time = datetime.now().timestamp()
