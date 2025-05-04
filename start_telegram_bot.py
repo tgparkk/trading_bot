@@ -30,7 +30,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 LOCK_FILE = Path("telegram_bot.lock")
 
 def check_bot_running():
-    """봇이 이미 실행 중인지 확인"""
+    """봇이 이미 실행 중인지 확인하고, 실행 중이면 자동으로 종료"""
     if LOCK_FILE.exists():
         try:
             with open(LOCK_FILE, "r") as f:
@@ -40,21 +40,45 @@ def check_bot_running():
                 
                 # PID가 여전히 활성 상태인지 확인
                 try:
-                    # Windows에서는 os.kill(pid, 0)이 작동하지 않으므로 다른 방법 사용
+                    # psutil이 설치되어 있는지 확인
                     import psutil
                     if psutil.pid_exists(pid):
                         print(f"⚠️ 텔레그램 봇이 이미 실행 중입니다 (PID: {pid}, 시작 시간: {start_time})")
-                        print("다른 인스턴스를 종료 후 실행하거나, 락 파일을 삭제하세요: " + str(LOCK_FILE))
-                        return True
+                        print("기존 프로세스를 종료하고 새로 시작합니다...")
+                        
+                        try:
+                            # 프로세스 종료 시도
+                            process = psutil.Process(pid)
+                            process.terminate()  # SIGTERM 신호 전송
+                            
+                            # 최대 5초 동안 종료될 때까지 대기
+                            process.wait(timeout=5)
+                            print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 성공적으로 종료되었습니다.")
+                        except psutil.NoSuchProcess:
+                            print(f"프로세스(PID: {pid})가 이미 종료되었습니다.")
+                        except psutil.TimeoutExpired:
+                            print(f"프로세스(PID: {pid}) 종료 시간 초과. 강제 종료를 시도합니다.")
+                            try:
+                                process.kill()  # SIGKILL 신호 전송 (강제 종료)
+                                print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 강제 종료되었습니다.")
+                            except Exception as kill_error:
+                                print(f"강제 종료 실패: {str(kill_error)}")
+                                print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
+                                return True
+                        except Exception as e:
+                            print(f"프로세스 종료 중 오류 발생: {str(e)}")
+                            print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
+                            return True
                 except ImportError:
-                    # psutil이 설치되지 않은 경우 파일의 존재만으로 판단
-                    print(f"⚠️ 텔레그램 봇이 이미 실행 중인 것으로 보입니다.")
-                    print("다른 인스턴스를 종료 후 실행하거나, 락 파일을 삭제하세요: " + str(LOCK_FILE))
+                    # psutil이 설치되지 않은 경우
+                    print("⚠️ psutil 모듈이 설치되지 않아 기존 프로세스를 자동으로 종료할 수 없습니다.")
+                    print("pip install psutil 명령으로 psutil을 설치하거나,")
+                    print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
                     return True
         except (json.JSONDecodeError, KeyError) as e:
             print(f"락 파일이 손상되었습니다: {e}")
             
-        # 락 파일은 존재하지만 프로세스가 실행 중이 아닌 경우, 락 파일 삭제
+        # 락 파일은 존재하지만 프로세스가 실행 중이 아니거나 종료된 경우, 락 파일 삭제
         LOCK_FILE.unlink(missing_ok=True)
         print("이전 락 파일을 삭제했습니다.")
         

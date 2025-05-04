@@ -499,25 +499,52 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            query = "SELECT * FROM token_logs WHERE 1=1"
+            query = "SELECT * FROM token_logs"
             params = []
+            where_clauses = []
             
             if start_date:
-                query += " AND created_at >= ?"
+                where_clauses.append("created_at >= ?")
                 params.append(start_date)
             
             if end_date:
-                query += " AND created_at <= ?"
+                where_clauses.append("created_at <= ?")
                 params.append(end_date)
             
             if event_type:
-                query += " AND event_type = ?"
+                where_clauses.append("event_type = ?")
                 params.append(event_type)
+            
+            if where_clauses:
+                query += " WHERE " + " AND ".join(where_clauses)
             
             query += " ORDER BY created_at DESC"
             
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def get_latest_token(self) -> Optional[Dict[str, Any]]:
+        """가장 최근에 발급된 유효한 토큰 조회"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # 가장 최근에 성공적으로 발급된 토큰 조회
+                query = """
+                    SELECT * FROM token_logs 
+                    WHERE event_type = 'ISSUE' AND status = 'SUCCESS' AND token IS NOT NULL 
+                    ORDER BY id DESC LIMIT 1
+                """
+                
+                cursor.execute(query)
+                token_data = cursor.fetchone()
+                
+                if token_data:
+                    return dict(token_data)
+                return None
+        except Exception as e:
+            logger.log_error(e, "최신 토큰 조회 실패")
+            return None
     
     def get_symbol_search_logs(self, start_date: str = None, 
                              end_date: str = None) -> List[Dict[str, Any]]:
@@ -643,7 +670,7 @@ class Database:
     def get_telegram_messages(self, direction: str = None, chat_id: str = None,
                             is_command: bool = None, processed: bool = None,
                             start_date: str = None, end_date: str = None,
-                            limit: int = 100) -> List[Dict[str, Any]]:
+                            message_id: str = None, limit: int = 100) -> List[Dict[str, Any]]:
         """텔레그램 메시지 조회"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -658,6 +685,10 @@ class Database:
             if chat_id:
                 query += " AND chat_id = ?"
                 params.append(str(chat_id))
+            
+            if message_id:
+                query += " AND message_id = ?"
+                params.append(message_id)
             
             if is_command is not None:
                 query += " AND is_command = ?"

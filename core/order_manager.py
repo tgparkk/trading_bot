@@ -330,25 +330,98 @@ class OrderManager:
             return []
     
     async def get_positions(self) -> List[Dict[str, Any]]:
-        """보유 포지션 목록 조회"""
+        """보유 포지션 조회"""
         try:
-            # DB에서 보유 중인 포지션 조회
-            positions = db.get_all_positions()
-            
-            # 메모리에 있는 포지션 정보도 확인하여 최신 정보 유지
-            result = []
-            for pos in positions:
-                symbol = pos["symbol"]
-                # 메모리에 있는 정보가 있으면 그것을 사용, 없으면 DB에서 조회한 정보 사용
-                if symbol in self.positions:
-                    result.append(self.positions[symbol])
-                else:
-                    result.append(pos)
-            
-            return result
+            return list(self.positions.values())
         except Exception as e:
             logger.log_error(e, "Failed to get positions")
             return []
+            
+    async def get_account_balance(self) -> Dict[str, Any]:
+        """계좌 잔고 조회"""
+        try:
+            # 비동기 환경에서 동기 함수 호출을 위해 run_in_executor 사용
+            loop = asyncio.get_event_loop()
+            raw_result = await loop.run_in_executor(None, api_client.get_account_balance)
+            
+            # 데이터 표준화: raw_result가 리스트인 경우
+            if isinstance(raw_result, list):
+                logger.log_system("계좌 잔고 데이터가 리스트 형식으로 반환되었습니다.")
+                if not raw_result:
+                    logger.log_system("계좌 잔고 리스트가 비어 있습니다.", level="WARNING")
+                    return {"output1": {
+                        "tot_evlu_amt": "0",
+                        "dnca_tot_amt": "0",
+                        "scts_evlu_amt": "0",
+                        "nass_amt": "0"
+                    }}
+                
+                # 첫 번째 항목을 사용하여 딕셔너리 생성
+                first_item = raw_result[0]
+                if isinstance(first_item, dict):
+                    # 첫 번째 항목을 output1 형식으로 표준화
+                    return {"output1": {
+                        "tot_evlu_amt": first_item.get("tot_evlu_amt", "0"),
+                        "dnca_tot_amt": first_item.get("dnca_tot_amt", "0"),
+                        "scts_evlu_amt": first_item.get("scts_evlu_amt", "0"),
+                        "nass_amt": first_item.get("nass_amt", "0")
+                    }}
+                else:
+                    logger.log_system(f"계좌 잔고 항목이 딕셔너리가 아닙니다: {type(first_item)}", level="WARNING")
+                    return {"output1": {
+                        "tot_evlu_amt": "0",
+                        "dnca_tot_amt": "0",
+                        "scts_evlu_amt": "0",
+                        "nass_amt": "0"
+                    }}
+            
+            # 데이터 표준화: raw_result가 딕셔너리인 경우
+            elif isinstance(raw_result, dict):
+                logger.log_system("계좌 잔고 데이터가 딕셔너리 형식으로 반환되었습니다.")
+                
+                # 이미 output1 키가 있는 경우
+                if "output1" in raw_result:
+                    return raw_result
+                
+                # 필요한 키들이 최상위에 있는 경우 (output1 구조로 래핑)
+                if any(key in raw_result for key in ["tot_evlu_amt", "dnca_tot_amt", "scts_evlu_amt", "nass_amt"]):
+                    return {"output1": {
+                        "tot_evlu_amt": raw_result.get("tot_evlu_amt", "0"),
+                        "dnca_tot_amt": raw_result.get("dnca_tot_amt", "0"),
+                        "scts_evlu_amt": raw_result.get("scts_evlu_amt", "0"),
+                        "nass_amt": raw_result.get("nass_amt", "0")
+                    }}
+                
+                # rt_cd가 있고 0이 아닌 경우 (API 오류)
+                if raw_result.get("rt_cd") and raw_result.get("rt_cd") != "0":
+                    logger.log_system(f"계좌 잔고 조회 실패: {raw_result.get('msg1', '알 수 없는 오류')}", level="WARNING")
+                    
+                # 기타 경우는 빈 구조 반환
+                return {"output1": {
+                    "tot_evlu_amt": "0",
+                    "dnca_tot_amt": "0",
+                    "scts_evlu_amt": "0",
+                    "nass_amt": "0"
+                }}
+            
+            # 데이터 표준화: 다른 타입인 경우
+            else:
+                logger.log_system(f"계좌 잔고 데이터가 예상하지 못한 형식입니다: {type(raw_result)}", level="WARNING")
+                return {"output1": {
+                    "tot_evlu_amt": "0",
+                    "dnca_tot_amt": "0",
+                    "scts_evlu_amt": "0",
+                    "nass_amt": "0"
+                }}
+                
+        except Exception as e:
+            logger.log_error(e, "Failed to get account balance")
+            return {"output1": {
+                "tot_evlu_amt": "0",
+                "dnca_tot_amt": "0",
+                "scts_evlu_amt": "0",
+                "nass_amt": "0"
+            }}
 
 # 싱글톤 인스턴스
 order_manager = OrderManager()
