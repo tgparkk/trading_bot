@@ -198,59 +198,39 @@ class Database:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS symbol_search_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    search_time TIMESTAMP NOT NULL,
+                    search_time TIMESTAMP,
                     total_symbols INTEGER,
                     filtered_symbols INTEGER,
-                    search_criteria TEXT,  -- JSON 형식으로 저장
-                    status TEXT,  -- SUCCESS/FAIL
+                    search_criteria TEXT,  -- JSON 형식
+                    status TEXT,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # 텔레그램 메시지 로그 테이블이 존재하는지 확인
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_messages'")
-            telegram_table_exists = cursor.fetchone() is not None
+            # 텔레그램 메시지 테이블
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    direction TEXT NOT NULL,  -- INCOMING/OUTGOING
+                    chat_id TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    message_id TEXT,
+                    update_id INTEGER,
+                    is_command INTEGER DEFAULT 0,
+                    command TEXT,
+                    processed INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'SUCCESS',
+                    error_message TEXT,
+                    reply_to TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
-            # 테이블이 없거나 강제 초기화가 요청된 경우 생성
-            if not telegram_table_exists or force_initialize:
-                # 기존 테이블이 있으면 삭제
-                if telegram_table_exists and force_initialize:
-                    cursor.execute("DROP TABLE telegram_messages")
-                
-                # 텔레그램 메시지 로그 테이블
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS telegram_messages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        direction TEXT NOT NULL,  -- INCOMING/OUTGOING
-                        chat_id TEXT NOT NULL,
-                        message_text TEXT,
-                        command TEXT,  -- 명령어인 경우 해당 명령어
-                        message_id TEXT,  -- 텔레그램에서 제공하는 메시지 ID
-                        update_id INTEGER,  -- 텔레그램 업데이트 ID
-                        is_command BOOLEAN DEFAULT 0,  -- 명령어 여부
-                        processed BOOLEAN DEFAULT 0,  -- 처리 완료 여부
-                        status TEXT,  -- SUCCESS/FAIL
-                        error_message TEXT,
-                        reply_to TEXT,  -- 답장 대상 메시지 ID
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                
-                logger.log_system("Telegram messages table created or re-initialized")
-            else:
-                # 테이블이 존재하는 경우 reply_to 필드가 있는지 확인
-                cursor.execute("PRAGMA table_info(telegram_messages)")
-                columns = cursor.fetchall()
-                column_names = [column[1] for column in columns]
-                
-                # reply_to 필드가 없으면 추가
-                if 'reply_to' not in column_names:
-                    cursor.execute("ALTER TABLE telegram_messages ADD COLUMN reply_to TEXT")
-                    logger.log_system("Added reply_to column to telegram_messages table")
+            # 초기화 완료 로그
+            logger.log_system("Database initialized successfully")
             
             conn.commit()
-            logger.log_system("Database initialized successfully")
     
     def save_order(self, order_data: Dict[str, Any]) -> int:
         """주문 저장"""
@@ -425,15 +405,37 @@ class Database:
     
     def get_latest_system_status(self) -> Optional[Dict[str, Any]]:
         """최신 시스템 상태 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM system_status 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """)
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM system_status 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                """)
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+                
+                # 상태 정보가 없으면 기본값 반환
+                logger.log_system("시스템 상태 정보가 없어 기본값을 반환합니다", level="WARNING")
+                return {
+                    "id": 0,
+                    "status": "UNKNOWN",
+                    "last_heartbeat": datetime.now().isoformat(),
+                    "error_message": None,
+                    "created_at": datetime.now().isoformat()
+                }
+        except Exception as e:
+            logger.log_error(e, "시스템 상태 조회 오류")
+            # 오류 발생 시 기본값 반환
+            return {
+                "id": 0,
+                "status": "ERROR",
+                "last_heartbeat": datetime.now().isoformat(),
+                "error_message": str(e),
+                "created_at": datetime.now().isoformat()
+            }
     
     def backup_database(self, backup_path: str = None):
         """데이터베이스 백업"""
