@@ -182,6 +182,146 @@ class SimpleTelegramBot:
             response = """텔레그램 봇이 시작되었습니다.
 명령어 목록을 보려면 /help를 입력하세요."""
             
+        elif command == "/pause":
+            response = """⚠️ 자동 거래가 일시 중지되었습니다.
+자동 매매가 중지되었지만, 수동 매매는 가능합니다.
+거래를 재개하려면 /resume을 입력하세요."""
+            
+        elif command == "/resume":
+            response = "✅ 자동 거래가 재개되었습니다."
+            
+        elif command == "/stop":
+            # 확인 요청
+            if not args or not args[0] == "confirm":
+                response = "⚠️ 정말로 봇을 종료하시겠습니까? 확인하려면 `/stop confirm`을 입력하세요."
+            else:
+                response = "🛑 봇을 종료합니다... 시스템이 종료됩니다."
+                # 메시지 전송 후 봇 종료
+                await self.send_message(response)
+                
+                # 봇 종료 플래그 설정
+                self.running = False
+                
+                # 전역 종료 플래그 설정
+                global shutdown_requested
+                shutdown_requested = True
+                
+                print("텔레그램 명령으로 시스템 종료 요청 수신됨")
+                
+                # 프로그램 자체를 종료
+                print("프로그램을 종료합니다...")
+                try:
+                    # 세션 닫기
+                    if self.session and not self.session.closed:
+                        await self.session.close()
+                    
+                    # 백엔드 프로세스도 함께 종료 시도
+                    try:
+                        # Windows 환경인 경우 taskkill 명령을 먼저 실행
+                        if os.name == 'nt':
+                            print("Windows taskkill 명령으로 Python 프로세스 종료 시도")
+                            # 더 구체적인 필터링으로 타겟팅
+                            os.system('taskkill /f /im python.exe /fi "COMMANDLINE eq *main.py*"')
+                            os.system('taskkill /f /im python.exe /fi "COMMANDLINE eq *trading_bot*"')
+                            # 관련 모든 Python 프로세스 종료
+                            os.system('taskkill /f /im python.exe /fi "USERNAME eq %USERNAME%"')
+                            print("taskkill 명령 실행 완료")
+                        
+                        import psutil
+                        current_process = psutil.Process(os.getpid())
+                        current_pid = os.getpid()
+                        print(f"현재 프로세스 PID: {current_pid}")
+                        
+                        # 현재 프로세스의 부모 찾기 (main.py 프로세스일 수 있음)
+                        try:
+                            parent = current_process.parent()
+                            print(f"부모 프로세스: {parent.name()} (PID: {parent.pid})")
+                            
+                            # 부모가 python 프로세스인 경우 종료
+                            if "python" in parent.name().lower():
+                                print(f"부모 Python 프로세스 (PID: {parent.pid}) 종료 시도")
+                                try:
+                                    parent.terminate()  # 부모 프로세스 종료 시도
+                                    gone, still_alive = psutil.wait_procs([parent], timeout=3)
+                                    if still_alive:
+                                        print(f"부모 프로세스가 종료되지 않아 강제 종료합니다")
+                                        parent.kill()  # 강제 종료
+                                except psutil.NoSuchProcess:
+                                    print("부모 프로세스가 이미 종료됨")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                            print(f"부모 프로세스 접근 오류: {str(e)}")
+                        
+                        # 모든 Python 프로세스 검색
+                        print("관련 Python 프로세스 검색 시작")
+                        python_processes = []
+                        
+                        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                            try:
+                                # 자기 자신은 제외
+                                if proc.info['pid'] == current_pid:
+                                    continue
+                                    
+                                # Python 프로세스 검색
+                                proc_name = proc.info['name'].lower()
+                                if "python" in proc_name or "pythonw" in proc_name:
+                                    try:
+                                        cmd = proc.cmdline()
+                                        cmd_str = " ".join(cmd)
+                                        
+                                        # main.py, start_fixed_system.bat, 또는 trading_bot 관련 프로세스 검색
+                                        if any(target in cmd_str for target in ['main.py', 'trading_bot', 'start_fixed_system']):
+                                            python_processes.append(proc)
+                                            print(f"종료 대상 프로세스 발견: PID {proc.info['pid']}, CMD: {cmd_str}")
+                                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                        continue
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                continue
+                        
+                        # 발견된 프로세스 종료
+                        if python_processes:
+                            print(f"{len(python_processes)}개의 관련 프로세스 종료 시도")
+                            for proc in python_processes:
+                                try:
+                                    proc.terminate()
+                                    print(f"프로세스 PID {proc.pid} 종료 요청 완료")
+                                except psutil.NoSuchProcess:
+                                    print(f"프로세스 PID {proc.pid}가 이미 종료됨")
+                                except Exception as e:
+                                    print(f"프로세스 PID {proc.pid} 종료 중 오류: {str(e)}")
+                            
+                            # 프로세스가 종료될 때까지 기다림
+                            print("프로세스 종료 대기")
+                            _, still_alive = psutil.wait_procs(python_processes, timeout=5)
+                            
+                            # 여전히 살아있는 프로세스 강제 종료
+                            if still_alive:
+                                print(f"{len(still_alive)}개 프로세스가 여전히 실행 중, 강제 종료 시도")
+                                for proc in still_alive:
+                                    try:
+                                        proc.kill()  # 강제 종료
+                                        print(f"프로세스 PID {proc.pid} 강제 종료 요청")
+                                    except Exception as e:
+                                        print(f"프로세스 PID {proc.pid} 강제 종료 중 오류: {str(e)}")
+                        else:
+                            print("종료할 관련 프로세스를 찾지 못했습니다")
+                    
+                    except ImportError:
+                        print("psutil 모듈이 설치되지 않아 프로세스 검색이 불가능합니다.")
+                    except Exception as e:
+                        print(f"프로세스 종료 중 오류 발생: {str(e)}")
+                    
+                    # 1초 대기 후 현재 프로세스 종료
+                    await asyncio.sleep(1)
+                    import os
+                    print("os._exit(0)를 통해 프로세스 강제 종료")
+                    os._exit(0)  # 강제 종료
+                except Exception as e:
+                    print(f"종료 중 오류: {str(e)}")
+                    os._exit(1)  # 오류와 함께 강제 종료
+                
+                # 종료 플래그만 설정하고 메인 루프에서 처리하도록 반환
+                return
+            
         else:
             response = f"명령어 '{command}'는 아직 구현되지 않았습니다.\n/help를 입력하여 사용 가능한 명령어를 확인하세요."
         

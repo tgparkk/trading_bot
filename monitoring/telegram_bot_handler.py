@@ -7,6 +7,7 @@ import logging
 import requests
 import aiohttp
 import traceback
+import os
 from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime
 from config.settings import config
@@ -25,26 +26,34 @@ class TelegramBotHandler:
         self.token = config["alert"].telegram_token
         self.chat_id = config["alert"].telegram_chat_id
         
-        # 하드코딩된 기본값이거나 비어있는 경우 환경 변수에서 직접 로드
+        # 토큰이 기본값이거나 비어 있으면 환경 변수에서 직접 읽기 시도
         if self.token == "your_telegram_bot_token" or not self.token:
-            logger.log_system("텔레그램 토큰이 기본값이거나 설정되지 않았습니다. 환경 변수에서 로드합니다.", level="WARNING")
-            env_token = dotenv_helper.get_value("TELEGRAM_TOKEN")
+            env_token = os.getenv("TELEGRAM_TOKEN")
             if env_token:
                 self.token = env_token
-                logger.log_system(f"환경변수에서 텔레그램 토큰을 로드했습니다: {self.token[:10]}...")
+                logger.log_system(f"환경 변수에서 텔레그램 토큰을 로드했습니다.")
         
+        # 채팅 ID가 기본값이거나 비어 있으면 환경 변수에서 직접 읽기 시도
         if self.chat_id == "your_chat_id" or not self.chat_id:
-            logger.log_system("텔레그램 채팅 ID가 기본값이거나 설정되지 않았습니다. 환경 변수에서 로드합니다.", level="WARNING")
-            env_chat_id = dotenv_helper.get_value("TELEGRAM_CHAT_ID")
+            env_chat_id = os.getenv("TELEGRAM_CHAT_ID")
             if env_chat_id:
                 self.chat_id = env_chat_id
-                logger.log_system(f"환경변수에서 텔레그램 채팅 ID를 로드했습니다: {self.chat_id}")
+                logger.log_system(f"환경 변수에서 텔레그램 채팅 ID를 로드했습니다.")
         
-        # 로그 남기기
-        logger.log_system(f"텔레그램 봇 설정 - 토큰: {self.token[:10]}..., 채팅 ID: {self.chat_id}")
-        
-        # 텔레그램 API 기본 URL 설정
+        # API 기본 URL 설정
         self.base_url = f"https://api.telegram.org/bot{self.token}"
+        
+        # 봇 상태 변수
+        self.last_update_id = 0
+        self.bot_running = False
+        self.trading_paused = False
+        self.ready_event = None
+        
+        # 종료 콜백 함수 초기화
+        self.shutdown_callback = None
+        
+        # aiohttp 세션
+        self._session = None  # aiohttp 세션 싱글톤
         
         self.commands = {
             '/status': self.get_status,
@@ -61,13 +70,7 @@ class TelegramBotHandler:
             '/price': self.get_price,
             '/help': self.get_help,
         }
-        self.last_update_id = 0
-        self.bot_running = False
-        self.trading_paused = False
-        self.shutdown_callback = None
-        self.ready_event = None  # 초기화 시점에는 None으로 설정
         self.message_lock = asyncio.Lock()  # 메시지 전송 동시성 제어를 위한 락
-        self._session = None  # aiohttp 세션 싱글톤
         
     def set_shutdown_callback(self, callback: Callable):
         """종료 콜백 설정"""
@@ -338,6 +341,11 @@ class TelegramBotHandler:
     
     async def _send_message(self, text: str, reply_to: str = None, max_retries: int = 3):
         """내부 메시지 전송 (재시도 로직 포함)"""
+        # 봇이 종료된 상태이면 메시지 전송 중단
+        if not self.bot_running:
+            logger.log_system("봇이 종료되어 메시지를 전송하지 않습니다.", level="WARNING")
+            return None
+            
         # 실제 메시지 전송 구현
         message_id = None
         error_message = None
@@ -346,7 +354,8 @@ class TelegramBotHandler:
         
         params = {
             "chat_id": self.chat_id,
-            "text": text
+            "text": text,
+            "parse_mode": "Markdown"  # 마크다운 지원 추가
         }
         
         if reply_to:
@@ -370,27 +379,45 @@ class TelegramBotHandler:
             try:
                 logger.log_system(f"텔레그램 API 요청 시도 #{attempt+1}: {self.base_url}/sendMessage")
                 
+                # 봇 종료 확인 - 각 시도 전에 확인
+                if not self.bot_running:
+                    logger.log_system("봇이 종료되어 메시지 전송 시도를 중단합니다.", level="WARNING")
+                    error_message = "Bot is shutting down"
+                    break
+                
                 # 세션이 없으면 생성
                 if self._session is None or self._session.closed:
                     self._session = aiohttp.ClientSession()
                 
-                async with self._session.post(f"{self.base_url}/sendMessage", json=params, timeout=10) as response:
-                    response_data = await response.json()
-                    logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
-                    
-                    if response.status == 200 and response_data.get("ok"):
-                        message_id = response_data.get("result", {}).get("message_id")
-                        status = "SUCCESS"
-                        break
-                    else:
-                        error_message = response_data.get("description", f"HTTP 오류: {response.status}")
-                        logger.log_system(f"텔레그램 메시지 전송 실패 (시도 #{attempt+1}): {error_message}", level="WARNING")
+                try:
+                    async with self._session.post(f"{self.base_url}/sendMessage", json=params, timeout=10) as response:
+                        response_data = await response.json()
+                        logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
                         
-                        # API 토큰 오류인 경우 더 이상 시도하지 않음
-                        if "unauthorized" in error_message.lower() or "forbidden" in error_message.lower():
+                        if response.status == 200 and response_data.get("ok"):
+                            message_id = response_data.get("result", {}).get("message_id")
+                            status = "SUCCESS"
                             break
-                        
-                        await asyncio.sleep(1)  # 잠시 대기 후 재시도
+                        else:
+                            error_message = response_data.get("description", f"HTTP 오류: {response.status}")
+                            logger.log_system(f"텔레그램 메시지 전송 실패 (시도 #{attempt+1}): {error_message}", level="WARNING")
+                            
+                            # API 토큰 오류인 경우 더 이상 시도하지 않음
+                            if "unauthorized" in error_message.lower() or "forbidden" in error_message.lower():
+                                break
+                            
+                            await asyncio.sleep(1)  # 잠시 대기 후 재시도
+                except RuntimeError as re:
+                    # 이벤트 루프 관련 오류 처리
+                    if "Event loop is closed" in str(re):
+                        logger.log_system("이벤트 루프가 닫혀 메시지 전송이 불가능합니다.", level="WARNING")
+                        error_message = "Event loop is closed"
+                        break
+                    raise  # 다른 런타임 오류는 그대로 전파
+                except asyncio.CancelledError:
+                    logger.log_system("작업이 취소되어 메시지 전송이 중단됩니다.", level="WARNING")
+                    error_message = "Task cancelled"
+                    break
             except asyncio.TimeoutError as e:
                 error_message = f"요청 시간 초과: {str(e)}"
                 logger.log_system(f"텔레그램 메시지 전송 타임아웃: {error_message}", level="WARNING")
@@ -787,28 +814,212 @@ class TelegramBotHandler:
     
     async def stop_bot(self, args: List[str]) -> str:
         """프로그램 종료"""
-        if self.shutdown_callback is None:
-            return "❌ 종료 콜백이 설정되지 않았습니다."
-            
         # 확인 요청
         if not args or not args[0] == "confirm":
             return "⚠️ 정말로 트레이딩 봇을 종료하시겠습니까? 확인하려면 `/stop confirm`을 입력하세요."
-            
+        
         await self._send_message("🛑 *트레이딩 봇을 종료합니다...*")
         
-        # 비동기로 종료 처리
-        asyncio.create_task(self._shutdown_bot())
+        # 콜백이 없어도 자체적으로 종료 처리
+        if self.shutdown_callback is None:
+            logger.log_system("종료 콜백이 설정되지 않았습니다. 직접 종료 처리를 시도합니다.", level="WARNING")
+            # 직접 종료 처리 시도
+            asyncio.create_task(self._direct_shutdown())
+        else:
+            # 비동기로 종료 처리
+            asyncio.create_task(self._shutdown_bot())
+        
         return None  # 이미 메시지를 보냈으므로 추가 메시지 필요 없음
-    
-    async def _shutdown_bot(self):
-        """봇 종료 처리"""
+        
+    async def _direct_shutdown(self):
+        """콜백 없이 직접 종료 처리"""
+        # 필요한 모듈 임포트
+        import os
+        import sys
+        
+        logger.log_system("직접 종료 처리 시작", level="INFO")
         # 잠시 대기 후 종료 (메시지 전송 시간 확보)
         await asyncio.sleep(2)
         self.bot_running = False
         
+        # 세션 정리 (새 메시지 전송 방지)
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+                logger.log_system("텔레그램 세션 정상 종료", level="INFO")
+        except Exception as e:
+            logger.log_error(e, "텔레그램 세션 종료 중 오류")
+        
+        # DB에 상태 업데이트
+        try:
+            db.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
+            logger.log_system("시스템 상태를 '종료됨'으로 업데이트", level="INFO")
+        except Exception as e:
+            logger.log_error(e, "상태 업데이트 중 오류")
+        
+        # 프로그램 강제 종료 - 백엔드까지 종료
+        logger.log_system("텔레그램 명령으로 프로그램을 종료합니다", level="INFO")
+        
+        # 2초 후 프로그램 종료
+        await asyncio.sleep(2)
+        
+        # 먼저 Windows taskkill 명령을 실행하여 모든 관련 프로세스 종료 시도
+        try:
+            # Windows 환경인 경우
+            if os.name == 'nt':
+                logger.log_system("Windows taskkill 명령으로 관련 프로세스 종료 시도", level="INFO")
+                # 백엔드 프로세스 종료 시도 (main.py)
+                os.system('taskkill /f /im python.exe /fi "COMMANDLINE eq *main.py*"')
+                # 다른 trading_bot 관련 프로세스 종료 시도
+                os.system('taskkill /f /im python.exe /fi "COMMANDLINE eq *trading_bot*"')
+                # 모든 Python 프로세스 종료 시도 (위험할 수 있으므로 마지막 수단)
+                os.system('taskkill /f /im python.exe /fi "USERNAME eq %USERNAME%"')
+                logger.log_system("taskkill 명령 실행 완료", level="INFO")
+        except Exception as e:
+            logger.log_error(e, "taskkill 명령 실행 중 오류")
+        
+        # Python 프로세스 종료 시도 (psutil 사용)
+        try:
+            # psutil을 이용해 백엔드 프로세스도 함께 종료
+            import psutil
+            current_pid = os.getpid()
+            logger.log_system(f"현재 프로세스 PID: {current_pid}", level="INFO")
+            current_process = psutil.Process(current_pid)
+            
+            # 현재 프로세스의 부모 찾기 (main.py 프로세스일 수 있음)
+            try:
+                parent = current_process.parent()
+                logger.log_system(f"부모 프로세스: {parent.name()} (PID: {parent.pid})", level="INFO")
+                
+                # 부모가 python 프로세스인 경우 종료
+                if "python" in parent.name().lower():
+                    logger.log_system(f"부모 Python 프로세스 (PID: {parent.pid}) 종료 시도", level="INFO")
+                    try:
+                        parent.terminate()  # 부모 프로세스 종료 시도
+                        gone, still_alive = psutil.wait_procs([parent], timeout=3)
+                        if still_alive:
+                            logger.log_system(f"부모 프로세스가 종료되지 않아 강제 종료합니다", level="WARNING")
+                            parent.kill()  # 강제 종료
+                    except psutil.NoSuchProcess:
+                        logger.log_system("부모 프로세스가 이미 종료됨", level="INFO")
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                logger.log_system(f"부모 프로세스 접근 오류: {str(e)}", level="WARNING")
+            
+            # 모든 Python 프로세스 검색
+            logger.log_system("관련 Python 프로세스 검색 시작", level="INFO")
+            python_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # 자기 자신은 제외
+                    if proc.info['pid'] == current_pid:
+                        continue
+                        
+                    # Python 프로세스 검색
+                    proc_name = proc.info['name'].lower()
+                    if "python" in proc_name or "pythonw" in proc_name:
+                        cmd = proc.cmdline()
+                        cmd_str = " ".join(cmd)
+                        
+                        # main.py, start_fixed_system.bat, 또는 trading_bot 관련 프로세스 검색
+                        if any(target in cmd_str for target in ['main.py', 'trading_bot', 'start_fixed_system']):
+                            python_processes.append(proc)
+                            logger.log_system(f"종료 대상 프로세스 발견: PID {proc.info['pid']}, CMD: {cmd_str}", level="INFO")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # 발견된 프로세스 종료
+            if python_processes:
+                logger.log_system(f"{len(python_processes)}개의 관련 프로세스 종료 시도", level="INFO")
+                for proc in python_processes:
+                    try:
+                        proc.terminate()
+                        logger.log_system(f"프로세스 PID {proc.pid} 종료 요청 완료", level="INFO")
+                    except psutil.NoSuchProcess:
+                        logger.log_system(f"프로세스 PID {proc.pid}가 이미 종료됨", level="INFO")
+                    except Exception as e:
+                        logger.log_error(e, f"프로세스 PID {proc.pid} 종료 중 오류")
+                
+                # 프로세스가 종료될 때까지 기다림
+                logger.log_system("프로세스 종료 대기", level="INFO")
+                _, still_alive = psutil.wait_procs(python_processes, timeout=5)
+                
+                # 여전히 살아있는 프로세스 강제 종료
+                if still_alive:
+                    logger.log_system(f"{len(still_alive)}개 프로세스가 여전히 실행 중, 강제 종료 시도", level="WARNING")
+                    for proc in still_alive:
+                        try:
+                            proc.kill()  # 강제 종료
+                            logger.log_system(f"프로세스 PID {proc.pid} 강제 종료 요청", level="WARNING")
+                        except Exception as e:
+                            logger.log_error(e, f"프로세스 PID {proc.pid} 강제 종료 중 오류")
+            else:
+                logger.log_system("종료할 관련 프로세스를 찾지 못했습니다", level="WARNING")
+            
+            # 1초 대기 후 현재 프로세스 종료
+            await asyncio.sleep(1)
+        except ImportError:
+            logger.log_system("psutil 모듈이 설치되지 않아 프로세스 검색이 불가능합니다.", level="WARNING")
+        except Exception as e:
+            logger.log_error(e, "프로세스 종료 중 오류 발생")
+        
+        # 시스템 종료 명령 - 가장 강력한 방법 시도
+        try:
+            # 강제 종료 전에 로그 메시지
+            logger.log_system("강제 종료 전 파이썬 종료 코드 시도", level="INFO")
+            
+            # 시스템 종료 시도 - 다양한 방법
+            try:
+                # 방법 1: sys.exit
+                sys.exit(0)
+            except Exception as e1:
+                logger.log_system(f"sys.exit 실패: {str(e1)}", level="WARNING")
+                
+                # 방법 2: os._exit
+                try:
+                    logger.log_system("os._exit(0)를 통해 프로세스 강제 종료 시도", level="INFO")
+                    os._exit(0)  # 강제 종료
+                except Exception as e2:
+                    logger.log_error(e2, "os._exit 실패")
+        except Exception as e:
+            logger.log_error(e, "시스템 종료 실패")
+            
+            # 최후의 수단
+            os._exit(1)
+            
+    async def _shutdown_bot(self):
+        """봇 종료 처리 (콜백 사용)"""
+        logger.log_system("텔레그램 봇 종료 시작", level="INFO")
+        
+        # 잠시 대기 후 종료 (메시지 전송 시간 확보)
+        await asyncio.sleep(2)
+        
+        # 봇 종료 상태 설정 및 세션 정리
+        self.bot_running = False
+        
+        # 세션 정리 (새 메시지 전송 방지)
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+                logger.log_system("텔레그램 세션 정상 종료", level="INFO")
+        except Exception as e:
+            logger.log_error(e, "텔레그램 세션 종료 중 오류")
+        
         # 종료 콜백 실행
         if self.shutdown_callback:
-            await self.shutdown_callback()
+            logger.log_system("시스템 종료 콜백 함수 실행", level="INFO")
+            try:
+                await self.shutdown_callback()
+                logger.log_system("시스템 종료 콜백 함수 실행 완료", level="INFO")
+            except Exception as e:
+                logger.log_error(e, "시스템 종료 콜백 함수 실행 중 오류 발생")
+                # 콜백 실행 실패 시 직접 종료 시도
+                logger.log_system("콜백 실행 실패로 직접 종료 시도", level="WARNING")
+                await self._direct_shutdown()
+        else:
+            logger.log_system("종료 콜백이 설정되지 않았습니다. 직접 종료 처리를 시도합니다.", level="WARNING")
+            await self._direct_shutdown()
     
     async def pause_trading(self, args: List[str]) -> str:
         """거래 일시 중지"""
