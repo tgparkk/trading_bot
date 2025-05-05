@@ -2,6 +2,7 @@
 초단기 스캘핑 전략
 """
 import asyncio
+import uuid
 from typing import Dict, Any, List
 from datetime import datetime, timedelta, time
 from collections import deque
@@ -21,7 +22,8 @@ class ScalpingStrategy:
         self.watched_symbols = set()
         self.price_data = {}  # {symbol: deque of tick data}
         self.volume_data = {}  # {symbol: deque of volume data}
-        self.positions = {}  # {symbol: position_data}
+        self.positions = {}  # {position_id: position_data}
+        self.cooldown_symbols = {}  # {symbol: cooldown_end_time}
         
     async def start(self, symbols: List[str]):
         """전략 시작"""
@@ -108,8 +110,9 @@ class ScalpingStrategy:
             logger.log_system("Handling market close...")
             
             # 1. 모든 포지션 청산
-            for symbol, position in list(self.positions.items()):
+            for position_id, position in list(self.positions.items()):
                 try:
+                    symbol = position["symbol"]
                     # 현재가 조회
                     price_data = api_client.get_current_price(symbol)
                     if price_data.get("rt_cd") == "0":
@@ -125,10 +128,10 @@ class ScalpingStrategy:
                             reason="market_close"
                         )
                         
-                        logger.log_system(f"Closed position for {symbol} at market close")
+                        logger.log_system(f"Closed position {position_id} for {symbol} at market close")
                         
                 except Exception as e:
-                    logger.log_error(e, f"Failed to close position for {symbol}")
+                    logger.log_error(e, f"Failed to close position {position_id}")
             
             # 2. 웹소켓 구독 해제
             for symbol in self.watched_symbols:
@@ -199,9 +202,8 @@ class ScalpingStrategy:
                                                 volume_surge, momentum):
                 await self._enter_position(symbol)
             
-            # 청산 조건 체크
-            if symbol in self.positions:
-                await self._check_exit_conditions(symbol)
+            # 청산 조건 체크 (종목별 포지션을 모두 확인)
+            await self._check_exit_conditions(symbol)
                 
         except Exception as e:
             logger.log_error(e, f"Analysis error for {symbol}")
@@ -238,11 +240,41 @@ class ScalpingStrategy:
         
         return (prices[-1] - prices[0]) / prices[0]
     
+    def _get_symbol_positions(self, symbol: str) -> List[str]:
+        """특정 종목의 포지션 ID 목록 반환"""
+        return [
+            position_id for position_id, position in self.positions.items()
+            if position["symbol"] == symbol
+        ]
+    
+    def _get_total_investment_for_symbol(self, symbol: str) -> float:
+        """특정 종목의 총 투자 금액 계산"""
+        total = 0
+        for position in self.positions.values():
+            if position["symbol"] == symbol:
+                total += position["entry_price"] * position["quantity"]
+        return total
+    
     async def _check_entry_conditions(self, symbol: str, volatility: float, 
                                     volume_surge: float, momentum: float) -> bool:
         """진입 조건 확인"""
-        # 이미 포지션이 있으면 스킵
-        if symbol in self.positions:
+        # 쿨다운 기간 중인지 확인
+        if symbol in self.cooldown_symbols:
+            if datetime.now() < self.cooldown_symbols[symbol]:
+                return False
+            else:
+                # 쿨다운 기간이 지났으면 제거
+                del self.cooldown_symbols[symbol]
+        
+        # 종목별 최대 포지션 개수 확인
+        symbol_positions = self._get_symbol_positions(symbol)
+        max_positions_per_symbol = self.params.get("max_positions_per_symbol", 3)
+        if len(symbol_positions) >= max_positions_per_symbol:
+            return False
+        
+        # 종목별 최대 투자 금액 확인
+        max_investment_per_symbol = self.params.get("max_investment_per_symbol", 5000000)  # 5백만원
+        if self._get_total_investment_for_symbol(symbol) >= max_investment_per_symbol:
             return False
         
         # 변동성이 임계값 이상
@@ -288,7 +320,12 @@ class ScalpingStrategy:
             )
             
             if result["status"] == "success":
-                self.positions[symbol] = {
+                # 포지션 ID 생성
+                position_id = str(uuid.uuid4())
+                
+                # 포지션 저장
+                self.positions[position_id] = {
+                    "symbol": symbol,
                     "entry_price": current_price,
                     "entry_time": datetime.now(),
                     "side": side,
@@ -296,7 +333,7 @@ class ScalpingStrategy:
                 }
                 
                 logger.log_system(
-                    f"Entered {side} position for {symbol} at {current_price}"
+                    f"Entered {side} position {position_id} for {symbol} at {current_price}"
                 )
                 
         except Exception as e:
@@ -305,48 +342,51 @@ class ScalpingStrategy:
     async def _check_exit_conditions(self, symbol: str):
         """청산 조건 확인"""
         try:
-            position = self.positions[symbol]
-            current_price = self.price_data[symbol][-1]["price"]
-            
-            # 수익률 계산
-            if position["side"] == "BUY":
-                pnl_rate = (current_price - position["entry_price"]) / position["entry_price"]
-            else:
-                pnl_rate = (position["entry_price"] - current_price) / position["entry_price"]
-            
-            # 시간 경과
-            holding_time = (datetime.now() - position["entry_time"]).total_seconds()
-            
-            # 청산 조건
-            should_exit = False
-            exit_reason = ""
-            
-            # 손절
-            if pnl_rate <= -self.params["stop_loss"]:
-                should_exit = True
-                exit_reason = "stop_loss"
-            
-            # 익절
-            elif pnl_rate >= self.params["take_profit"]:
-                should_exit = True
-                exit_reason = "take_profit"
-            
-            # 시간 만료
-            elif holding_time >= self.params["hold_time"]:
-                should_exit = True
-                exit_reason = "time_exit"
-            
-            # 청산 실행
-            if should_exit:
-                await self._exit_position(symbol, exit_reason)
+            # 이 종목에 해당하는 모든 포지션 확인
+            for position_id in self._get_symbol_positions(symbol):
+                position = self.positions[position_id]
+                current_price = self.price_data[symbol][-1]["price"]
+                
+                # 수익률 계산
+                if position["side"] == "BUY":
+                    pnl_rate = (current_price - position["entry_price"]) / position["entry_price"]
+                else:
+                    pnl_rate = (position["entry_price"] - current_price) / position["entry_price"]
+                
+                # 시간 경과
+                holding_time = (datetime.now() - position["entry_time"]).total_seconds()
+                
+                # 청산 조건
+                should_exit = False
+                exit_reason = ""
+                
+                # 손절
+                if pnl_rate <= -self.params["stop_loss"]:
+                    should_exit = True
+                    exit_reason = "stop_loss"
+                
+                # 익절
+                elif pnl_rate >= self.params["take_profit"]:
+                    should_exit = True
+                    exit_reason = "take_profit"
+                
+                # 시간 만료
+                elif holding_time >= self.params["hold_time"]:
+                    should_exit = True
+                    exit_reason = "time_exit"
+                
+                # 청산 실행
+                if should_exit:
+                    await self._exit_position(position_id, exit_reason)
                 
         except Exception as e:
             logger.log_error(e, f"Exit check error for {symbol}")
     
-    async def _exit_position(self, symbol: str, reason: str):
+    async def _exit_position(self, position_id: str, reason: str):
         """포지션 청산"""
         try:
-            position = self.positions[symbol]
+            position = self.positions[position_id]
+            symbol = position["symbol"]
             exit_side = "SELL" if position["side"] == "BUY" else "BUY"
             
             result = await order_manager.place_order(
@@ -359,18 +399,31 @@ class ScalpingStrategy:
             )
             
             if result["status"] == "success":
-                del self.positions[symbol]
-                logger.log_system(
-                    f"Exited position for {symbol}, reason: {reason}"
-                )
+                # 포지션 제거
+                del self.positions[position_id]
+                
+                # 특정 조건에서만 쿨다운 설정
+                if reason == "stop_loss":
+                    # 손절 시 쿨다운 설정 (더 긴 시간)
+                    cooldown_minutes = self.params.get("cooldown_minutes_stop_loss", 5)
+                    self.cooldown_symbols[symbol] = datetime.now() + timedelta(minutes=cooldown_minutes)
+                    logger.log_system(
+                        f"Exited position {position_id} for {symbol}, reason: {reason}, cooldown until {self.cooldown_symbols[symbol].strftime('%H:%M:%S')}"
+                    )
+                else:
+                    logger.log_system(
+                        f"Exited position {position_id} for {symbol}, reason: {reason}"
+                    )
                 
         except Exception as e:
-            logger.log_error(e, f"Exit error for {symbol}")
+            logger.log_error(e, f"Exit error for position {position_id}")
     
     async def _monitor_positions(self):
         """포지션 모니터링"""
         try:
-            for symbol, position in list(self.positions.items()):
+            for position_id, position in list(self.positions.items()):
+                symbol = position["symbol"]
+                
                 # 현재 가격 확인
                 if symbol not in self.price_data or not self.price_data[symbol]:
                     continue
@@ -385,7 +438,7 @@ class ScalpingStrategy:
                 
                 # 급락/급등 시 긴급 청산
                 if abs(pnl_rate) > 0.05:  # 5% 이상 변동
-                    await self._exit_position(symbol, "emergency_exit")
+                    await self._exit_position(position_id, "emergency_exit")
                     await alert_system.notify_large_movement(
                         symbol, pnl_rate, self._detect_volume_surge(symbol)
                     )
