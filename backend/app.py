@@ -20,212 +20,21 @@ import time
 import atexit
 
 app = Flask(__name__)
-# CORS 설정 추가 - 모든 오리진에서의 요청 허용
+# CORS 설정 개선 - 모든 경로에 대해 모든 오리진에서의 요청 허용
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # 텔레그램 봇 상태 관리 전역 변수
 telegram_bot_initialized = False
 telegram_lock_file = os.path.join(Path(__file__).parent.parent, "telegram_bot.lock")
 
-# KIS API 접속 테스트 및 결과 텔레그램 전송 함수
-async def test_kis_api_connection():
-    try:
-        # KIS API 접속 시도 전 메시지 전송
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pre_message = f"""
-        *KIS API 접속 시도* 🔄
-        시도 시간: {current_time}
-        
-        한국투자증권 API 서버에 접속을 시도합니다.
-        """
-        
-        logger.log_system("KIS API 접속 시도 전 메시지 전송 중...")
-        await telegram_bot_handler.send_message(pre_message)
-        logger.log_system("KIS API 접속 시도 전 메시지 전송 완료")
-        
-        # 접속 시도 시간 기록을 위해 1초 대기
-        await asyncio.sleep(1)
-        
-        # KIS API 접속 시도
-        logger.log_system("KIS API 접속 시도 (계좌 잔고 조회)...")
-        result = api_client.get_account_balance()
-        
-        # 현재 시간 갱신
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 결과 확인 및 메시지 전송
-        if result and result.get("rt_cd") == "0":
-            # 성공 메시지
-            logger.log_system("KIS API 접속 성공")
-            success_message = f"""
-            *KIS API 접속 성공* ✅
-            접속 시간: {current_time}
-            
-            한국투자증권 API 서버에 성공적으로 접속했습니다.
-            응답 메시지: {result.get("msg1", "정상")}
-            """
-            
-            logger.log_system("KIS API 접속 성공 메시지 전송 중...")
-            await telegram_bot_handler.send_message(success_message)
-            logger.log_system("KIS API 접속 성공 메시지 전송 완료")
-            return True
-        else:
-            # 실패 메시지
-            error_msg = result.get("msg1", "알 수 없는 오류") if result else "응답 없음"
-            logger.log_system(f"KIS API 접속 실패: {error_msg}")
-            
-            fail_message = f"""
-            *KIS API 접속 실패* ❌
-            시도 시간: {current_time}
-            
-            한국투자증권 API 서버 접속에 실패했습니다.
-            오류: {error_msg}
-            """
-            
-            logger.log_system("KIS API 접속 실패 메시지 전송 중...")
-            await telegram_bot_handler.send_message(fail_message)
-            logger.log_system("KIS API 접속 실패 메시지 전송 완료")
-            return False
-            
-    except Exception as e:
-        # 예외 발생 시 메시지
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.log_error(e, "KIS API 접속 중 예외 발생")
-        
-        error_message = f"""
-        *KIS API 접속 중 오류 발생* ❌
-        시도 시간: {current_time}
-        
-        한국투자증권 API 서버 접속 중 예외가 발생했습니다.
-        오류 내용: {str(e)}
-        """
-        
-        try:
-            logger.log_system("KIS API 접속 오류 메시지 전송 중...")
-            await telegram_bot_handler.send_message(error_message)
-            logger.log_system("KIS API 접속 오류 메시지 전송 완료")
-        except Exception as msg_error:
-            logger.log_error(msg_error, "KIS API 접속 오류 메시지 전송 실패")
-        
-        return False
+# 테스트용 API 엔드포인트 추가
+@app.route('/test')
+def test():
+    return jsonify({"status": "OK", "message": "Test endpoint is working"})
 
-# 텔레그램 봇 핸들러 초기화 및 시작 메시지 전송
-async def init_telegram_handler():
-    global telegram_bot_initialized
-    
-    # 이미 초기화된 경우 건너뛰기
-    if telegram_bot_initialized:
-        logger.log_system("텔레그램 봇이 이미 초기화되어 있습니다.")
-        return
-    
-    try:
-        # 텔레그램 봇 핸들러 준비 대기
-        logger.log_system("대시보드 백엔드: 텔레그램 봇 핸들러 준비 대기...")
-        await telegram_bot_handler.wait_until_ready(timeout=10)
-        
-        # 대시보드 시작 알림 전송
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        dashboard_message = f"""
-        *트레이딩 봇 대시보드 시작* 🚀
-        시작 시간: {current_time}
-
-        웹 기반 대시보드 모드로 트레이딩 봇이 시작되었습니다.
-        백엔드 API 서버가 실행 중입니다.
-        """
-        
-        logger.log_system("대시보드 시작 알림 전송 시도...")
-        await telegram_bot_handler.send_message(dashboard_message)
-        logger.log_system("대시보드 시작 알림 전송 완료")
-        
-        # KIS API 접속 테스트 및 결과 전송
-        await test_kis_api_connection()
-        
-        # 초기화 완료 표시
-        telegram_bot_initialized = True
-        
-        # 잠금 파일 생성
-        with open(telegram_lock_file, "w") as f:
-            f.write(str(datetime.now().timestamp()))
-            
-    except Exception as e:
-        logger.log_error(e, "대시보드 시작 알림 전송 실패")
-
-# 텔레그램 봇 종료 처리
-def cleanup_telegram_bot():
-    # 잠금 파일 제거
-    try:
-        if os.path.exists(telegram_lock_file):
-            os.remove(telegram_lock_file)
-            logger.log_system("텔레그램 봇 잠금 파일 제거 완료")
-    except Exception as e:
-        logger.log_error(e, "텔레그램 봇 잠금 파일 제거 실패")
-
-# 프로그램 종료 시 정리 작업 등록
-atexit.register(cleanup_telegram_bot)
-
-# 텔레그램 봇 잠금 파일 확인
-def check_telegram_lock():
-    if os.path.exists(telegram_lock_file):
-        try:
-            # 파일이 있지만 5분(300초) 이상 지난 경우 무시하고 제거
-            file_time = os.path.getmtime(telegram_lock_file)
-            current_time = time.time()
-            if current_time - file_time > 300:
-                logger.log_system("오래된 텔레그램 봇 잠금 파일 발견. 제거합니다.")
-                os.remove(telegram_lock_file)
-                return False
-            return True
-        except Exception as e:
-            logger.log_error(e, "텔레그램 봇 잠금 파일 확인 실패")
-            return False
-    return False
-
-# 비동기 작업을 처리하기 위한 이벤트 루프 생성 및 실행
-def start_telegram_handler():
-    global telegram_bot_initialized
-    
-    # 이미 실행 중인 텔레그램 봇이 있는지 확인
-    if check_telegram_lock():
-        logger.log_system("다른 프로세스에서 실행 중인 텔레그램 봇이 감지되었습니다. 텔레그램 초기화를 건너뜁니다.")
-        telegram_bot_initialized = True
-        return
-    
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # 텔레그램 폴링 태스크 시작
-        telegram_task = loop.create_task(telegram_bot_handler.start_polling())
-        
-        # 초기화 및 시작 메시지 전송 (및 KIS API 접속 테스트)
-        loop.run_until_complete(init_telegram_handler())
-        
-        # 이벤트 루프 계속 실행 (백그라운드 스레드에서)
-        def run_event_loop(loop):
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_forever()
-            except Exception as e:
-                logger.log_error(e, "텔레그램 이벤트 루프 실행 오류")
-            finally:
-                if not loop.is_closed():
-                    loop.close()
-                    logger.log_system("텔레그램 이벤트 루프가 정상적으로 종료되었습니다.")
-            
-        thread = threading.Thread(target=run_event_loop, args=(loop,), daemon=True)
-        thread.start()
-        
-        logger.log_system("텔레그램 핸들러가 백그라운드에서 실행 중입니다.")
-    except Exception as e:
-        logger.log_error(e, "텔레그램 핸들러 시작 오류")
-
-# 서버 시작 시 텔레그램 핸들러 초기화
-if __name__ == "__main__":
-    start_telegram_handler()
-    app.run(host='0.0.0.0', port=5050, debug=False)
-else:
-    # WSGI 서버에서 실행될 때도 텔레그램 핸들러 시작
-    start_telegram_handler()
+@app.route('/api/test')
+def api_test():
+    return jsonify({"status": "OK", "message": "API test endpoint is working"})
 
 @app.route('/')
 def home():
@@ -458,4 +267,205 @@ def api_test_kis_connection():
         else:
             return jsonify({'success': False, 'message': 'KIS API 접속 실패'})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500 
+        return jsonify({'error': str(e)}), 500
+
+# KIS API 접속 테스트 및 결과 텔레그램 전송 함수
+async def test_kis_api_connection():
+    try:
+        # KIS API 접속 시도 전 메시지 전송
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pre_message = f"""
+        *KIS API 접속 시도* 🔄
+        시도 시간: {current_time}
+        
+        한국투자증권 API 서버에 접속을 시도합니다.
+        """
+        
+        logger.log_system("KIS API 접속 시도 전 메시지 전송 중...")
+        await telegram_bot_handler.send_message(pre_message)
+        logger.log_system("KIS API 접속 시도 전 메시지 전송 완료")
+        
+        # 접속 시도 시간 기록을 위해 1초 대기
+        await asyncio.sleep(1)
+        
+        # KIS API 접속 시도
+        logger.log_system("KIS API 접속 시도 (계좌 잔고 조회)...")
+        result = api_client.get_account_balance()
+        
+        # 현재 시간 갱신
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 결과 확인 및 메시지 전송
+        if result and result.get("rt_cd") == "0":
+            # 성공 메시지
+            logger.log_system("KIS API 접속 성공")
+            success_message = f"""
+            *KIS API 접속 성공* ✅
+            접속 시간: {current_time}
+            
+            한국투자증권 API 서버에 성공적으로 접속했습니다.
+            응답 메시지: {result.get("msg1", "정상")}
+            """
+            
+            logger.log_system("KIS API 접속 성공 메시지 전송 중...")
+            await telegram_bot_handler.send_message(success_message)
+            logger.log_system("KIS API 접속 성공 메시지 전송 완료")
+            return True
+        else:
+            # 실패 메시지
+            error_msg = result.get("msg1", "알 수 없는 오류") if result else "응답 없음"
+            logger.log_system(f"KIS API 접속 실패: {error_msg}")
+            
+            fail_message = f"""
+            *KIS API 접속 실패* ❌
+            시도 시간: {current_time}
+            
+            한국투자증권 API 서버 접속에 실패했습니다.
+            오류: {error_msg}
+            """
+            
+            logger.log_system("KIS API 접속 실패 메시지 전송 중...")
+            await telegram_bot_handler.send_message(fail_message)
+            logger.log_system("KIS API 접속 실패 메시지 전송 완료")
+            return False
+            
+    except Exception as e:
+        # 예외 발생 시 메시지
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.log_error(e, "KIS API 접속 중 예외 발생")
+        
+        error_message = f"""
+        *KIS API 접속 중 오류 발생* ❌
+        시도 시간: {current_time}
+        
+        한국투자증권 API 서버 접속 중 예외가 발생했습니다.
+        오류 내용: {str(e)}
+        """
+        
+        try:
+            logger.log_system("KIS API 접속 오류 메시지 전송 중...")
+            await telegram_bot_handler.send_message(error_message)
+            logger.log_system("KIS API 접속 오류 메시지 전송 완료")
+        except Exception as msg_error:
+            logger.log_error(msg_error, "KIS API 접속 오류 메시지 전송 실패")
+        
+        return False
+
+# 텔레그램 봇 핸들러 초기화 및 시작 메시지 전송
+async def init_telegram_handler():
+    global telegram_bot_initialized
+    
+    # 이미 초기화된 경우 건너뛰기
+    if telegram_bot_initialized:
+        logger.log_system("텔레그램 봇이 이미 초기화되어 있습니다.")
+        return
+    
+    try:
+        # 텔레그램 봇 핸들러 준비 대기
+        logger.log_system("대시보드 백엔드: 텔레그램 봇 핸들러 준비 대기...")
+        await telegram_bot_handler.wait_until_ready(timeout=10)
+        
+        # 대시보드 시작 알림 전송
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        dashboard_message = f"""
+        *트레이딩 봇 대시보드 시작* 🚀
+        시작 시간: {current_time}
+
+        웹 기반 대시보드 모드로 트레이딩 봇이 시작되었습니다.
+        백엔드 API 서버가 실행 중입니다.
+        """
+        
+        logger.log_system("대시보드 시작 알림 전송 시도...")
+        await telegram_bot_handler.send_message(dashboard_message)
+        logger.log_system("대시보드 시작 알림 전송 완료")
+        
+        # KIS API 접속 테스트 및 결과 전송
+        await test_kis_api_connection()
+        
+        # 초기화 완료 표시
+        telegram_bot_initialized = True
+        
+        # 잠금 파일 생성
+        with open(telegram_lock_file, "w") as f:
+            f.write(str(datetime.now().timestamp()))
+            
+    except Exception as e:
+        logger.log_error(e, "대시보드 시작 알림 전송 실패")
+
+# 텔레그램 봇 종료 처리
+def cleanup_telegram_bot():
+    # 잠금 파일 제거
+    try:
+        if os.path.exists(telegram_lock_file):
+            os.remove(telegram_lock_file)
+            logger.log_system("텔레그램 봇 잠금 파일 제거 완료")
+    except Exception as e:
+        logger.log_error(e, "텔레그램 봇 잠금 파일 제거 실패")
+
+# 프로그램 종료 시 정리 작업 등록
+atexit.register(cleanup_telegram_bot)
+
+# 텔레그램 봇 잠금 파일 확인
+def check_telegram_lock():
+    if os.path.exists(telegram_lock_file):
+        try:
+            # 파일이 있지만 5분(300초) 이상 지난 경우 무시하고 제거
+            file_time = os.path.getmtime(telegram_lock_file)
+            current_time = time.time()
+            if current_time - file_time > 300:
+                logger.log_system("오래된 텔레그램 봇 잠금 파일 발견. 제거합니다.")
+                os.remove(telegram_lock_file)
+                return False
+            return True
+        except Exception as e:
+            logger.log_error(e, "텔레그램 봇 잠금 파일 확인 실패")
+            return False
+    return False
+
+# 비동기 작업을 처리하기 위한 이벤트 루프 생성 및 실행
+def start_telegram_handler():
+    global telegram_bot_initialized
+    
+    # 이미 실행 중인 텔레그램 봇이 있는지 확인
+    if check_telegram_lock():
+        logger.log_system("다른 프로세스에서 실행 중인 텔레그램 봇이 감지되었습니다. 텔레그램 초기화를 건너뜁니다.")
+        telegram_bot_initialized = True
+        return
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 텔레그램 폴링 태스크 시작
+        telegram_task = loop.create_task(telegram_bot_handler.start_polling())
+        
+        # 초기화 및 시작 메시지 전송 (및 KIS API 접속 테스트)
+        loop.run_until_complete(init_telegram_handler())
+        
+        # 이벤트 루프 계속 실행 (백그라운드 스레드에서)
+        def run_event_loop(loop):
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_forever()
+            except Exception as e:
+                logger.log_error(e, "텔레그램 이벤트 루프 실행 오류")
+            finally:
+                if not loop.is_closed():
+                    loop.close()
+                    logger.log_system("텔레그램 이벤트 루프가 정상적으로 종료되었습니다.")
+            
+        thread = threading.Thread(target=run_event_loop, args=(loop,), daemon=True)
+        thread.start()
+        
+        logger.log_system("텔레그램 핸들러가 백그라운드에서 실행 중입니다.")
+    except Exception as e:
+        logger.log_error(e, "텔레그램 핸들러 시작 오류")
+
+# 서버 시작 시 텔레그램 핸들러 초기화
+if __name__ == "__main__":
+    start_telegram_handler()
+    # 디버그 모드 활성화
+    app.run(host='0.0.0.0', port=5050, debug=True)
+else:
+    # WSGI 서버에서 실행될 때도 텔레그램 핸들러 시작
+    start_telegram_handler() 
