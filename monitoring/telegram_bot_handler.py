@@ -394,6 +394,35 @@ class TelegramBotHandler:
             logger.log_system("봇이 종료되어 일반 메시지를 전송하지 않습니다.", level="WARNING")
             return None
         
+        # 이벤트 루프가 닫혀있는지 확인
+        try:
+            current_loop = asyncio.get_running_loop()
+            if current_loop.is_closed():
+                logger.log_system("이벤트 루프가 닫혀 메시지 전송이 불가능합니다.", level="WARNING")
+                # DB에 저장만 하고 전송은 하지 않음
+                db_message_id = db.save_telegram_message(
+                    direction="OUTGOING",
+                    chat_id=self.chat_id,
+                    message_text=text,
+                    reply_to=reply_to,
+                    status="FAIL",
+                    error_message="이벤트 루프 닫힘"
+                )
+                return None
+        except RuntimeError:
+            # 이벤트 루프가 없는 상태 - 프로그램 종료 중일 가능성이 높음
+            logger.log_system("이벤트 루프를 가져올 수 없습니다. 프로그램이 종료 중일 수 있습니다.", level="WARNING")
+            # DB에 저장만 하고 전송은 하지 않음
+            db_message_id = db.save_telegram_message(
+                direction="OUTGOING",
+                chat_id=self.chat_id,
+                message_text=text,
+                reply_to=reply_to,
+                status="FAIL", 
+                error_message="이벤트 루프 없음"
+            )
+            return None
+        
         # 메시지 ID 생성 및 DB 저장
         db_message_id = db.save_telegram_message(
             direction="OUTGOING",
@@ -423,77 +452,77 @@ class TelegramBotHandler:
                 # 세션이 없거나 닫혀있는 경우 새로 생성
                 if self._session is None or self._session.closed:
                     logger.log_system("텔레그램 API 세션이 없거나 닫혀 있어 새로 생성합니다.", level="WARNING")
-                    self._session = aiohttp.ClientSession()
-                
-                # 이벤트 루프가 닫혀있는지 확인
-                try:
-                    current_loop = asyncio.get_event_loop()
-                    if current_loop.is_closed():
-                        logger.log_system("이벤트 루프가 닫혀 메시지 전송이 불가능합니다.", level="WARNING")
-                        # 메시지 전송 실패 상태 업데이트
-                        db.update_telegram_message(db_message_id, status="FAIL", error_message="이벤트 루프 닫힘")
+                    try:
+                        self._session = aiohttp.ClientSession()
+                    except RuntimeError as e:
+                        # 이벤트 루프 관련 오류 (이벤트 루프가 닫혀있을 가능성)
+                        logger.log_system(f"세션 생성 중 이벤트 루프 오류: {str(e)}", level="WARNING")
+                        db.update_telegram_message(db_message_id, status="FAIL", error_message=f"세션 생성 실패: {str(e)}")
                         return None
-                except RuntimeError as loop_error:
-                    logger.log_system(f"이벤트 루프 관련 오류: {str(loop_error)}", level="WARNING")
-                    # 메시지 전송 실패 상태 업데이트
-                    db.update_telegram_message(db_message_id, status="FAIL", error_message=f"이벤트 루프 오류: {str(loop_error)}")
-                    return None
                 
-                # API 요청 전송
-                async with self._session.post(url, params=params, timeout=10) as response:
-                    logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
-                    
-                    # 응답 처리
-                    if response.status == 200:
-                        result = await response.json()
+                # API 요청 전송 시도
+                try:
+                    async with self._session.post(url, params=params, timeout=10) as response:
+                        logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
                         
-                        if result.get("ok"):
-                            # 성공적으로 전송된 메시지 ID 저장
-                            message_id = result.get("result", {}).get("message_id")
+                        # 응답 처리
+                        if response.status == 200:
+                            result = await response.json()
                             
-                            # DB에 메시지 ID 및 상태 업데이트
-                            db.update_telegram_message(db_message_id, message_id=str(message_id), status="SUCCESS")
-                            logger.log_system(f"발신 메시지 DB 상태 업데이트 완료 (Status: SUCCESS)")
-                            
-                            return message_id
+                            if result.get("ok"):
+                                # 성공적으로 전송된 메시지 ID 저장
+                                message_id = result.get("result", {}).get("message_id")
+                                
+                                # DB에 메시지 ID 및 상태 업데이트
+                                db.update_telegram_message(db_message_id, message_id=str(message_id), status="SUCCESS")
+                                logger.log_system(f"발신 메시지 DB 상태 업데이트 완료 (Status: SUCCESS)")
+                                
+                                return message_id
+                            else:
+                                # 텔레그램 API 오류 처리
+                                error_code = result.get("error_code")
+                                description = result.get("description", "알 수 없는 오류")
+                                
+                                logger.log_system(f"텔레그램 API 오류: {error_code} - {description}", level="ERROR")
+                                
+                                # DB에 오류 상태 업데이트
+                                db.update_telegram_message(
+                                    db_message_id, 
+                                    status="FAIL", 
+                                    error_message=f"API 오류: {error_code} - {description}"
+                                )
+                                
+                                # 재시도 가능한 오류인 경우 계속 시도
+                                if error_code in [429, 500, 502, 503, 504] and attempt < max_retries:
+                                    await asyncio.sleep(attempt * 2)  # 지수 백오프
+                                    continue
+                                
+                                return None
                         else:
-                            # 텔레그램 API 오류 처리
-                            error_code = result.get("error_code")
-                            description = result.get("description", "알 수 없는 오류")
-                            
-                            logger.log_system(f"텔레그램 API 오류: {error_code} - {description}", level="ERROR")
+                            # HTTP 오류 처리
+                            error_text = await response.text()
+                            logger.log_system(f"텔레그램 API HTTP 오류: {response.status} - {error_text}", level="ERROR")
                             
                             # DB에 오류 상태 업데이트
                             db.update_telegram_message(
                                 db_message_id, 
                                 status="FAIL", 
-                                error_message=f"API 오류: {error_code} - {description}"
+                                error_message=f"HTTP 오류: {response.status} - {error_text[:100]}"
                             )
                             
-                            # 재시도 가능한 오류인 경우 계속 시도
-                            if error_code in [429, 500, 502, 503, 504] and attempt < max_retries:
+                            # 재시도 가능한 HTTP 오류인 경우 계속 시도
+                            if response.status in [429, 500, 502, 503, 504] and attempt < max_retries:
                                 await asyncio.sleep(attempt * 2)  # 지수 백오프
                                 continue
                             
                             return None
-                    else:
-                        # HTTP 오류 처리
-                        error_text = await response.text()
-                        logger.log_system(f"텔레그램 API HTTP 오류: {response.status} - {error_text}", level="ERROR")
-                        
-                        # DB에 오류 상태 업데이트
-                        db.update_telegram_message(
-                            db_message_id, 
-                            status="FAIL", 
-                            error_message=f"HTTP 오류: {response.status} - {error_text[:100]}"
-                        )
-                        
-                        # 재시도 가능한 HTTP 오류인 경우 계속 시도
-                        if response.status in [429, 500, 502, 503, 504] and attempt < max_retries:
-                            await asyncio.sleep(attempt * 2)  # 지수 백오프
-                            continue
-                        
+                except RuntimeError as e:
+                    # 이벤트 루프 관련 오류 (이벤트 루프가 닫혀있을 가능성)
+                    if "loop is closed" in str(e) or "Event loop is closed" in str(e):
+                        logger.log_system("이벤트 루프가 닫혀 텔레그램 API 요청을 보낼 수 없습니다.", level="WARNING")
+                        db.update_telegram_message(db_message_id, status="FAIL", error_message="이벤트 루프 닫힘")
                         return None
+                    raise  # 다른 런타임 오류는 다시 발생시킴
             
             except aiohttp.ClientError as e:
                 # 네트워크 관련 오류 처리
@@ -550,17 +579,37 @@ class TelegramBotHandler:
     async def wait_until_ready(self, timeout: Optional[float] = None):
         """봇이 준비될 때까지 대기"""
         try:
+            # 이벤트 루프가 닫혀있는지 확인
+            try:
+                current_loop = asyncio.get_running_loop()
+                if current_loop.is_closed():
+                    logger.log_system("이벤트 루프가 닫혀 있어 텔레그램 봇 준비 상태를 확인할 수 없습니다.", level="WARNING")
+                    return False
+            except RuntimeError:
+                logger.log_system("현재 실행 중인 이벤트 루프를 가져올 수 없습니다.", level="WARNING")
+                return False
+                
             # ready_event가 None이면 봇이 아직 시작되지 않은 것
             if self.ready_event is None:
                 logger.log_system("텔레그램 봇 핸들러가 아직 시작되지 않았습니다. 자동으로 시작합니다.", level="WARNING")
                 # 이벤트 초기화 및 폴링 시작
                 self.ready_event = asyncio.Event()
                 # 백그라운드에서 폴링 시작
-                asyncio.create_task(self.start_polling())
+                try:
+                    asyncio.create_task(self.start_polling())
+                except RuntimeError as e:
+                    if "loop is closed" in str(e) or "Event loop is closed" in str(e):
+                        logger.log_system("이벤트 루프가 닫혀 텔레그램 봇을 시작할 수 없습니다.", level="WARNING")
+                        return False
+                    raise
                 
             # 타임아웃과 함께 대기
             if timeout is not None:
-                await asyncio.wait_for(self.ready_event.wait(), timeout=timeout)
+                try:
+                    await asyncio.wait_for(self.ready_event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.log_system(f"텔레그램 봇 준비 시간 초과 ({timeout}초)", level="WARNING")
+                    raise
             else:
                 await self.ready_event.wait()
                 
@@ -569,6 +618,14 @@ class TelegramBotHandler:
         except asyncio.TimeoutError:
             logger.log_system(f"텔레그램 봇 준비 시간 초과 ({timeout}초)", level="WARNING")
             raise
+        except RuntimeError as e:
+            if "loop is closed" in str(e) or "Event loop is closed" in str(e):
+                logger.log_system("이벤트 루프가 닫혀 있어 텔레그램 봇 준비 상태를 확인할 수 없습니다.", level="WARNING")
+                return False
+            raise
+        except Exception as e:
+            logger.log_error(e, "텔레그램 봇 준비 대기 중 오류 발생")
+            return False
     
     # 명령어 핸들러들
     async def get_status(self, args: List[str]) -> str:
@@ -1350,6 +1407,25 @@ class TelegramBotHandler:
 <b>요약</b>: {summary}
 
 {f'종목코드 {symbol}의 ' if symbol else ''}최근 {len(trades)}건 표시 (최대 {limit}건)"""
+
+    async def close_session(self):
+        """세션 명시적 종료 메소드 - 프로그램 종료 전 호출용"""
+        logger.log_system("텔레그램 봇 세션 명시적 종료 요청 받음...")
+        try:
+            if self._session and not self._session.closed:
+                logger.log_system("텔레그램 봇 세션 닫기 시도...")
+                await self._session.close()
+                self._session = None
+                logger.log_system("텔레그램 봇 세션 명시적으로 닫힘")
+            else:
+                logger.log_system("텔레그램 봇 세션이 이미 닫혀있거나 없음")
+            
+            # 봇 상태 업데이트
+            self.bot_running = False
+            return True
+        except Exception as e:
+            logger.log_error(e, "텔레그램 봇 세션 종료 중 오류")
+            return False
 
 # 싱글톤 인스턴스
 telegram_bot_handler = TelegramBotHandler() 

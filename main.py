@@ -235,14 +235,31 @@ class TradingBot:
             if shutdown_message:
                 logger.log_system(f"{message_type} 알림 전송 시도...")
                 try:
-                    # 텔레그램 핸들러 준비 대기 (최대 5초)
-                    logger.log_system("종료 알림 전송 전 텔레그램 핸들러 준비 대기...")
-                    await telegram_bot_handler.wait_until_ready(timeout=5)
-
-                    # 텔레그램 메시지 전송 및 DB 저장 (await 추가)
-                    logger.log_system(f"{message_type} 알림 전송 실행...")
-                    await telegram_bot_handler.send_message(shutdown_message)
-                    logger.log_system(f"{message_type} 알림 전송 완료 (DB 저장 확인 필요)")
+                    # 텔레그램 핸들러가 준비되어 있는지 확인 (예외 처리 추가)
+                    telegram_ready = False
+                    try:
+                        # 텔레그램 핸들러 준비 대기 (최대 5초)
+                        logger.log_system("종료 알림 전송 전 텔레그램 핸들러 준비 대기...")
+                        await telegram_bot_handler.wait_until_ready(timeout=5)
+                        telegram_ready = True
+                    except asyncio.TimeoutError:
+                        logger.log_warning("텔레그램 핸들러 준비 대기 시간 초과, 최대한 알림 전송 시도합니다.")
+                    except Exception as wait_error:
+                        logger.log_error(wait_error, "텔레그램 핸들러 준비 체크 중 오류")
+                    
+                    # 알림 전송 시도 (이벤트 루프 닫힘 오류에 대비한 예외 처리 추가)
+                    if telegram_ready or is_important_message(shutdown_message):
+                        logger.log_system(f"{message_type} 알림 전송 실행...")
+                        try:
+                            await telegram_bot_handler.send_message(shutdown_message)
+                            logger.log_system(f"{message_type} 알림 전송 완료 (DB 저장 확인 필요)")
+                            # 메시지 전송 후 잠시 대기하여 메시지 전송이 완료될 시간 제공
+                            await asyncio.sleep(2)
+                        except RuntimeError as e:
+                            if "loop is closed" in str(e) or "Event loop is closed" in str(e):
+                                logger.log_warning(f"이벤트 루프가 닫혀 {message_type} 알림 전송 실패")
+                            else:
+                                raise
                 except asyncio.TimeoutError:
                      logger.log_warning("텔레그램 핸들러 준비 대기 시간 초과, 알림 전송 건너뜀.")
                 except Exception as e:
@@ -254,6 +271,13 @@ class TradingBot:
         except Exception as e:
             logger.log_error(e, "Error during shutdown process")
             return
+
+def is_important_message(message: str) -> bool:
+    """중요 메시지 여부 확인 (오류, 경고, 종료 관련)"""
+    important_keywords = [
+        "❌", "⚠️", "오류", "실패", "error", "fail", "종료", "stop", "ERROR", "WARNING", "CRITICAL"
+    ]
+    return any(keyword in message for keyword in important_keywords)
 
 async def main():
     """메인 함수"""
@@ -366,25 +390,47 @@ async def main():
         exit_code = 1
     finally:
         logger.log_system("Main function finally block entered.")
-        # 텔레그램 태스크 정리 (최대 5초 대기)
-        if telegram_task and not telegram_task.done():
-            logger.log_system("Cancelling Telegram polling task...")
-            # 메시지 전송 작업을 완료할 수 있는 짧은 시간 제공
-            await asyncio.sleep(3)
-            telegram_task.cancel()
+        # 텔레그램 종료 처리
+        try:
+            # 먼저 텔레그램 메시지 전송이 완료될 수 있도록 충분한 대기 시간 제공
+            logger.log_system("텔레그램 메시지 전송 완료 대기 중...")
+            await asyncio.sleep(5)
+            
+            # 봇 세션을 명시적으로 닫기 시도
+            logger.log_system("텔레그램 봇 세션 닫기 시도...")
             try:
+                # 이벤트 루프가 아직 살아있다면 세션을 명시적으로 닫기
+                await telegram_bot_handler.close_session()
+                # 세션이 완전히 닫힐 시간을 주기 위해 잠시 대기
+                await asyncio.sleep(1)
+            except Exception as session_error:
+                logger.log_error(session_error, "텔레그램 봇 세션 종료 중 오류")
+                
+            # 텔레그램 태스크 정리 (최대 5초 대기)
+            if telegram_task and not telegram_task.done():
+                # 중요: 텔레그램 태스크를 취소하기 전에 마지막 메시지가 전송될 수 있도록 충분한 시간 제공
+                logger.log_system("텔레그램 태스크 취소 전 마지막 메시지 전송을 위해 대기 중...")
+                # 종료 메시지가 전송될 수 있도록 더 긴 시간 대기
+                await asyncio.sleep(3)
+                
+                logger.log_system("Cancelling Telegram polling task...")
+                telegram_task.cancel()
+                
                 # 종료될 때까지 최대 5초 대기
-                await asyncio.wait_for(telegram_task, timeout=5)
-                logger.log_system("Telegram polling task successfully cancelled.")
-            except asyncio.CancelledError:
-                logger.log_system("Telegram polling task cancellation confirmed.")
-            except asyncio.TimeoutError:
-                logger.log_warning("Telegram polling task cancellation timed out, but proceeding anyway.")
-            except Exception as e:
-                logger.log_error(e, "Error during Telegram task cancellation")
-
-        logger.log_system(f"Exiting application with code {exit_code}.")
-        sys.exit(exit_code)
+                try:
+                    await asyncio.wait_for(telegram_task, timeout=5)
+                    logger.log_system("Telegram polling task successfully cancelled.")
+                except asyncio.CancelledError:
+                    logger.log_system("Telegram polling task cancellation confirmed.")
+                except asyncio.TimeoutError:
+                    logger.log_warning("Telegram polling task cancellation timed out, but proceeding anyway.")
+                except Exception as e:
+                    logger.log_error(e, "Error during Telegram task cancellation")
+        except Exception as e:
+            logger.log_error(e, "Error cleaning up Telegram resources")
+        
+        logger.log_system(f"Main function exiting with code {exit_code}.")
+        return exit_code
 
 if __name__ == "__main__":
     # 환경 변수 체크
@@ -411,5 +457,48 @@ if __name__ == "__main__":
         
         sys.exit(1)
     
-    # 이벤트 루프 실행
-    asyncio.run(main())
+    # 이벤트 루프 명시적 관리 - 수동으로 이벤트 루프 생성 및 종료
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    exit_code = 1  # 기본 종료 코드는 오류로 설정
+    
+    try:
+        # 메인 함수 실행
+        loop.run_until_complete(main())
+        exit_code = 0  # 정상 종료 시 종료 코드를 0으로 변경
+    except KeyboardInterrupt:
+        logger.warning("KeyboardInterrupt received.")
+        logger.log_system("프로그램 종료 중...")
+        exit_code = 0
+    except Exception as e:
+        logger.log_error(e, "Unexpected error in main loop")
+    finally:
+        logger.log_system("이벤트 루프 정리 중...")
+        try:
+            # 남은 모든 작업이 완료될 때까지 대기
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                logger.log_system(f"{len(pending)}개의 미완료 작업 정리 중...")
+                # 텔레그램 메시지 전송이 완료될 수 있도록 시간 제공
+                loop.run_until_complete(asyncio.sleep(5))
+                
+                # 남은 작업들 취소
+                for task in pending:
+                    task.cancel()
+                
+                # 모든 작업이 취소될 때까지 대기 (최대 10초)
+                try:
+                    loop.run_until_complete(asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=10
+                    ))
+                    logger.log_system("모든 작업 정리 완료")
+                except asyncio.TimeoutError:
+                    logger.log_system("일부 작업이 시간 내에 정리되지 않았으나 계속 진행합니다.", level="WARNING")
+        except Exception as cleanup_error:
+            logger.log_error(cleanup_error, "작업 정리 중 오류 발생")
+        finally:
+            logger.log_system("이벤트 루프 닫기...")
+            loop.close()
+            logger.log_system(f"프로그램 종료 (종료 코드: {exit_code}).")
+            sys.exit(exit_code)

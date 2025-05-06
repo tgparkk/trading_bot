@@ -18,6 +18,7 @@ from utils.logger import logger
 import threading
 import time
 import atexit
+import queue
 
 app = Flask(__name__)
 # CORS 설정 개선 - 모든 경로에 대해 모든 오리진에서의 요청 허용
@@ -26,6 +27,34 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 # 텔레그램 봇 상태 관리 전역 변수
 telegram_bot_initialized = False
 telegram_lock_file = os.path.join(Path(__file__).parent.parent, "telegram_bot.lock")
+
+# 텔레그램 메시지 큐 생성 (Thread-Safe)
+telegram_message_queue = queue.Queue()
+
+# 텔레그램 메시지를 큐에 추가하는 헬퍼 함수
+def queue_telegram_message(text, reply_to=None, priority="normal"):
+    try:
+        # 큐에 메시지 추가
+        message_data = {
+            "text": text,
+            "reply_to": reply_to,
+            "priority": priority,
+            "timestamp": datetime.now().timestamp()
+        }
+        telegram_message_queue.put(message_data)
+        
+        # 로깅을 위한 요약 메시지 생성 (처음 30자 정도)
+        text_for_log = text[:30] + "..." if len(text) > 30 else text
+        
+        # 이모지가 있으면 로깅용으로 대체 - 기존 utils.logger에 정의된 함수 사용
+        from utils.logger import sanitize_for_console
+        text_for_log = sanitize_for_console(text_for_log)
+        
+        logger.log_system(f"텔레그램 메시지가 전송 큐에 추가됨: {text_for_log}")
+        return True
+    except Exception as e:
+        logger.log_error(e, "메시지 큐 추가 중 오류 발생")
+        return False
 
 # 테스트용 API 엔드포인트 추가
 @app.route('/test')
@@ -60,6 +89,19 @@ def api_symbol_search_logs():
 def api_account():
     # 계좌 정보 반환
     try:
+        # 요청 출처 확인 - 웹 요청인지 아닌지 판단
+        # 텔레그램 메시지를 보낼지 여부 결정 (쿼리 파라미터로 제어)
+        send_telegram = request.args.get('notify', 'false').lower() == 'true'
+        
+        # User-Agent 확인하여 웹 브라우저에서의 요청인지 확인
+        user_agent = request.headers.get('User-Agent', '')
+        is_web_browser = 'mozilla' in user_agent.lower() or 'chrome' in user_agent.lower() or 'safari' in user_agent.lower()
+        
+        # 웹 브라우저 요청이고 명시적으로 notify=true가 아니면 알림 비활성화
+        if is_web_browser and not send_telegram:
+            logger.log_system("웹 브라우저에서 계좌 정보 조회 요청 - 텔레그램 알림 비활성화")
+            send_telegram = False
+        
         # KIS API 접속 시도
         raw_info = api_client.get_account_balance()
         
@@ -106,60 +148,39 @@ def api_account():
                 "timestamp": datetime.now().isoformat()
             }
         
-        # 비동기 작업을 동기적으로 실행하여 결과 텔레그램 전송
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 결과에 따라 메시지 준비
-        if is_success:
-            message = f"""
-            *계좌 정보 조회 성공* ✅
-            조회 시간: {current_time}
+        # 텔레그램으로 알림 보내기 (웹에서의 일반 요청이 아닌 경우에만)
+        if send_telegram or not is_web_browser:
+            # 비동기 작업을 동기적으로 실행하여 결과 텔레그램 전송
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            한국투자증권 API 계좌 정보 조회에 성공했습니다.
-            응답 메시지: {raw_info.get("msg1", "정상")}
-            """
+            # 결과에 따라 메시지 준비
+            if is_success:
+                message = f"""
+                *계좌 정보 조회 성공* ✅
+                조회 시간: {current_time}
+                
+                한국투자증권 API 계좌 정보 조회에 성공했습니다.
+                응답 메시지: {raw_info.get("msg1", "정상")}
+                """
+            else:
+                error_msg = raw_info.get("msg1", "알 수 없는 오류") if raw_info else "응답 없음"
+                message = f"""
+                *계좌 정보 조회 실패* ❌
+                조회 시간: {current_time}
+                
+                한국투자증권 API 계좌 정보 조회에 실패했습니다.
+                오류: {error_msg}
+                """
+            
+            # 텔레그램 메시지 전송 (큐에 추가하여 비동기 처리)
+            queue_telegram_message(message, priority="high")
+            logger.log_system("계좌 정보 조회 결과 메시지 전송 완료")
         else:
-            error_msg = raw_info.get("msg1", "알 수 없는 오류") if raw_info else "응답 없음"
-            message = f"""
-            *계좌 정보 조회 실패* ❌
-            조회 시간: {current_time}
-            
-            한국투자증권 API 계좌 정보 조회에 실패했습니다.
-            오류: {error_msg}
-            """
-        
-        # 텔레그램 메시지 전송 (백그라운드에서 비동기로 실행)
-        def run_background_task():
-            # 새 이벤트 루프 생성
-            task_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(task_loop)
-            
-            async def send_account_result():
-                try:
-                    # 봇 상태 확인 및 필요시 활성화
-                    if not telegram_bot_handler.bot_running:
-                        telegram_bot_handler.bot_running = True
-                        logger.log_system("메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
-                    
-                    await telegram_bot_handler.send_message(message)
-                    logger.log_system("계좌 정보 조회 결과 메시지 전송 완료")
-                except Exception as e:
-                    logger.log_error(e, "계좌 정보 조회 결과 메시지 전송 실패")
-                finally:
-                    # 반드시 이벤트 루프 닫기
-                    task_loop.stop()
-            
-            try:
-                task_loop.run_until_complete(send_account_result())
-            finally:
-                task_loop.close()
-        
-        thread = threading.Thread(target=run_background_task, daemon=True)
-        thread.start()
+            logger.log_system("웹 요청으로 인한 계좌 정보 조회 - 텔레그램 알림 전송 생략")
         
         return jsonify(info)
     except Exception as e:
-        # 예외 발생 시 오류 메시지 텔레그램 전송
+        # 예외 발생 시 오류 메시지 텔레그램 전송 (항상)
         error_message = f"""
         *계좌 정보 조회 중 오류 발생* ❌
         조회 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -168,37 +189,9 @@ def api_account():
         오류 내용: {str(e)}
         """
         
-        # 백그라운드에서 오류 메시지 전송
-        try:
-            def run_background_task():
-                # 새 이벤트 루프 생성
-                task_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(task_loop)
-                
-                async def send_error_message():
-                    try:
-                        # 봇 상태 확인 및 필요시 활성화
-                        if not telegram_bot_handler.bot_running:
-                            telegram_bot_handler.bot_running = True
-                            logger.log_system("메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
-                        
-                        await telegram_bot_handler.send_message(error_message)
-                        logger.log_system("계좌 정보 조회 오류 메시지 전송 완료")
-                    except Exception as msg_error:
-                        logger.log_error(msg_error, "계좌 정보 조회 오류 메시지 전송 실패")
-                    finally:
-                        # 반드시 이벤트 루프 닫기
-                        task_loop.stop()
-                
-                try:
-                    task_loop.run_until_complete(send_error_message())
-                finally:
-                    task_loop.close()
-            
-            thread = threading.Thread(target=run_background_task, daemon=True)
-            thread.start()
-        except Exception as thread_error:
-            logger.log_error(thread_error, "텔레그램 메시지 스레드 생성 실패")
+        # 오류 메시지를 큐에 추가 (우선순위 높음)
+        queue_telegram_message(error_message, priority="high")
+        logger.log_system("계좌 정보 조회 오류 메시지 큐에 추가 완료")
         
         # 사용자 친화적인 오류 응답
         return jsonify({
@@ -254,37 +247,21 @@ def api_refresh_candidates():
 # 텔레그램 메시지 직접 전송하는 API 엔드포인트 추가
 @app.route('/api/send_telegram', methods=['POST'])
 def api_send_telegram():
+    """텔레그램으로 메시지 전송 (웹 인터페이스에서 호출)"""
     try:
         data = request.json
         message = data.get('message', '')
+        
         if not message:
             return jsonify({'error': 'No message provided'}), 400
             
-        # 독립적인 이벤트 루프 생성
-        task_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(task_loop)
-        
-        # 메시지 전송 전에 봇 상태 확인 및 활성화
-        async def send_with_status_check():
-            try:
-                # 봇 상태 확인 및 필요시 활성화
-                if not telegram_bot_handler.bot_running:
-                    telegram_bot_handler.bot_running = True
-                    logger.log_system("API 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
-                
-                # 메시지 전송
-                return await telegram_bot_handler.send_message(message)
-            finally:
-                # 처리 완료 후 이벤트 루프 중지
-                task_loop.stop()
-        
-        try:
-            message_id = task_loop.run_until_complete(send_with_status_check())
-        finally:
-            task_loop.close()
-        
-        return jsonify({'success': True, 'message_id': message_id})
+        # 메시지 큐에 추가
+        queue_telegram_message(message)
+        logger.log_system("웹 인터페이스에서 요청한 텔레그램 메시지를 큐에 추가했습니다.")
+            
+        return jsonify({'status': 'success', 'message': 'Message queued for delivery'})
     except Exception as e:
+        logger.log_error(e, "텔레그램 메시지 전송 API 오류")
         return jsonify({'error': str(e)}), 500
 
 # KIS API 접속 테스트 엔드포인트 추가
@@ -308,50 +285,30 @@ def api_test_kis_connection():
 
 # KIS API 접속 테스트 및 결과 텔레그램 전송 함수
 async def test_kis_api_connection():
+    """KIS API 접속 테스트 및 결과 전송"""
     try:
-        # 봇 상태 확인 및 필요시 활성화
-        if not telegram_bot_handler.bot_running:
-            telegram_bot_handler.bot_running = True
-            logger.log_system("KIS API 테스트 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+        logger.log_system("KIS API 접속 테스트 시작...")
+        # api_client.check_connectivity 메서드를 사용해 접속 테스트
+        result = await api_client.check_connectivity()
         
-        # KIS API 접속 시도 전 메시지 전송
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pre_message = f"""
-        *KIS API 접속 시도* 🔄
-        시도 시간: {current_time}
-        
-        한국투자증권 API 서버에 접속을 시도합니다.
-        """
-        
-        logger.log_system("KIS API 접속 시도 전 메시지 전송 중...")
-        await telegram_bot_handler.send_message(pre_message)
-        logger.log_system("KIS API 접속 시도 전 메시지 전송 완료")
-        
-        # 접속 시도 시간 기록을 위해 1초 대기
-        await asyncio.sleep(1)
-        
-        # KIS API 접속 시도
-        logger.log_system("KIS API 접속 시도 (계좌 잔고 조회)...")
-        result = api_client.get_account_balance()
-        
-        # 현재 시간 갱신
+        # 현재 시간 포맷팅
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # 결과 확인 및 메시지 전송
         if result and result.get("rt_cd") == "0":
             # 성공 메시지
             logger.log_system("KIS API 접속 성공")
+            
             success_message = f"""
             *KIS API 접속 성공* ✅
-            접속 시간: {current_time}
+            테스트 시간: {current_time}
             
             한국투자증권 API 서버에 성공적으로 접속했습니다.
             응답 메시지: {result.get("msg1", "정상")}
             """
             
-            logger.log_system("KIS API 접속 성공 메시지 전송 중...")
-            await telegram_bot_handler.send_message(success_message)
-            logger.log_system("KIS API 접속 성공 메시지 전송 완료")
+            logger.log_system("KIS API 접속 성공 메시지 큐에 추가 중...")
+            queue_telegram_message(success_message)
+            logger.log_system("KIS API 접속 성공 메시지 큐에 추가 완료")
             return True
         else:
             # 실패 메시지
@@ -366,9 +323,9 @@ async def test_kis_api_connection():
             오류: {error_msg}
             """
             
-            logger.log_system("KIS API 접속 실패 메시지 전송 중...")
-            await telegram_bot_handler.send_message(fail_message)
-            logger.log_system("KIS API 접속 실패 메시지 전송 완료")
+            logger.log_system("KIS API 접속 실패 메시지 큐에 추가 중...")
+            queue_telegram_message(fail_message, priority="high")
+            logger.log_system("KIS API 접속 실패 메시지 큐에 추가 완료")
             return False
             
     except Exception as e:
@@ -385,40 +342,127 @@ async def test_kis_api_connection():
         """
         
         try:
-            # 봇 상태 확인 및 필요시 활성화
-            if not telegram_bot_handler.bot_running:
-                telegram_bot_handler.bot_running = True
-                logger.log_system("오류 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
-            
-            logger.log_system("KIS API 접속 오류 메시지 전송 중...")
-            await telegram_bot_handler.send_message(error_message)
-            logger.log_system("KIS API 접속 오류 메시지 전송 완료")
+            # 오류 메시지 큐에 추가
+            logger.log_system("KIS API 접속 오류 메시지 큐에 추가 중...")
+            queue_telegram_message(error_message, priority="high")
+            logger.log_system("KIS API 접속 오류 메시지 큐에 추가 완료")
         except Exception as msg_error:
-            logger.log_error(msg_error, "KIS API 접속 오류 메시지 전송 실패")
+            logger.log_error(msg_error, "KIS API 접속 오류 메시지 큐 추가 실패")
         
         return False
 
+# 메시지 큐 처리 함수
+async def process_message_queue():
+    """텔레그램 메시지 큐에서 메시지를 꺼내 전송하는 비동기 함수"""
+    logger.log_system("텔레그램 메시지 큐 처리 시작")
+    
+    # 로컬 실행 플래그 - 안정적인 종료를 위해 사용
+    running = True
+    last_status_log = time.time()
+    empty_counter = 0
+    
+    while running:
+        try:
+            # 큐에서 메시지 가져오기 (비차단 방식)
+            try:
+                message_data = telegram_message_queue.get_nowait()
+                empty_counter = 0  # 메시지를 찾았으므로 카운터 초기화
+                
+                text = message_data.get("text", "")
+                reply_to = message_data.get("reply_to")
+                priority = message_data.get("priority", "normal")
+                
+                # 로깅용 텍스트 준비 (이모지 처리)
+                from utils.logger import sanitize_for_console
+                log_text = text[:30] + "..." if len(text) > 30 else text
+                log_text = sanitize_for_console(log_text)
+                
+                # 메시지 전송 - 직접 HTTP 요청 사용 (aiohttp 세션 문제 회피)
+                try:
+                    logger.log_system(f"큐에서 메시지 처리 중 (우선순위: {priority}): {log_text}")
+                    
+                    # 텔레그램 봇 핸들러가 실행 중인지 확인
+                    if telegram_bot_handler.bot_running:
+                        # 제대로 된 비동기 태스크로 래핑하여 실행
+                        send_task = asyncio.create_task(safe_send_message(text, reply_to))
+                        await send_task
+                        logger.log_system("큐의 메시지 처리 완료")
+                    else:
+                        logger.log_system("텔레그램 봇이 실행 중이 아니어서 메시지를 보낼 수 없습니다.", level="WARNING")
+                        
+                except Exception as send_error:
+                    logger.log_error(send_error, "큐의 메시지 전송 중 오류 발생")
+                
+                # 작업 완료 표시
+                telegram_message_queue.task_done()
+                
+            except queue.Empty:
+                # 큐가 비어있으면 잠시 대기
+                empty_counter += 1
+                
+                # 주기적으로 상태 로그 남기기 (1분에 한 번)
+                current_time = time.time()
+                if current_time - last_status_log > 60:
+                    logger.log_system(f"메시지 큐 처리기 실행 중: 큐 크기 = {telegram_message_queue.qsize()}, 빈 횟수 = {empty_counter}")
+                    last_status_log = current_time
+                
+                # 텔레그램 봇 핸들러가 종료되었는지 확인
+                if not telegram_bot_handler.bot_running and empty_counter > 10:
+                    logger.log_system("텔레그램 봇이 종료되어 메시지 큐 처리기도 종료합니다.")
+                    running = False
+                    break
+                
+                pass
+                
+            # 처리 간격 - 부하 방지와 CPU 사용량 감소를 위해
+            await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            logger.log_error(e, "메시지 큐 처리 중 오류 발생")
+            await asyncio.sleep(5)  # 오류 발생 시 더 오래 대기
+    
+    logger.log_system("메시지 큐 처리기가 정상적으로 종료되었습니다.")
+
+# 백그라운드 이벤트 루프에서 메시지 큐 처리 실행
+def start_message_queue_processor():
+    """메시지 큐 처리기를 백그라운드에서 실행"""
+    try:
+        logger.log_system("메시지 큐 처리기 시작 중...")
+        loop = asyncio.new_event_loop()
+        
+        # 큐 처리 스레드 참조를 저장
+        queue_processor_thread = None
+        
+        def run_processor():
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(process_message_queue())
+            except Exception as e:
+                logger.log_error(e, "메시지 큐 처리기 오류")
+            finally:
+                if not loop.is_closed():
+                    loop.close()
+                    logger.log_system("메시지 큐 처리기 이벤트 루프가 종료되었습니다")
+        
+        # 백그라운드 스레드 시작
+        queue_processor_thread = threading.Thread(target=run_processor, daemon=True)
+        queue_processor_thread.start()
+        logger.log_system("메시지 큐 처리기가 백그라운드에서 실행 중입니다")
+        
+        # 스레드 참조 반환
+        return queue_processor_thread
+    except Exception as e:
+        logger.log_error(e, "메시지 큐 처리기 시작 실패")
+        return None
+
 # 텔레그램 봇 핸들러 초기화 및 시작 메시지 전송
 async def init_telegram_handler():
-    global telegram_bot_initialized
-    
-    # 이미 초기화된 경우 건너뛰기
-    if telegram_bot_initialized:
-        logger.log_system("텔레그램 봇이 이미 초기화되어 있습니다.")
-        return
-    
+    """텔레그램 봇 초기화 및 시작 메시지 전송"""
     try:
         # 텔레그램 봇 핸들러 준비 대기
         logger.log_system("대시보드 백엔드: 텔레그램 봇 핸들러 준비 대기...")
         
-        # 봇 상태 강제 활성화
-        telegram_bot_handler.bot_running = True
-        logger.log_system("대시보드 백엔드: 텔레그램 봇 상태를 활성화했습니다.")
-        
-        # 봇 준비 대기
-        await telegram_bot_handler.wait_until_ready(timeout=10)
-        
-        # 대시보드 시작 알림 전송
+        # 대시보드 시작 알림 텍스트 준비
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dashboard_message = f"""
         *트레이딩 봇 대시보드 시작* 🚀
@@ -428,119 +472,139 @@ async def init_telegram_handler():
         백엔드 API 서버가 실행 중입니다.
         """
         
-        logger.log_system("대시보드 시작 알림 전송 시도...")
-        await telegram_bot_handler.send_message(dashboard_message)
-        logger.log_system("대시보드 시작 알림 전송 완료")
+        # 시작 메시지를 큐에 추가
+        logger.log_system("대시보드 시작 알림 메시지 큐에 추가 중...")
+        queue_telegram_message(dashboard_message)
+        logger.log_system("대시보드 시작 알림 메시지 큐에 추가 완료")
         
-        # KIS API 접속 테스트 및 결과 전송
-        await test_kis_api_connection()
+    except Exception as e:
+        logger.log_error(e, "텔레그램 봇 초기화 오류")
+
+# 직접 HTTP 요청을 사용한 메시지 전송 함수 (aiohttp 세션 문제 회피)
+async def safe_send_message(text, reply_to=None):
+    """안전하게 텔레그램 메시지를 전송하는 함수"""
+    try:
+        # 세션 문제를 회피하기 위해 requests 모듈 사용 (동기식)
+        import requests
         
-        # 초기화 완료 표시
-        telegram_bot_initialized = True
+        # 메시지 텍스트 준비
+        params = {
+            "chat_id": telegram_bot_handler.chat_id,
+            "text": text,
+            "parse_mode": "HTML"  # HTML 형식 지원 활성화
+        }
         
-        # 잠금 파일 생성
-        with open(telegram_lock_file, "w") as f:
-            f.write(str(datetime.now().timestamp()))
+        # 회신 메시지인 경우
+        if reply_to:
+            params["reply_to_message_id"] = reply_to
+        
+        # API URL
+        url = f"https://api.telegram.org/bot{telegram_bot_handler.token}/sendMessage"
+        
+        # 비동기 블로킹을 방지하기 위해 동기식 HTTP 요청을 별도 스레드에서 실행
+        import concurrent.futures
+        
+        # 스레드풀에서 동기식 함수 실행
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(lambda: requests.post(url, params=params, timeout=10))
             
+            # 메시지 ID 반환
+            response = await asyncio.wrap_future(future)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    message_id = data.get("result", {}).get("message_id")
+                    logger.log_system(f"텔레그램 메시지 전송 성공 (message_id: {message_id})")
+                    return message_id
+                else:
+                    error_msg = f"텔레그램 API 오류: {data.get('description', '알 수 없는 오류')}"
+                    logger.log_system(error_msg, level="ERROR")
+                    raise Exception(error_msg)
+            else:
+                error_msg = f"텔레그램 API 응답 오류: HTTP {response.status_code}"
+                logger.log_system(error_msg, level="ERROR")
+                raise Exception(error_msg)
+                
     except Exception as e:
-        logger.log_error(e, "대시보드 시작 알림 전송 실패")
+        logger.log_error(e, "안전한 텔레그램 메시지 전송 중 오류 발생")
+        raise
 
-# 텔레그램 봇 종료 처리
-def cleanup_telegram_bot():
-    # 잠금 파일 제거
+# 서버 시작 시 필요한 초기화 작업
+def initialize_server():
+    """서버 시작 시 필요한 초기화 작업 수행"""
     try:
-        if os.path.exists(telegram_lock_file):
-            os.remove(telegram_lock_file)
-            logger.log_system("텔레그램 봇 잠금 파일 제거 완료")
-    except Exception as e:
-        logger.log_error(e, "텔레그램 봇 잠금 파일 제거 실패")
-
-# 프로그램 종료 시 정리 작업 등록
-atexit.register(cleanup_telegram_bot)
-
-# 텔레그램 봇 잠금 파일 확인
-def check_telegram_lock():
-    if os.path.exists(telegram_lock_file):
-        try:
-            # 파일이 있지만 5분(300초) 이상 지난 경우 무시하고 제거
-            file_time = os.path.getmtime(telegram_lock_file)
-            current_time = time.time()
-            if current_time - file_time > 300:
-                logger.log_system("오래된 텔레그램 봇 잠금 파일 발견. 제거합니다.")
-                os.remove(telegram_lock_file)
-                return False
-            return True
-        except Exception as e:
-            logger.log_error(e, "텔레그램 봇 잠금 파일 확인 실패")
-            return False
-    return False
-
-# 비동기 작업을 처리하기 위한 이벤트 루프 생성 및 실행
-def start_telegram_handler():
-    global telegram_bot_initialized
-    
-    # 이미 실행 중인 텔레그램 봇이 있는지 확인
-    if check_telegram_lock():
-        logger.log_system("다른 프로세스에서 실행 중인 텔레그램 봇이 감지되었습니다. 텔레그램 초기화를 건너뜁니다.")
-        # 다른 프로세스에서 봇이 실행 중이더라도 이 프로세스에서 사용할 수 있도록 상태 설정
-        telegram_bot_handler.bot_running = True
-        telegram_bot_initialized = True
-        logger.log_system("백엔드에서 메시지 전송을 위해 봇 상태를 활성화했습니다.")
-        return
-    
-    try:
+        logger.log_system("백엔드 서버 초기화 중...")
+        
+        # 텔레그램 설정 로그 출력
+        logger.log_system(f"텔레그램 설정 - 토큰: {telegram_bot_handler.token[:10]}..., 채팅 ID: {telegram_bot_handler.chat_id}")
+        
+        # 텔레그램 봇 폴링 태스크 시작 (별도 스레드에서 실행)
+        import threading
+        
+        def start_telegram_polling():
+            try:
+                telegram_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(telegram_loop)
+                # 텔레그램 봇 폴링 시작
+                logger.log_system("텔레그램 봇 폴링 시작 중...")
+                telegram_loop.run_until_complete(telegram_bot_handler.start_polling())
+                # 이벤트 루프 계속 실행
+                telegram_loop.run_forever()
+            except Exception as e:
+                logger.log_error(e, "텔레그램 봇 폴링 스레드 오류")
+            finally:
+                if not telegram_loop.is_closed():
+                    telegram_loop.close()
+                logger.log_system("텔레그램 봇 폴링 스레드 종료")
+                
+        # 텔레그램 폴링 스레드 시작
+        telegram_thread = threading.Thread(target=start_telegram_polling, daemon=True)
+        telegram_thread.start()
+        logger.log_system("텔레그램 봇 폴링이 백그라운드에서 시작되었습니다")
+        
+        # 텔레그램 봇이 준비될 때까지 잠시 대기 (최대 10초)
+        time.sleep(2)
+        
+        # 텔레그램 봇 초기화
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        # 봇 상태 명시적으로 활성화
-        telegram_bot_handler.bot_running = True
-        
-        # 텔레그램 폴링 태스크 시작
-        telegram_task = loop.create_task(telegram_bot_handler.start_polling())
-        
-        # 초기화 및 시작 메시지 전송 (및 KIS API 접속 테스트)
         loop.run_until_complete(init_telegram_handler())
+        loop.close()
         
-        # 이벤트 루프 계속 실행 (백그라운드 스레드에서)
-        def run_event_loop(loop):
-            asyncio.set_event_loop(loop)
+        # 메시지 큐 처리기 시작
+        queue_processor_thread = start_message_queue_processor()
+        
+        # 종료 시 정리 함수 등록
+        def cleanup():
+            logger.log_system("백엔드 서버 종료 중...")
+            # 종료 메시지 큐에 추가
             try:
-                # 봇 상태 주기적으로 확인하는 태스크 추가
-                async def check_bot_status():
-                    while True:
-                        try:
-                            if not telegram_bot_handler.bot_running:
-                                logger.log_system("봇 상태가 비활성화되어 있어 다시 활성화합니다.", level="WARNING")
-                                telegram_bot_handler.bot_running = True
-                            await asyncio.sleep(30)  # 30초마다 체크
-                        except Exception as e:
-                            logger.log_error(e, "봇 상태 체크 중 오류 발생")
-                            await asyncio.sleep(60)  # 오류 발생 시 더 오래 대기
-                
-                # 상태 체크 태스크 시작
-                status_task = loop.create_task(check_bot_status())
-                
-                # 이벤트 루프 실행
-                loop.run_forever()
-            except Exception as e:
-                logger.log_error(e, "텔레그램 이벤트 루프 실행 오류")
-            finally:
-                if not loop.is_closed():
-                    loop.close()
-                    logger.log_system("텔레그램 이벤트 루프가 정상적으로 종료되었습니다.")
-            
-        thread = threading.Thread(target=run_event_loop, args=(loop,), daemon=True)
-        thread.start()
-        
-        logger.log_system("텔레그램 핸들러가 백그라운드에서 실행 중입니다.")
-    except Exception as e:
-        logger.log_error(e, "텔레그램 핸들러 시작 오류")
+                shutdown_message = f"""
+                *트레이딩 봇 대시보드 종료* 🛑
+                종료 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-# 서버 시작 시 텔레그램 핸들러 초기화
+                웹 기반 대시보드가 종료되었습니다.
+                """
+                queue_telegram_message(shutdown_message)
+                # 큐의 메시지가 모두 처리될 때까지 약간의 시간 대기
+                time.sleep(2)
+            except Exception as e:
+                logger.log_error(e, "종료 메시지 전송 실패")
+        
+        # 종료 시 정리 함수 등록
+        atexit.register(cleanup)
+        
+        logger.log_system("백엔드 서버 초기화 완료")
+    except Exception as e:
+        logger.log_error(e, "백엔드 서버 초기화 실패")
+
+# 서버 시작
 if __name__ == "__main__":
-    start_telegram_handler()
-    # 디버그 모드 활성화
-    app.run(host='0.0.0.0', port=5050, debug=True)
+    # 서버 초기화
+    initialize_server()
+    # Flask 앱 실행
+    app.run(host='0.0.0.0', port=5050, debug=False)
 else:
-    # WSGI 서버에서 실행될 때도 텔레그램 핸들러 시작
-    start_telegram_handler() 
+    # WSGI 서버에서 실행될 때도 초기화
+    initialize_server()
+        

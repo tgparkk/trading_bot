@@ -3,9 +3,71 @@
 """
 import logging
 import os
+import sys
+import re
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 # 순환 참조 문제 해결을 위해 설정 import를 함수 내부로 이동
+
+# 이모지 및 특수 유니코드 문자를 안전한 텍스트로 대체하는 매핑
+EMOJI_REPLACEMENTS = {
+    '✅': '[OK]',
+    '❌': '[ERROR]',
+    '⚠️': '[WARNING]',
+    '🚀': '[LAUNCH]',
+    '🔄': '[SYNC]',
+    '🟢': '[GREEN]',
+    '🔴': '[RED]',
+    '⚪': '[NEUTRAL]',
+    '📊': '[STATS]',
+    '📈': '[CHART_UP]',
+    '📉': '[CHART_DOWN]',
+    '💰': '[MONEY]',
+    '💹': '[MARKET]',
+    '👍': '[THUMBS_UP]',
+    '🤖': '[BOT]'
+}
+
+# 유니코드 이모지 제거 또는 대체
+def sanitize_for_console(text):
+    """콘솔 출력을 위해 유니코드 문자 제거 또는 대체"""
+    if not text:
+        return text
+        
+    # 알려진 이모지 대체
+    for emoji, replacement in EMOJI_REPLACEMENTS.items():
+        text = text.replace(emoji, replacement)
+    
+    # 다른 이모지나 지원되지 않는 유니코드 문자 제거
+    # 기본 ASCII 범위(0-127) 이외의 문자 중 한글(0xAC00-0xD7A3)과 기본 라틴 확장(0x80-0xFF)은 유지
+    def is_safe_char(c):
+        code = ord(c)
+        return (code < 127) or (0xAC00 <= code <= 0xD7A3) or (0x80 <= code <= 0xFF)
+    
+    # 안전하지 않은 문자는 '?' 또는 다른 대체 문자로 대체
+    return ''.join(c if is_safe_char(c) else '?' for c in text)
+
+# 유니코드 안전 출력을 위한 커스텀 StreamHandler
+class SafeStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            
+            # Windows 콘솔용 메시지 정리
+            if sys.platform == 'win32' and stream is sys.stderr or stream is sys.stdout:
+                msg = sanitize_for_console(msg)
+                
+            # UTF-8 인코딩 적용 시도
+            try:
+                stream.write(msg + self.terminator)
+                self.flush()
+            except UnicodeEncodeError:
+                # UTF-8로 인코딩 시도
+                stream.write(msg.encode('utf-8', errors='replace').decode('utf-8') + self.terminator)
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
 class TradingLogger:
     """트레이딩 전용 로거"""
@@ -96,14 +158,15 @@ class TradingLogger:
         file_handler = TimedRotatingFileHandler(
             log_file, 
             when='midnight',
-            backupCount=30  # 30일 동안 보관
+            backupCount=30,  # 30일 동안 보관
+            encoding='utf-8'  # 명시적 UTF-8 인코딩 설정
         )
         file_handler.setFormatter(logging.Formatter(self.log_format))
         file_handler.suffix = "%Y-%m-%d"  # 백업 파일 이름 형식
         logger.addHandler(file_handler)
         
-        # 콘솔 핸들러
-        console_handler = logging.StreamHandler()
+        # 커스텀 안전 콘솔 핸들러
+        console_handler = SafeStreamHandler()
         console_handler.setFormatter(logging.Formatter(self.log_format))
         logger.addHandler(console_handler)
         
