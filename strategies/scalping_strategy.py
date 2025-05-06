@@ -19,6 +19,7 @@ class ScalpingStrategy:
     def __init__(self):
         self.params = config["trading"].scalping_params
         self.running = False
+        self.paused = False
         self.watched_symbols = set()
         self.price_data = {}  # {symbol: deque of tick data}
         self.volume_data = {}  # {symbol: deque of volume data}
@@ -29,6 +30,7 @@ class ScalpingStrategy:
         """전략 시작"""
         try:
             self.running = True
+            self.paused = False
             self.watched_symbols = set(symbols)
             
             # 각 종목별 데이터 초기화
@@ -59,6 +61,22 @@ class ScalpingStrategy:
             await ws_client.unsubscribe(symbol, "orderbook")
         
         logger.log_system("Scalping strategy stopped")
+    
+    async def pause(self):
+        """전략 일시 중지"""
+        if not self.paused:
+            self.paused = True
+            logger.log_system("Scalping strategy paused")
+            await alert_system.notify_system_status("PAUSED", "Trading strategy has been paused")
+        return True
+
+    async def resume(self):
+        """전략 재개"""
+        if self.paused:
+            self.paused = False
+            logger.log_system("Scalping strategy resumed")
+            await alert_system.notify_system_status("RESUMED", "Trading strategy has been resumed")
+        return True
     
     async def _handle_price_update(self, data: Dict[str, Any]):
         """실시간 체결가 업데이트 처리"""
@@ -169,6 +187,11 @@ class ScalpingStrategy:
                     await asyncio.sleep(60)
                     continue
                 
+                # 전략이 일시 중지된 경우 스킵
+                if self.paused:
+                    await asyncio.sleep(1)  # 1초 대기
+                    continue
+                
                 for symbol in self.watched_symbols:
                     await self._analyze_and_trade(symbol)
                 
@@ -184,6 +207,14 @@ class ScalpingStrategy:
     async def _analyze_and_trade(self, symbol: str):
         """종목 분석 및 거래"""
         try:
+            # 전략이 일시 중지 상태인지 확인
+            if self.paused:
+                return
+                
+            # order_manager의 거래 일시 중지 상태도 확인
+            if order_manager.is_trading_paused():
+                return
+            
             # 데이터 충분한지 확인
             if len(self.price_data[symbol]) < self.params["tick_window"]:
                 return
@@ -298,6 +329,14 @@ class ScalpingStrategy:
     async def _enter_position(self, symbol: str):
         """포지션 진입"""
         try:
+            # 전략이 일시 중지 상태인지 확인
+            if self.paused:
+                return
+                
+            # order_manager의 거래 일시 중지 상태도 확인
+            if order_manager.is_trading_paused():
+                return
+                
             # 현재가 조회
             current_price = self.price_data[symbol][-1]["price"]
             
@@ -485,3 +524,12 @@ class ScalpingStrategy:
 
 # 싱글톤 인스턴스
 scalping_strategy = ScalpingStrategy()
+
+# 모듈 레벨 함수 정의
+async def pause():
+    """모듈 레벨에서 전략 일시 중지"""
+    return await scalping_strategy.pause()
+
+async def resume():
+    """모듈 레벨에서 전략 재개"""
+    return await scalping_strategy.resume()

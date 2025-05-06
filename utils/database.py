@@ -3,11 +3,15 @@
 """
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 from typing import Dict, List, Any, Optional
 from contextlib import contextmanager
 from config.settings import config, DatabaseConfig
 from utils.logger import logger
+
+# 한국 시간대 설정
+KST = pytz.timezone('Asia/Seoul')
 
 class Database:
     """트레이딩 데이터베이스"""
@@ -44,6 +48,10 @@ class Database:
             try:
                 conn = sqlite3.connect(self.db_path, timeout=10)  # 10초 타임아웃 설정
                 conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
+                
+                # 한국 시간 변환을 위한 함수 등록
+                conn.create_function("kst_datetime", 0, self._current_kst_datetime)
+                
                 yield conn
                 
                 # 예외 없이 종료된 경우 커밋
@@ -93,6 +101,12 @@ class Database:
                     except Exception:
                         pass
     
+    def _current_kst_datetime(self):
+        """현재 한국 시간을 ISO 형식 문자열로 반환하는 SQLite 함수"""
+        now_utc = datetime.now(pytz.UTC)
+        now_kst = now_utc.astimezone(KST)
+        return now_kst.strftime('%Y-%m-%d %H:%M:%S')
+    
     def _initialize_db(self, force_initialize=False):
         """데이터베이스 초기화"""
         with self.get_connection() as conn:
@@ -112,8 +126,8 @@ class Database:
                     filled_quantity INTEGER DEFAULT 0,
                     avg_price REAL,
                     commission REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT (kst_datetime()),
+                    updated_at TIMESTAMP DEFAULT (kst_datetime()),
                     strategy TEXT,
                     reason TEXT
                 )
@@ -129,8 +143,8 @@ class Database:
                     current_price REAL,
                     unrealized_pnl REAL,
                     realized_pnl REAL DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT (kst_datetime()),
+                    updated_at TIMESTAMP DEFAULT (kst_datetime())
                 )
             """)
             
@@ -144,10 +158,13 @@ class Database:
                     quantity INTEGER NOT NULL,
                     pnl REAL,
                     commission REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT (kst_datetime()),
                     strategy TEXT,
                     entry_reason TEXT,
-                    exit_reason TEXT
+                    exit_reason TEXT,
+                    order_id TEXT,
+                    order_type TEXT,
+                    status TEXT
                 )
             """)
             
@@ -164,7 +181,7 @@ class Database:
                     win_rate REAL,
                     sharpe_ratio REAL,
                     max_drawdown REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT (kst_datetime()),
                     UNIQUE(date, symbol)
                 )
             """)
@@ -176,7 +193,7 @@ class Database:
                     status TEXT NOT NULL,  -- RUNNING/STOPPED/ERROR
                     last_heartbeat TIMESTAMP,
                     error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
             """)
             
@@ -190,7 +207,7 @@ class Database:
                     expire_time TIMESTAMP,
                     status TEXT,  -- SUCCESS/FAIL
                     error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
             """)
             
@@ -204,7 +221,7 @@ class Database:
                     search_criteria TEXT,  -- JSON 형식
                     status TEXT,
                     error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
             """)
             
@@ -223,14 +240,58 @@ class Database:
                     status TEXT DEFAULT 'SUCCESS',
                     error_message TEXT,
                     reply_to TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
             """)
             
             # 초기화 완료 로그
             logger.log_system("Database initialized successfully")
             
+            # 기존 테이블의 타임스탬프를 KST로 변환하는 함수 등록
+            self._update_timestamps_to_kst(conn)
+            
             conn.commit()
+    
+    def _update_timestamps_to_kst(self, conn):
+        """기존 데이터베이스의 타임스탬프를 KST로 변환"""
+        try:
+            # 기존 테이블 및 컬럼 조회
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            for table in tables:
+                # 테이블 컬럼 정보 조회
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = cursor.fetchall()
+                
+                # 타임스탬프 컬럼 찾기
+                timestamp_columns = []
+                for col in columns:
+                    col_name = col[1]
+                    col_type = col[2].upper()
+                    if "TIMESTAMP" in col_type or col_name in ["created_at", "updated_at", "last_heartbeat", "issue_time", "expire_time", "search_time"]:
+                        timestamp_columns.append(col_name)
+                
+                # 각 타임스탬프 컬럼에 대해 KST로 변환
+                for col_name in timestamp_columns:
+                    try:
+                        # 현재 값이 있는 레코드만 업데이트
+                        cursor.execute(f"""
+                            UPDATE {table} 
+                            SET {col_name} = datetime({col_name}, '+9 hours')
+                            WHERE {col_name} IS NOT NULL
+                              AND {col_name} NOT LIKE '%+09:00%'
+                              AND {col_name} NOT LIKE '%+0900%'
+                        """)
+                        rows_updated = cursor.rowcount
+                        if rows_updated > 0:
+                            logger.log_system(f"타임스탬프 변환: {table}.{col_name}, {rows_updated}개 레코드 업데이트")
+                    except Exception as e:
+                        logger.log_error(e, f"타임스탬프 변환 중 오류 발생: {table}.{col_name}")
+        
+        except Exception as e:
+            logger.log_error(e, "타임스탬프 변환 중 오류 발생")
     
     def save_order(self, order_data: Dict[str, Any]) -> int:
         """주문 저장"""
@@ -267,7 +328,7 @@ class Database:
             
             cursor.execute(f"""
                 UPDATE orders 
-                SET {set_clause}, updated_at = CURRENT_TIMESTAMP
+                SET {set_clause}, updated_at = kst_datetime()
                 WHERE order_id = ?
             """, values)
             
@@ -322,11 +383,31 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
+            # 먼저 trades 테이블 구조를 확인하고 필요하면 수정
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    pnl REAL,
+                    commission REAL,
+                    created_at TIMESTAMP DEFAULT (kst_datetime()),
+                    strategy TEXT,
+                    entry_reason TEXT,
+                    exit_reason TEXT,
+                    order_id TEXT,
+                    order_type TEXT,
+                    status TEXT
+                )
+            """)
+            
             cursor.execute("""
                 INSERT INTO trades (
                     symbol, side, price, quantity, pnl, commission,
-                    strategy, entry_reason, exit_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, entry_reason, exit_reason, order_id, order_type, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_data['symbol'],
                 trade_data['side'],
@@ -335,11 +416,21 @@ class Database:
                 trade_data.get('pnl'),
                 trade_data.get('commission'),
                 trade_data.get('strategy'),
-                trade_data.get('entry_reason'),
-                trade_data.get('exit_reason')
+                trade_data.get('entry_reason', trade_data.get('reason')),  # reason 필드도 체크
+                trade_data.get('exit_reason'),
+                trade_data.get('order_id'),
+                trade_data.get('order_type'),
+                trade_data.get('status', 'FILLED')
             ))
             
+            # 거래 ID 반환
+            trade_id = cursor.lastrowid
+            
             conn.commit()
+            
+            logger.log_system(f"Trade saved to database: ID={trade_id}, Symbol={trade_data['symbol']}, Side={trade_data['side']}")
+            
+            return trade_id
     
     def get_trades(self, symbol: str = None, start_date: str = None, 
                    end_date: str = None) -> List[Dict[str, Any]]:
@@ -398,7 +489,7 @@ class Database:
             
             cursor.execute("""
                 INSERT INTO system_status (status, last_heartbeat, error_message)
-                VALUES (?, CURRENT_TIMESTAMP, ?)
+                VALUES (?, kst_datetime(), ?)
             """, (status, error_message))
             
             conn.commit()
@@ -456,6 +547,12 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
+            # 시간 데이터를 한국 시간으로 변환
+            if issue_time and not issue_time.tzinfo:
+                issue_time = pytz.UTC.localize(issue_time).astimezone(KST)
+            if expire_time and not expire_time.tzinfo:
+                expire_time = pytz.UTC.localize(expire_time).astimezone(KST)
+                
             cursor.execute("""
                 INSERT INTO token_logs (
                     event_type, token, issue_time, expire_time, 
@@ -479,13 +576,16 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
+            # 현재 한국 시간
+            now_kst = datetime.now(KST).isoformat()
+            
             cursor.execute("""
                 INSERT INTO symbol_search_logs (
                     search_time, total_symbols, filtered_symbols,
                     search_criteria, status, error_message
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                datetime.now().isoformat(),
+                now_kst,
                 total_symbols,
                 filtered_symbols,
                 json.dumps(search_criteria),
@@ -718,15 +818,37 @@ class Database:
         """현재 시스템 상태 조회"""
         status = self.get_latest_system_status()
         if not status:
+            # 현재 한국 시간 사용
+            now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             return {
                 "status": "UNKNOWN",
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": now_kst,
                 "error_message": None
             }
         
+        # 시간 형식 확인 및 수정
+        updated_at = status.get("created_at")
+        if updated_at:
+            try:
+                # 문자열 파싱하여 유효성 확인
+                dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+                
+                # 미래 날짜이거나 2025년 이전인 경우 현재 시간으로 대체
+                now = datetime.now()
+                if dt.year < 2025 or dt > now:
+                    updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                    logger.log_system(f"시스템 상태의 날짜가 이상하여 현재 시간으로 대체합니다: {dt} -> {now}", level="WARNING")
+            except (ValueError, TypeError):
+                # 파싱 실패 시 현재 시간 사용
+                updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                logger.log_system(f"시스템 상태의 날짜 형식이 잘못되어 현재 시간으로 대체합니다: {status.get('created_at')} -> {updated_at}", level="WARNING")
+        else:
+            # 시간 정보가 없는 경우 현재 시간 사용
+            updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         return {
             "status": status["status"],
-            "updated_at": status["created_at"],
+            "updated_at": updated_at,
             "error_message": status["error_message"]
         }
 

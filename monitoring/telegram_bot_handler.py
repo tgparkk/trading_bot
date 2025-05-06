@@ -4,16 +4,21 @@
 """
 import asyncio
 import logging
-import requests
-import aiohttp
+import re
+import time
 import traceback
 import os
+import json
+import aiohttp
+import requests
 from typing import Dict, Any, List, Callable, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from config.settings import config
 from core.order_manager import order_manager
+from core.api_client import api_client
 from core.stock_explorer import stock_explorer
 from strategies.scalping_strategy import scalping_strategy
+from monitoring.alert_system import alert_system
 from utils.logger import logger
 from utils.database import db
 from utils.dotenv_helper import dotenv_helper
@@ -32,6 +37,8 @@ class TelegramBotHandler:
             if env_token:
                 self.token = env_token
                 logger.log_system(f"환경 변수에서 텔레그램 토큰을 로드했습니다.")
+            else:
+                logger.log_system(f"텔레그램 토큰이 설정되지 않았습니다. 봇 기능이 작동하지 않습니다.", level="ERROR")
         
         # 채팅 ID가 기본값이거나 비어 있으면 환경 변수에서 직접 읽기 시도
         if self.chat_id == "your_chat_id" or not self.chat_id:
@@ -39,6 +46,12 @@ class TelegramBotHandler:
             if env_chat_id:
                 self.chat_id = env_chat_id
                 logger.log_system(f"환경 변수에서 텔레그램 채팅 ID를 로드했습니다.")
+            else:
+                logger.log_system(f"텔레그램 채팅 ID가 설정되지 않았습니다. 메시지를 보낼 수 없습니다.", level="ERROR")
+        
+        # 토큰 유효성 기본 검사
+        if self.token and len(self.token) < 20:
+            logger.log_system(f"텔레그램 토큰이 너무 짧아 유효하지 않습니다. 올바른 토큰인지 확인하세요.", level="ERROR")
         
         # API 기본 URL 설정
         self.base_url = f"https://api.telegram.org/bot{self.token}"
@@ -68,6 +81,7 @@ class TelegramBotHandler:
             '/resume': self.resume_trading,
             '/close_all': self.close_all_positions,
             '/price': self.get_price,
+            '/trades': self.get_trades,
             '/help': self.get_help,
         }
         self.message_lock = asyncio.Lock()  # 메시지 전송 동시성 제어를 위한 락
@@ -105,7 +119,7 @@ class TelegramBotHandler:
         start_message_sent = False
         try:
             logger.log_system("텔레그램 봇 핸들러 시작 알림 메시지 전송 시도...")
-            await self._send_message("🤖 *트레이딩 봇 원격 제어 시작*\n\n명령어 목록을 보려면 /help를 입력하세요.")
+            await self._send_message("🤖 <b>트레이딩 봇 원격 제어 시작</b>\n\n명령어 목록을 보려면 /help를 입력하세요.")
             start_message_sent = True
             logger.log_system("텔레그램 봇 핸들러 시작 알림 메시지 전송 성공.")
         except Exception as e:
@@ -140,7 +154,7 @@ class TelegramBotHandler:
                     self._session = None
                     logger.log_system("텔레그램 봇 aiohttp 세션 정상 종료")
             except Exception as e:
-                logger.log_error(e, "텔레그램 봇 세션 종료 중 오류 발생")
+                logger.log_error(e, "텔레그램 봇 세션 종료 중 오류")
 
     async def _get_updates(self) -> List[Dict[str, Any]]:
         """업데이트 가져오기"""
@@ -209,62 +223,79 @@ class TelegramBotHandler:
             # 메시지가 없거나 텍스트가 없는 경우 무시
             if not message or not text:
                 return
+            
+            logger.log_system(f"텔레그램 메시지 수신: {text[:30]}... (chat_id: {chat_id}, message_id: {message_id})")
                 
             # 메시지 ID가 있는 경우 이미 처리된 메시지인지 확인
             if message_id:
                 # DB에서 이 메시지 ID로 저장된 메시지가 있는지 확인
-                existing_messages = db.get_telegram_messages(
-                    direction="INCOMING",
-                    message_id=str(message_id),
-                    limit=1
-                )
-                
-                # 메시지가 이미 저장되어 있고 처리된 경우 건너뜀
-                if existing_messages and existing_messages[0].get("processed"):
-                    logger.log_system(f"이미 처리된 메시지 무시: ID {message_id}", level="INFO")
-                    return
+                try:
+                    existing_messages = db.get_telegram_messages(
+                        direction="INCOMING",
+                        message_id=str(message_id),
+                        limit=1
+                    )
+                    
+                    # 메시지가 이미 저장되어 있고 처리된 경우 건너뜀
+                    if existing_messages and existing_messages[0].get("processed"):
+                        logger.log_system(f"이미 처리된 메시지 무시: ID {message_id}", level="INFO")
+                        return
+                except Exception as e:
+                    logger.log_error(e, f"메시지 처리 상태 확인 중 오류: {message_id}")
+                    # 오류가 발생해도 계속 진행 (중복 처리보다 누락이 더 위험함)
             
             # 수신 메시지 DB에 저장
             is_command = text.startswith('/')
             command = text.split()[0].lower() if is_command else None
             
-            db.save_telegram_message(
-                direction="INCOMING",
-                chat_id=chat_id,
-                message_text=text,
-                message_id=str(message_id) if message_id else None,
-                update_id=update_id,
-                is_command=is_command,
-                command=command
-            )
+            try:
+                db_message_id = db.save_telegram_message(
+                    direction="INCOMING",
+                    chat_id=str(chat_id) if chat_id else "unknown",
+                    message_text=text,
+                    message_id=str(message_id) if message_id else None,
+                    update_id=update_id,
+                    is_command=is_command,
+                    command=command
+                )
+                logger.log_system(f"수신 메시지 DB 저장 성공 (DB ID: {db_message_id})")
+            except Exception as e:
+                logger.log_error(e, "수신 메시지 DB 저장 실패")
+                # DB 저장 실패해도 메시지 처리는 계속함
             
             # 권한 확인 (설정된 chat_id와 일치해야 함)
-            if str(chat_id) != str(self.chat_id):
+            if not chat_id or str(chat_id) != str(self.chat_id):
                 logger.log_system(f"허가되지 않은 접근 (채팅 ID: {chat_id})", level="WARNING")
                 # 메시지 처리 실패 상태 업데이트
                 if message_id:
-                    db.update_telegram_message_status(
-                        message_id=str(message_id),
-                        processed=True,
-                        status="FAIL",
-                        error_message="Unauthorized chat ID"
-                    )
+                    try:
+                        db.update_telegram_message_status(
+                            message_id=str(message_id),
+                            processed=True,
+                            status="FAIL",
+                            error_message="Unauthorized chat ID"
+                        )
+                    except Exception as e:
+                        logger.log_error(e, "메시지 상태 업데이트 실패")
                 return
             
             if is_command:
-                await self._handle_command(text, chat_id, message_id)
+                await self._handle_command(text, str(chat_id), str(message_id) if message_id else None)
                 
         except Exception as e:
             logger.log_error(e, f"텔레그램 업데이트 처리 오류: {update}")
             # 오류 발생 시 메시지 상태 업데이트
             message_id = update.get("message", {}).get("message_id")
             if message_id:
-                db.update_telegram_message_status(
-                    message_id=str(message_id),
-                    processed=True,
-                    status="FAIL",
-                    error_message=str(e)
-                )
+                try:
+                    db.update_telegram_message_status(
+                        message_id=str(message_id),
+                        processed=True,
+                        status="FAIL",
+                        error_message=str(e)
+                    )
+                except Exception as update_error:
+                    logger.log_error(update_error, "메시지 상태 업데이트 실패")
     
     async def _handle_command(self, command_text: str, chat_id: str, message_id: str = None):
         """명령어 처리"""
@@ -340,120 +371,171 @@ class TelegramBotHandler:
                 )
     
     async def _send_message(self, text: str, reply_to: str = None, max_retries: int = 3):
-        """내부 메시지 전송 (재시도 로직 포함)"""
-        # 봇이 종료된 상태이면 메시지 전송 중단
-        if not self.bot_running:
-            logger.log_system("봇이 종료되어 메시지를 전송하지 않습니다.", level="WARNING")
-            return None
-            
-        # 실제 메시지 전송 구현
-        message_id = None
-        error_message = None
-        status = "FAIL"
-        db_message_id = None
+        """텔레그램 메시지 전송 내부 메서드
         
+        텔레그램 API를 통해 메시지를 전송하고 DB에 로그를 저장합니다.
+        중요 메시지(오류, 경고, 종료)는 봇 중단 상태에서도 전송됩니다.
+        
+        Args:
+            text: 전송할 메시지 텍스트
+            reply_to: 답장할 메시지 ID
+            max_retries: 최대 재시도 횟수
+        
+        Returns:
+            성공 시 메시지 ID, 실패 시 None
+        """
+        # 중요 메시지 여부 확인 (오류, 경고, 봇 종료 관련 메시지)
+        is_important = any(keyword in text for keyword in [
+            "❌", "⚠️", "오류", "실패", "error", "fail", "종료", "stop", "ERROR", "WARNING", "CRITICAL"
+        ])
+        
+        # 봇이 실행 중이 아니고, 중요 메시지도 아닌 경우
+        if not self.bot_running and not is_important:
+            logger.log_system("봇이 종료되어 일반 메시지를 전송하지 않습니다.", level="WARNING")
+            return None
+        
+        # 메시지 ID 생성 및 DB 저장
+        db_message_id = db.save_telegram_message(
+            direction="OUTGOING",
+            chat_id=self.chat_id,
+            message_text=text,
+            reply_to=reply_to
+        )
+        
+        logger.log_system(f"발신 메시지 DB 저장 완료 (ID: {db_message_id})")
+        
+        # 텔레그램 API 요청 준비
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         params = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown"  # 마크다운 지원 추가
+            "parse_mode": "HTML"  # HTML 형식 지정
         }
         
         if reply_to:
             params["reply_to_message_id"] = reply_to
         
-        # DB에 메시지 저장 시도 (실패해도 계속 진행)
-        try:
-            db_message_id = db.save_telegram_message(
-                direction="OUTGOING",
-                chat_id=self.chat_id,
-                message_text=text,
-                reply_to=reply_to
-            )
-            logger.log_system(f"발신 메시지 DB 저장 완료 (ID: {db_message_id})")
-        except Exception as e:
-            logger.log_system(f"발신 메시지 DB 저장 실패: {str(e)}", level="WARNING")
-            # DB 저장 실패해도 메시지는 계속 전송 시도
-            
         # 메시지 전송 시도
-        for attempt in range(max_retries):
+        for attempt in range(1, max_retries + 1):
             try:
-                logger.log_system(f"텔레그램 API 요청 시도 #{attempt+1}: {self.base_url}/sendMessage")
+                logger.log_system(f"텔레그램 API 요청 시도 #{attempt}: {url}")
                 
-                # 봇 종료 확인 - 각 시도 전에 확인
-                if not self.bot_running:
-                    logger.log_system("봇이 종료되어 메시지 전송 시도를 중단합니다.", level="WARNING")
-                    error_message = "Bot is shutting down"
-                    break
-                
-                # 세션이 없으면 생성
+                # 세션이 없거나 닫혀있는 경우 새로 생성
                 if self._session is None or self._session.closed:
+                    logger.log_system("텔레그램 API 세션이 없거나 닫혀 있어 새로 생성합니다.", level="WARNING")
                     self._session = aiohttp.ClientSession()
                 
+                # 이벤트 루프가 닫혀있는지 확인
                 try:
-                    async with self._session.post(f"{self.base_url}/sendMessage", json=params, timeout=10) as response:
-                        response_data = await response.json()
-                        logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
-                        
-                        if response.status == 200 and response_data.get("ok"):
-                            message_id = response_data.get("result", {}).get("message_id")
-                            status = "SUCCESS"
-                            break
-                        else:
-                            error_message = response_data.get("description", f"HTTP 오류: {response.status}")
-                            logger.log_system(f"텔레그램 메시지 전송 실패 (시도 #{attempt+1}): {error_message}", level="WARNING")
-                            
-                            # API 토큰 오류인 경우 더 이상 시도하지 않음
-                            if "unauthorized" in error_message.lower() or "forbidden" in error_message.lower():
-                                break
-                            
-                            await asyncio.sleep(1)  # 잠시 대기 후 재시도
-                except RuntimeError as re:
-                    # 이벤트 루프 관련 오류 처리
-                    if "Event loop is closed" in str(re):
+                    current_loop = asyncio.get_event_loop()
+                    if current_loop.is_closed():
                         logger.log_system("이벤트 루프가 닫혀 메시지 전송이 불가능합니다.", level="WARNING")
-                        error_message = "Event loop is closed"
-                        break
-                    raise  # 다른 런타임 오류는 그대로 전파
-                except asyncio.CancelledError:
-                    logger.log_system("작업이 취소되어 메시지 전송이 중단됩니다.", level="WARNING")
-                    error_message = "Task cancelled"
-                    break
-            except asyncio.TimeoutError as e:
-                error_message = f"요청 시간 초과: {str(e)}"
-                logger.log_system(f"텔레그램 메시지 전송 타임아웃: {error_message}", level="WARNING")
-                await asyncio.sleep(1)
+                        # 메시지 전송 실패 상태 업데이트
+                        db.update_telegram_message(db_message_id, status="FAIL", error_message="이벤트 루프 닫힘")
+                        return None
+                except RuntimeError as loop_error:
+                    logger.log_system(f"이벤트 루프 관련 오류: {str(loop_error)}", level="WARNING")
+                    # 메시지 전송 실패 상태 업데이트
+                    db.update_telegram_message(db_message_id, status="FAIL", error_message=f"이벤트 루프 오류: {str(loop_error)}")
+                    return None
+                
+                # API 요청 전송
+                async with self._session.post(url, params=params, timeout=10) as response:
+                    logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
+                    
+                    # 응답 처리
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        if result.get("ok"):
+                            # 성공적으로 전송된 메시지 ID 저장
+                            message_id = result.get("result", {}).get("message_id")
+                            
+                            # DB에 메시지 ID 및 상태 업데이트
+                            db.update_telegram_message(db_message_id, message_id=str(message_id), status="SUCCESS")
+                            logger.log_system(f"발신 메시지 DB 상태 업데이트 완료 (Status: SUCCESS)")
+                            
+                            return message_id
+                        else:
+                            # 텔레그램 API 오류 처리
+                            error_code = result.get("error_code")
+                            description = result.get("description", "알 수 없는 오류")
+                            
+                            logger.log_system(f"텔레그램 API 오류: {error_code} - {description}", level="ERROR")
+                            
+                            # DB에 오류 상태 업데이트
+                            db.update_telegram_message(
+                                db_message_id, 
+                                status="FAIL", 
+                                error_message=f"API 오류: {error_code} - {description}"
+                            )
+                            
+                            # 재시도 가능한 오류인 경우 계속 시도
+                            if error_code in [429, 500, 502, 503, 504] and attempt < max_retries:
+                                await asyncio.sleep(attempt * 2)  # 지수 백오프
+                                continue
+                            
+                            return None
+                    else:
+                        # HTTP 오류 처리
+                        error_text = await response.text()
+                        logger.log_system(f"텔레그램 API HTTP 오류: {response.status} - {error_text}", level="ERROR")
+                        
+                        # DB에 오류 상태 업데이트
+                        db.update_telegram_message(
+                            db_message_id, 
+                            status="FAIL", 
+                            error_message=f"HTTP 오류: {response.status} - {error_text[:100]}"
+                        )
+                        
+                        # 재시도 가능한 HTTP 오류인 경우 계속 시도
+                        if response.status in [429, 500, 502, 503, 504] and attempt < max_retries:
+                            await asyncio.sleep(attempt * 2)  # 지수 백오프
+                            continue
+                        
+                        return None
+            
             except aiohttp.ClientError as e:
-                error_message = f"HTTP 클라이언트 오류: {str(e)}"
-                logger.log_system(f"텔레그램 메시지 전송 중 aiohttp 오류: {error_message}", level="WARNING")
+                # 네트워크 관련 오류 처리
+                logger.log_system(f"텔레그램 API 요청 네트워크 오류: {str(e)}", level="ERROR")
                 
-                # 세션이 손상된 경우 재생성
-                try:
-                    if self._session and not self._session.closed:
-                        await self._session.close()
-                    self._session = aiohttp.ClientSession()
-                except Exception as se:
-                    logger.log_system(f"세션 재생성 중 오류: {str(se)}", level="WARNING")
+                # DB에 오류 상태 업데이트
+                db.update_telegram_message(db_message_id, status="FAIL", error_message=f"네트워크 오류: {str(e)}")
                 
-                await asyncio.sleep(1)
+                # 재시도
+                if attempt < max_retries:
+                    await asyncio.sleep(attempt * 2)  # 지수 백오프
+                    continue
+                
+                return None
+                
+            except asyncio.TimeoutError:
+                # 타임아웃 오류 처리
+                logger.log_system("텔레그램 API 요청 타임아웃", level="ERROR")
+                
+                # DB에 오류 상태 업데이트
+                db.update_telegram_message(db_message_id, status="FAIL", error_message="요청 타임아웃")
+                
+                # 재시도
+                if attempt < max_retries:
+                    await asyncio.sleep(attempt * 2)  # 지수 백오프
+                    continue
+                
+                return None
+                
             except Exception as e:
-                error_message = f"일반 오류: {str(e)}"
-                logger.log_error(e, "텔레그램 메시지 전송 중 일반 오류")
-                await asyncio.sleep(1)
+                # 기타 예외 처리
+                logger.log_error(e, "텔레그램 메시지 전송 중 예외 발생")
+                
+                # DB에 오류 상태 업데이트
+                db.update_telegram_message(db_message_id, status="FAIL", error_message=f"예외: {str(e)}")
+                
+                # 치명적인 오류는 재시도하지 않음
+                return None
         
-        # DB에 전송 결과 업데이트 (실패해도 무시)
-        if db_message_id:
-            try:
-                db.update_telegram_message(
-                    db_message_id=db_message_id,
-                    message_id=message_id,
-                    status=status,
-                    error_message=error_message
-                )
-                logger.log_system(f"발신 메시지 DB 저장 완료 (Status: {status})")
-            except Exception as e:
-                logger.log_system(f"발신 메시지 상태 업데이트 실패: {str(e)}", level="WARNING")
-        
-        return message_id
+        # 모든 시도 실패
+        logger.log_system(f"텔레그램 메시지 전송 최대 시도 횟수 초과 ({max_retries}회)", level="ERROR")
+        return None
     
     async def send_message(self, text: str, reply_to: str = None):
         """외부에서 호출할 수 있는 메시지 전송 메소드"""
@@ -492,34 +574,73 @@ class TelegramBotHandler:
     async def get_status(self, args: List[str]) -> str:
         """시스템 상태 조회"""
         status = db.get_system_status()
-        return f"""📊 시스템 상태
+        
+        # 시간 형식 개선 - 날짜 확인 및 현재 시간 사용
+        updated_at = status['updated_at']
+        try:
+            # 시간 문자열 파싱 및 포매팅
+            if updated_at:
+                from datetime import datetime
+                # DB에서 가져온 시간이 이상한 경우, 현재 시간으로 대체
+                try:
+                    dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+                    # 날짜가 미래이거나 2025년 이전인 경우 현재 시간으로 대체
+                    now = datetime.now()
+                    if dt.year < 2025 or dt > now:
+                        dt = now
+                    updated_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    # 시간 형식이 잘못된 경우 현재 시간으로 대체
+                    updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                # updated_at이 없는 경우 현재 시간 사용
+                updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            # 파싱 에러 발생 시 현재 시간 사용
+            from datetime import datetime
+            updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.log_error(e, "시스템 상태 시간 파싱 실패")
+        
+        # 상태에 따른 이모지 결정
+        status_emoji = "✅" if status['status'] == "RUNNING" else "⚠️" if status['status'] == "PAUSED" else "❌"
+        
+        # 현재 시간 표시 추가
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 거래 건수와 포지션 가져오기
+        today_orders_count = len(await order_manager.get_today_orders())
+        positions_count = len(await order_manager.get_positions())
+        
+        return f"""<b>📊 시스템 상태</b>
 
-상태: {status['status']}
-마지막 업데이트: {status['updated_at']}
-거래 일시정지: {'활성화 ⚠️' if self.trading_paused else '비활성화 ✅'}
+상태: {status_emoji} <b>{status['status']}</b>
+마지막 업데이트: {updated_at}
+현재 시간: {current_time}
+거래 일시정지: {'⚠️ 활성화' if self.trading_paused else '✅ 비활성화'}
 
-성능 요약
-금일 거래: {len(await order_manager.get_today_orders())}건
-보유 포지션: {len(await order_manager.get_positions())}개"""
+<b>성능 요약</b>
+금일 거래: {today_orders_count}건
+보유 포지션: {positions_count}개"""
     
     async def get_help(self, args: List[str]) -> str:
         """도움말"""
-        return """📝 사용 가능한 명령어
+        return """<b>📝 사용 가능한 명령어</b>
 
-조회 명령어
+<b>조회 명령어</b>
 /status - 시스템 상태 조회
 /positions - 보유 종목 조회
 /balance - 계좌 잔고 조회
 /performance - 성과 조회
 /price - 종목 현재가 조회
+/trades - 최근 거래 내역 조회 (예시: /trades 005930 10)
 
-거래 명령어
-/buy - 종목 매수
-/sell - 종목 매도
+<b>거래 명령어</b>
+/buy - 종목 매수 (예시: /buy 005930 10)
+/sell - 종목 매도 (예시: /sell 005930 10)
 /close_all - 모든 포지션 청산
 /scan - 종목 탐색 실행
 
-제어 명령어
+<b>제어 명령어</b>
 /pause - 자동 거래 일시정지
 /resume - 자동 거래 재개
 /stop - 프로그램 종료
@@ -553,23 +674,37 @@ class TelegramBotHandler:
             side="BUY",
             quantity=quantity,
             price=price,
-            order_type="MARKET"
+            order_type="MARKET",
+            reason="user_request_telegram"  # 사용자 요청으로 인한 주문임을 명시
         )
         
-        if result and result.get("rt_cd") == "0":
-            order_no = result.get("output", {}).get("ODNO", "알 수 없음")
+        if result and result.get("status") == "success":
+            order_no = result.get("order_id", "알 수 없음")
+            trade_data = result.get("trade_data", {})
             total_amount = price * quantity
+            
+            # 기존 포지션 정보 가져오기
+            positions = await order_manager.get_positions()
+            position = next((p for p in positions if p["symbol"] == symbol), None)
+            avg_price = position["avg_price"] if position else price
+            total_quantity = position["quantity"] if position else quantity
+            
             return f"""
-💰 *매수 주문 성공*
+<b>💰 매수 주문 성공</b>
 종목: {symbol} ({stock_info.get('name', symbol)})
 수량: {quantity}주
-예상 가격: {price:,}원
-예상 총액: {total_amount:,}원
+체결가: {price:,}원
+총액: {total_amount:,}원
 주문번호: {order_no}
+
+<b>포지션 정보</b>
+평균단가: {avg_price:,}원
+총보유수량: {total_quantity}주
+예상수수료: {trade_data.get('commission', total_amount * 0.0005):,.0f}원
             """
         else:
-            error = result.get("msg1", "알 수 없는 오류") if result else "API 호출 실패"
-            return f"❌ *매수 주문 실패*\n{symbol} 매수 실패: {error}"
+            error = result.get("reason", "알 수 없는 오류") if result else "API 호출 실패"
+            return f"❌ <b>매수 주문 실패</b>\n{symbol} 매수 실패: {error}"
     
     async def sell_stock(self, args: List[str]) -> str:
         """종목 매도"""
@@ -607,23 +742,44 @@ class TelegramBotHandler:
             side="SELL",
             quantity=quantity,
             price=price,
-            order_type="MARKET"
+            order_type="MARKET",
+            reason="user_request_telegram"  # 사용자 요청으로 인한 주문임을 명시
         )
         
-        if result and result.get("rt_cd") == "0":
-            order_no = result.get("output", {}).get("ODNO", "알 수 없음")
+        if result and result.get("status") == "success":
+            order_no = result.get("order_id", "알 수 없음")
+            trade_data = result.get("trade_data", {})
             total_amount = price * quantity
+            
+            # 매도 후 포지션 정보 가져오기
+            positions = await order_manager.get_positions()
+            position = next((p for p in positions if p["symbol"] == symbol), None)
+            remaining = position["quantity"] if position else 0
+            
+            # 손익 계산
+            avg_buy_price = position["avg_price"] if position else 0
+            pnl = trade_data.get("pnl", (price - avg_buy_price) * quantity)
+            pnl_percent = ((price / avg_buy_price) - 1) * 100 if avg_buy_price > 0 else 0
+            
+            # 이모지 결정
+            emoji = "🔴" if pnl < 0 else "🟢"
+            
             return f"""
-💰 *매도 주문 성공*
+<b>💰 매도 주문 성공</b>
 종목: {symbol} ({stock_info.get('name', symbol)})
 수량: {quantity}주
-예상 가격: {price:,}원
-예상 총액: {total_amount:,}원
+체결가: {price:,}원
+총액: {total_amount:,}원
 주문번호: {order_no}
+
+<b>거래 결과</b>
+손익: {emoji} {pnl:,.0f}원 ({pnl_percent:.2f}%)
+남은수량: {remaining}주
+예상수수료: {trade_data.get('commission', total_amount * 0.0005):,.0f}원
             """
         else:
-            error = result.get("msg1", "알 수 없는 오류") if result else "API 호출 실패"
-            return f"❌ *매도 주문 실패*\n{symbol} 매도 실패: {error}"
+            error = result.get("reason", "알 수 없는 오류") if result else "API 호출 실패"
+            return f"❌ <b>매도 주문 실패</b>\n{symbol} 매도 실패: {error}"
     
     async def get_positions(self, args: List[str]) -> str:
         """보유 종목 조회"""
@@ -632,7 +788,7 @@ class TelegramBotHandler:
         if not positions:
             return "현재 보유 중인 종목이 없습니다."
         
-        result = "*현재 보유 종목*\n\n"
+        result = "<b>현재 보유 종목</b>\n\n"
         
         total_value = 0
         for pos in positions:
@@ -656,7 +812,7 @@ class TelegramBotHandler:
             # 이모지 결정
             emoji = "🔴" if pnl < 0 else "🟢"
             
-            result += f"{emoji} *{name}* ({symbol})\n"
+            result += f"{emoji} <b>{name}</b> ({symbol})\n"
             result += f"   수량: {quantity}주\n"
             result += f"   평균단가: {avg_price:,.0f}원\n"
             result += f"   현재가: {current_price:,.0f}원\n"
@@ -665,7 +821,7 @@ class TelegramBotHandler:
             
             total_value += eval_amount
         
-        result += f"*총 평가금액: {total_value:,.0f}원*"
+        result += f"<b>총 평가금액: {total_value:,.0f}원</b>"
         return result
     
     async def get_balance(self, args: List[str]) -> str:
@@ -722,7 +878,7 @@ class TelegramBotHandler:
                 return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {type(balance_data)}"
             
             return f"""
-💵 *계좌 잔고 정보*
+<b>💵 계좌 잔고 정보</b>
 
 총 평가금액: {total_balance:,.0f}원
 예수금: {deposit:,.0f}원
@@ -750,7 +906,7 @@ class TelegramBotHandler:
         realized_pnl = total_sell - total_buy
         
         result = f"""
-📈 *오늘의 거래 성과*
+<b>📈 오늘의 거래 성과</b>
 
 총 거래: {len(today_orders)}건
 - 매수: {len(buy_orders)}건 (₩{total_buy:,.0f})
@@ -763,7 +919,7 @@ class TelegramBotHandler:
         symbols = set([o["symbol"] for o in today_orders])
         
         if symbols:
-            result += "\n*종목별 거래*\n"
+            result += "\n<b>종목별 거래</b>\n"
             
             for symbol in symbols:
                 symbol_orders = [o for o in today_orders if o["symbol"] == symbol]
@@ -816,9 +972,9 @@ class TelegramBotHandler:
         """프로그램 종료"""
         # 확인 요청
         if not args or not args[0] == "confirm":
-            return "⚠️ 정말로 트레이딩 봇을 종료하시겠습니까? 확인하려면 `/stop confirm`을 입력하세요."
+            return "⚠️ 정말로 트레이딩 봇을 종료하시겠습니까? 확인하려면 <code>/stop confirm</code>을 입력하세요."
         
-        await self._send_message("🛑 *트레이딩 봇을 종료합니다...*")
+        await self._send_message("🛑 <b>트레이딩 봇을 종료합니다...</b>")
         
         # 콜백이 없어도 자체적으로 종료 처리
         if self.shutdown_callback is None:
@@ -1026,28 +1182,40 @@ class TelegramBotHandler:
         self.trading_paused = True
         
         # 전략 일시 중지
-        if hasattr(scalping_strategy, 'pause'):
+        try:
             await scalping_strategy.pause()
+            logger.log_system("스캘핑 전략을 성공적으로 일시 중지했습니다.")
+        except Exception as e:
+            logger.log_error(e, "스캘핑 전략 일시 중지 중 오류 발생")
+            
+        # order_manager에도 거래 일시 중지 상태 설정
+        order_manager.pause_trading()
             
         db.update_system_status("PAUSED", "텔레그램 명령으로 거래 일시 중지됨")
-        return "⚠️ *거래가 일시 중지되었습니다.*\n\n자동 매매가 중지되었지만, 수동 매매는 가능합니다.\n거래를 재개하려면 `/resume`을 입력하세요."
+        return "⚠️ <b>거래가 일시 중지되었습니다.</b>\n\n자동 매매가 중지되었지만, 수동 매매는 가능합니다.\n거래를 재개하려면 <code>/resume</code>을 입력하세요."
     
     async def resume_trading(self, args: List[str]) -> str:
         """거래 재개"""
         self.trading_paused = False
         
         # 전략 재개
-        if hasattr(scalping_strategy, 'resume'):
+        try:
             await scalping_strategy.resume()
+            logger.log_system("스캘핑 전략을 성공적으로 재개했습니다.")
+        except Exception as e:
+            logger.log_error(e, "스캘핑 전략 재개 중 오류 발생")
+            
+        # order_manager에도 거래 재개 상태 설정
+        order_manager.resume_trading()
             
         db.update_system_status("RUNNING", "텔레그램 명령으로 거래 재개됨")
-        return "✅ *거래가 재개되었습니다.*"
+        return "✅ <b>거래가 재개되었습니다.</b>"
     
     async def close_all_positions(self, args: List[str]) -> str:
         """모든 포지션 청산"""
         # 확인 요청
         if not args or not args[0] == "confirm":
-            return "⚠️ 정말로 모든 포지션을 청산하시겠습니까? 확인하려면 `/close_all confirm`을 입력하세요."
+            return "⚠️ 정말로 모든 포지션을 청산하시겠습니까? 확인하려면 <code>/close_all confirm</code>을 입력하세요."
             
         positions = await order_manager.get_positions()
         
@@ -1072,10 +1240,11 @@ class TelegramBotHandler:
                 side="SELL",
                 quantity=quantity,
                 price=price,
-                order_type="MARKET"
+                order_type="MARKET",
+                reason="user_request_closeall"  # 사용자 요청으로 인한 주문임을 명시
             )
             
-            if result and result.get("rt_cd") == "0":
+            if result and result.get("status") == "success":
                 success_count += 1
             else:
                 failed_symbols.append(symbol)
@@ -1085,12 +1254,12 @@ class TelegramBotHandler:
         
         if failed_symbols:
             return f"""
-⚠️ *포지션 청산 일부 완료*
+⚠️ <b>포지션 청산 일부 완료</b>
 성공: {success_count}/{len(positions)}개 종목
 실패 종목: {', '.join(failed_symbols)}
             """
         else:
-            return f"✅ *모든 포지션 청산 완료*\n{success_count}개 종목이 청산되었습니다."
+            return f"✅ <b>모든 포지션 청산 완료</b>\n{success_count}개 종목이 청산되었습니다."
     
     async def get_price(self, args: List[str]) -> str:
         """종목 현재가 조회"""
@@ -1112,12 +1281,75 @@ class TelegramBotHandler:
         emoji = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
         
         return f"""
-💹 *{stock_info.get('name', symbol)} ({symbol})*
+<b>💹 {stock_info.get('name', symbol)} ({symbol})</b>
 
 현재가: {current_price:,.0f}원 {emoji}
 전일대비: {change_rate:.2f}%
 거래량: {volume:,}주
 """
+
+    async def get_trades(self, args: List[str]) -> str:
+        """최근 거래 내역 조회"""
+        # 파라미터 처리
+        symbol = None
+        limit = 5  # 기본값
+        
+        if args and len(args) > 0:
+            if len(args) >= 1 and args[0].isdigit():
+                limit = min(int(args[0]), 20)  # 최대 20개까지 제한
+            else:
+                symbol = args[0]
+                if len(args) >= 2 and args[1].isdigit():
+                    limit = min(int(args[1]), 20)
+        
+        # 현재 날짜 기준으로 최근 거래내역 조회
+        today = datetime.now().strftime('%Y-%m-%d')
+        one_week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        
+        trades = db.get_trades(symbol=symbol, start_date=one_week_ago, end_date=f"{today} 23:59:59")
+        
+        if not trades:
+            return f"<b>📊 최근 거래 내역</b>\n\n최근 거래 내역이 없습니다." + (f"\n종목: {symbol}" if symbol else "")
+        
+        # 최신순으로 정렬하여 limit 개수만큼만 표시
+        trades = sorted(trades, key=lambda x: x.get("created_at", ""), reverse=True)[:limit]
+        
+        trades_text = ""
+        for trade in trades:
+            trade_time = trade.get("created_at", "").split(" ")[1][:5]  # HH:MM 형식
+            trade_date = trade.get("created_at", "").split(" ")[0]
+            side = trade.get("side", "")
+            symbol = trade.get("symbol", "")
+            price = trade.get("price", 0)
+            quantity = trade.get("quantity", 0)
+            pnl = trade.get("pnl", 0)
+            
+            # 매수/매도에 따른 이모지 및 색상
+            emoji = "🟢" if side == "BUY" else "🔴"
+            
+            # 손익 표시 (매도의 경우)
+            pnl_text = ""
+            if side == "SELL" and pnl is not None:
+                pnl_emoji = "🔴" if pnl < 0 else "🟢"
+                pnl_text = f" ({pnl_emoji} {pnl:,.0f}원)"
+            
+            # 한 거래에 대한 텍스트 생성
+            trade_info = f"{emoji} {trade_date} {trade_time} | {symbol} | {side} | {price:,.0f}원 x {quantity}주{pnl_text}\n"
+            trades_text += trade_info
+        
+        # 요약 정보 계산
+        buy_count = sum(1 for t in trades if t.get("side") == "BUY")
+        sell_count = sum(1 for t in trades if t.get("side") == "SELL")
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades if t.get("side") == "SELL")
+        
+        summary = f"매수: {buy_count}건, 매도: {sell_count}건, 손익: {total_pnl:,.0f}원"
+        
+        return f"""<b>📊 최근 거래 내역</b>{f' ({symbol})' if symbol else ''}
+
+{trades_text}
+<b>요약</b>: {summary}
+
+{f'종목코드 {symbol}의 ' if symbol else ''}최근 {len(trades)}건 표시 (최대 {limit}건)"""
 
 # 싱글톤 인스턴스
 telegram_bot_handler = TelegramBotHandler() 

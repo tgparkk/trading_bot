@@ -129,20 +129,30 @@ def api_account():
             """
         
         # 텔레그램 메시지 전송 (백그라운드에서 비동기로 실행)
-        loop = asyncio.new_event_loop()
-        
-        async def send_account_result():
-            try:
-                await telegram_bot_handler.send_message(message)
-                logger.log_system("계좌 정보 조회 결과 메시지 전송 완료")
-            except Exception as e:
-                logger.log_error(e, "계좌 정보 조회 결과 메시지 전송 실패")
-        
-        # 비동기 함수를 백그라운드 스레드에서 실행
         def run_background_task():
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(send_account_result())
-            loop.close()
+            # 새 이벤트 루프 생성
+            task_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(task_loop)
+            
+            async def send_account_result():
+                try:
+                    # 봇 상태 확인 및 필요시 활성화
+                    if not telegram_bot_handler.bot_running:
+                        telegram_bot_handler.bot_running = True
+                        logger.log_system("메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+                    
+                    await telegram_bot_handler.send_message(message)
+                    logger.log_system("계좌 정보 조회 결과 메시지 전송 완료")
+                except Exception as e:
+                    logger.log_error(e, "계좌 정보 조회 결과 메시지 전송 실패")
+                finally:
+                    # 반드시 이벤트 루프 닫기
+                    task_loop.stop()
+            
+            try:
+                task_loop.run_until_complete(send_account_result())
+            finally:
+                task_loop.close()
         
         thread = threading.Thread(target=run_background_task, daemon=True)
         thread.start()
@@ -160,19 +170,30 @@ def api_account():
         
         # 백그라운드에서 오류 메시지 전송
         try:
-            loop = asyncio.new_event_loop()
-            
-            async def send_error_message():
-                try:
-                    await telegram_bot_handler.send_message(error_message)
-                    logger.log_system("계좌 정보 조회 오류 메시지 전송 완료")
-                except Exception as msg_error:
-                    logger.log_error(msg_error, "계좌 정보 조회 오류 메시지 전송 실패")
-            
             def run_background_task():
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(send_error_message())
-                loop.close()
+                # 새 이벤트 루프 생성
+                task_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(task_loop)
+                
+                async def send_error_message():
+                    try:
+                        # 봇 상태 확인 및 필요시 활성화
+                        if not telegram_bot_handler.bot_running:
+                            telegram_bot_handler.bot_running = True
+                            logger.log_system("메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+                        
+                        await telegram_bot_handler.send_message(error_message)
+                        logger.log_system("계좌 정보 조회 오류 메시지 전송 완료")
+                    except Exception as msg_error:
+                        logger.log_error(msg_error, "계좌 정보 조회 오류 메시지 전송 실패")
+                    finally:
+                        # 반드시 이벤트 루프 닫기
+                        task_loop.stop()
+                
+                try:
+                    task_loop.run_until_complete(send_error_message())
+                finally:
+                    task_loop.close()
             
             thread = threading.Thread(target=run_background_task, daemon=True)
             thread.start()
@@ -239,12 +260,28 @@ def api_send_telegram():
         if not message:
             return jsonify({'error': 'No message provided'}), 400
             
-        # 비동기 작업을 동기적으로 실행
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # 독립적인 이벤트 루프 생성
+        task_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(task_loop)
         
-        message_id = loop.run_until_complete(telegram_bot_handler.send_message(message))
-        loop.close()
+        # 메시지 전송 전에 봇 상태 확인 및 활성화
+        async def send_with_status_check():
+            try:
+                # 봇 상태 확인 및 필요시 활성화
+                if not telegram_bot_handler.bot_running:
+                    telegram_bot_handler.bot_running = True
+                    logger.log_system("API 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+                
+                # 메시지 전송
+                return await telegram_bot_handler.send_message(message)
+            finally:
+                # 처리 완료 후 이벤트 루프 중지
+                task_loop.stop()
+        
+        try:
+            message_id = task_loop.run_until_complete(send_with_status_check())
+        finally:
+            task_loop.close()
         
         return jsonify({'success': True, 'message_id': message_id})
     except Exception as e:
@@ -272,6 +309,11 @@ def api_test_kis_connection():
 # KIS API 접속 테스트 및 결과 텔레그램 전송 함수
 async def test_kis_api_connection():
     try:
+        # 봇 상태 확인 및 필요시 활성화
+        if not telegram_bot_handler.bot_running:
+            telegram_bot_handler.bot_running = True
+            logger.log_system("KIS API 테스트 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+        
         # KIS API 접속 시도 전 메시지 전송
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         pre_message = f"""
@@ -343,6 +385,11 @@ async def test_kis_api_connection():
         """
         
         try:
+            # 봇 상태 확인 및 필요시 활성화
+            if not telegram_bot_handler.bot_running:
+                telegram_bot_handler.bot_running = True
+                logger.log_system("오류 메시지 전송을 위해 봇 상태를 활성화했습니다.", level="WARNING")
+            
             logger.log_system("KIS API 접속 오류 메시지 전송 중...")
             await telegram_bot_handler.send_message(error_message)
             logger.log_system("KIS API 접속 오류 메시지 전송 완료")
@@ -363,6 +410,12 @@ async def init_telegram_handler():
     try:
         # 텔레그램 봇 핸들러 준비 대기
         logger.log_system("대시보드 백엔드: 텔레그램 봇 핸들러 준비 대기...")
+        
+        # 봇 상태 강제 활성화
+        telegram_bot_handler.bot_running = True
+        logger.log_system("대시보드 백엔드: 텔레그램 봇 상태를 활성화했습니다.")
+        
+        # 봇 준비 대기
         await telegram_bot_handler.wait_until_ready(timeout=10)
         
         # 대시보드 시작 알림 전송
@@ -429,12 +482,18 @@ def start_telegram_handler():
     # 이미 실행 중인 텔레그램 봇이 있는지 확인
     if check_telegram_lock():
         logger.log_system("다른 프로세스에서 실행 중인 텔레그램 봇이 감지되었습니다. 텔레그램 초기화를 건너뜁니다.")
+        # 다른 프로세스에서 봇이 실행 중이더라도 이 프로세스에서 사용할 수 있도록 상태 설정
+        telegram_bot_handler.bot_running = True
         telegram_bot_initialized = True
+        logger.log_system("백엔드에서 메시지 전송을 위해 봇 상태를 활성화했습니다.")
         return
     
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        
+        # 봇 상태 명시적으로 활성화
+        telegram_bot_handler.bot_running = True
         
         # 텔레그램 폴링 태스크 시작
         telegram_task = loop.create_task(telegram_bot_handler.start_polling())
@@ -446,6 +505,22 @@ def start_telegram_handler():
         def run_event_loop(loop):
             asyncio.set_event_loop(loop)
             try:
+                # 봇 상태 주기적으로 확인하는 태스크 추가
+                async def check_bot_status():
+                    while True:
+                        try:
+                            if not telegram_bot_handler.bot_running:
+                                logger.log_system("봇 상태가 비활성화되어 있어 다시 활성화합니다.", level="WARNING")
+                                telegram_bot_handler.bot_running = True
+                            await asyncio.sleep(30)  # 30초마다 체크
+                        except Exception as e:
+                            logger.log_error(e, "봇 상태 체크 중 오류 발생")
+                            await asyncio.sleep(60)  # 오류 발생 시 더 오래 대기
+                
+                # 상태 체크 태스크 시작
+                status_task = loop.create_task(check_bot_status())
+                
+                # 이벤트 루프 실행
                 loop.run_forever()
             except Exception as e:
                 logger.log_error(e, "텔레그램 이벤트 루프 실행 오류")

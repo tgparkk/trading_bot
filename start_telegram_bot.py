@@ -45,32 +45,64 @@ def check_bot_running():
                     # psutil이 설치되어 있는지 확인
                     import psutil
                     if psutil.pid_exists(pid):
-                        print(f"⚠️ 텔레그램 봇이 이미 실행 중입니다 (PID: {pid}, 시작 시간: {start_time})")
-                        print("기존 프로세스를 종료하고 새로 시작합니다...")
-                        
+                        # 해당 프로세스가 실제로 텔레그램 봇인지 확인 (명령줄 확인)
+                        is_bot_process = False
                         try:
-                            # 프로세스 종료 시도
                             process = psutil.Process(pid)
-                            process.terminate()  # SIGTERM 신호 전송
+                            cmdline = " ".join(process.cmdline())
+                            # 명령줄에 telegram 또는 start_telegram_bot이 포함되어 있는지 확인
+                            if any(keyword in cmdline.lower() for keyword in ["telegram", "start_telegram_bot.py"]):
+                                is_bot_process = True
+                                print(f"⚠️ 텔레그램 봇 프로세스가 이미 실행 중입니다 (PID: {pid}, 시작 시간: {start_time})")
+                                print(f"명령줄: {cmdline}")
+                            else:
+                                print(f"경고: 락 파일에 등록된 PID {pid}는 다른 프로세스입니다: {cmdline}")
+                                print("잘못된 락 파일을 삭제합니다.")
+                                LOCK_FILE.unlink(missing_ok=True)
+                                return False
+                        except (psutil.AccessDenied, psutil.NoSuchProcess):
+                            # 프로세스 접근 권한이 없으면 PID만으로 판단
+                            print(f"⚠️ PID {pid}의 프로세스가 존재하지만 명령줄을 확인할 수 없습니다. 텔레그램 봇으로 가정합니다.")
+                            is_bot_process = True
+                        
+                        # 텔레그램 봇 프로세스라면 종료 시도
+                        if is_bot_process:
+                            print("기존 프로세스를 종료하고 새로 시작합니다...")
                             
-                            # 최대 5초 동안 종료될 때까지 대기
-                            process.wait(timeout=5)
-                            print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 성공적으로 종료되었습니다.")
-                        except psutil.NoSuchProcess:
-                            print(f"프로세스(PID: {pid})가 이미 종료되었습니다.")
-                        except psutil.TimeoutExpired:
-                            print(f"프로세스(PID: {pid}) 종료 시간 초과. 강제 종료를 시도합니다.")
                             try:
-                                process.kill()  # SIGKILL 신호 전송 (강제 종료)
-                                print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 강제 종료되었습니다.")
-                            except Exception as kill_error:
-                                print(f"강제 종료 실패: {str(kill_error)}")
+                                # 프로세스 종료 시도
+                                process = psutil.Process(pid)
+                                process.terminate()  # SIGTERM 신호 전송
+                                
+                                # 최대 5초 동안 종료될 때까지 대기
+                                process.wait(timeout=5)
+                                print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 성공적으로 종료되었습니다.")
+                                LOCK_FILE.unlink(missing_ok=True)
+                                return False
+                            except psutil.NoSuchProcess:
+                                print(f"프로세스(PID: {pid})가 이미 종료되었습니다.")
+                                LOCK_FILE.unlink(missing_ok=True)
+                                return False
+                            except psutil.TimeoutExpired:
+                                print(f"프로세스(PID: {pid}) 종료 시간 초과. 강제 종료를 시도합니다.")
+                                try:
+                                    process.kill()  # SIGKILL 신호 전송 (강제 종료)
+                                    print(f"✅ 이전 텔레그램 봇 프로세스(PID: {pid})가 강제 종료되었습니다.")
+                                    LOCK_FILE.unlink(missing_ok=True)
+                                    return False
+                                except Exception as kill_error:
+                                    print(f"강제 종료 실패: {str(kill_error)}")
+                                    print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
+                                    return True
+                            except Exception as e:
+                                print(f"프로세스 종료 중 오류 발생: {str(e)}")
                                 print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
                                 return True
-                        except Exception as e:
-                            print(f"프로세스 종료 중 오류 발생: {str(e)}")
-                            print("기존 인스턴스를 수동으로 종료한 후 다시 시도하세요.")
-                            return True
+                    else:
+                        print(f"락 파일에 등록된 PID {pid}의 프로세스가 존재하지 않습니다.")
+                        print("오래된 락 파일을 삭제합니다.")
+                        LOCK_FILE.unlink(missing_ok=True)
+                        return False
                 except ImportError:
                     # psutil이 설치되지 않은 경우
                     print("⚠️ psutil 모듈이 설치되지 않아 기존 프로세스를 자동으로 종료할 수 없습니다.")
@@ -255,91 +287,164 @@ async def status_update():
         if counter >= interval:
             counter = 0
             try:
+                # 시스템 상태 업데이트
                 db.update_system_status("RUNNING", "텔레그램 봇 정상 실행 중")
                 logger.log_system(f"상태 업데이트: 텔레그램 봇 정상 실행 중 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
+                
+                # 봇 실행 상태 확인 및 필요시 재설정
+                if not telegram_bot_handler.bot_running:
+                    logger.log_system("봇 실행 상태가 False로 설정되어 있어 True로 재설정합니다.", level="WARNING")
+                    telegram_bot_handler.bot_running = True
+                    
+                # 세션 확인 및 필요시 재생성
+                if telegram_bot_handler._session is None or telegram_bot_handler._session.closed:
+                    logger.log_system("봇 세션이 없거나 닫혀 있어 재생성합니다.", level="WARNING")
+                    try:
+                        telegram_bot_handler._session = aiohttp.ClientSession()
+                        logger.log_system("새 aiohttp 세션 생성 완료")
+                    except Exception as e:
+                        logger.log_error(e, "세션 재생성 중 오류 발생")
             except Exception as e:
                 logger.log_error(e, "상태 업데이트 중 오류")
 
 async def main():
     """메인 함수"""
-    print("="*60)
-    print("텔레그램 봇 백그라운드 실행 시작")
-    print("="*60)
+    global shutdown_requested
     
-    # 이미 실행 중인지 확인
+    print("=== 텔레그램 봇 시작 ===")
+    
+    # 이미 실행 중인 봇 체크 및 처리
     if check_bot_running():
-        return 1
+        print("이미 실행 중인 텔레그램 봇이 감지되었습니다.")
+        sys.exit(1)
     
     # 락 파일 생성
     create_lock_file()
     
     try:
-        # 웹훅 초기화 (409 충돌 문제 해결)
+        # 웹훅 초기화 먼저 진행 (충돌 방지)
         await reset_telegram_webhook()
         
-        # 종료 콜백 함수 설정 - 명시적으로 확인
-        print("종료 콜백 함수 설정 중...")
-        # 콜백 함수가 None인지 직접 확인
-        if hasattr(telegram_bot_handler, 'set_shutdown_callback'):
-            telegram_bot_handler.set_shutdown_callback(shutdown)
-            print(f"✅ 종료 콜백 함수 설정 성공: {shutdown.__name__}")
-        else:
-            print("❌ 종료 콜백 설정 실패: 텔레그램 봇 핸들러에 set_shutdown_callback 메서드가 없습니다")
+        # 시스템 상태 업데이트
+        db.update_system_status("RUNNING", "텔레그램 봇 시작됨")
         
-        # 상태 업데이트 태스크
+        # 봇 핸들러에 종료 콜백 설정
+        telegram_bot_handler.set_shutdown_callback(shutdown)
+        
+        # 봇 실행 상태를 명시적으로 True로 설정
+        telegram_bot_handler.bot_running = True
+        
+        # 초기화 재시도 로직
+        init_retries = 3
+        init_success = False
+        
+        for attempt in range(init_retries):
+            try:
+                print(f"텔레그램 봇 초기화 시도 #{attempt+1}...")
+                
+                # 세션 정리 - 안전하게 새로 시작
+                if hasattr(telegram_bot_handler, '_session') and telegram_bot_handler._session:
+                    if not telegram_bot_handler._session.closed:
+                        try:
+                            await telegram_bot_handler._session.close()
+                            print("이전 세션 정리 완료")
+                        except Exception as e:
+                            print(f"이전 세션 정리 중 오류: {e}")
+                
+                # ready_event 초기화
+                telegram_bot_handler.ready_event = asyncio.Event()
+                
+                # 봇 상태 초기화 - 실행 중임을 명시
+                telegram_bot_handler.bot_running = True
+                
+                # 봇이 이미 재시도 로직에서 중지되었는지 확인
+                if shutdown_requested:
+                    print("종료 요청이 감지되었습니다. 초기화를 중단합니다.")
+                    break
+                
+                # 폴링 시작 (별도 태스크)
+                polling_task = asyncio.create_task(telegram_bot_handler.start_polling())
+                
+                # 최대 10초 동안 봇이 준비될 때까지 대기
+                try:
+                    await asyncio.wait_for(telegram_bot_handler.wait_until_ready(), timeout=10)
+                    print("텔레그램 봇 초기화 완료!")
+                    init_success = True
+                    break
+                except asyncio.TimeoutError:
+                    print("텔레그램 봇 초기화 시간 초과")
+                    # 봇 상태 재설정
+                    telegram_bot_handler.bot_running = False
+                    continue
+                    
+            except Exception as e:
+                print(f"텔레그램 봇 초기화 오류: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(2)  # 재시도 전 대기
+        
+        if not init_success:
+            print("텔레그램 봇 초기화에 실패했습니다. 프로그램을 종료합니다.")
+            remove_lock_file()
+            sys.exit(1)
+            
+        # 다시 봇이 실행 중임을 명시적으로 설정
+        telegram_bot_handler.bot_running = True
+            
+        # 주기적인 상태 업데이트 태스크 시작
         status_task = asyncio.create_task(status_update())
         
-        # 봇 시작
-        polling_task = asyncio.create_task(telegram_bot_handler.start_polling())
-        
-        # 봇이 준비될 때까지 대기
+        # 초기 상태 메시지 전송
         try:
-            await telegram_bot_handler.wait_until_ready(timeout=30)
-            print("✅ 텔레그램 봇 준비 완료")
+            await telegram_bot_handler.send_message("📡 <b>텔레그램 봇이 성공적으로 시작되었습니다.</b>\n\n/help 명령어로 사용 가능한 명령어를 확인하세요.")
+            print("초기 상태 메시지 전송 성공")
+        except Exception as e:
+            print(f"초기 상태 메시지 전송 실패: {e}")
+        
+        try:
+            # 상태를 주기적으로 모니터링하며 대기
+            while not shutdown_requested:
+                if not telegram_bot_handler.bot_running:
+                    print("텔레그램 봇 종료 감지. 프로그램을 종료합니다.")
+                    break
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("키보드 인터럽트 감지. 프로그램을 종료합니다.")
+            shutdown_requested = True
+        finally:
+            # 태스크 취소
+            if 'status_task' in locals() and not status_task.done():
+                status_task.cancel()
+            if 'polling_task' in locals() and not polling_task.done():
+                polling_task.cancel()
             
-            # 환영 메시지 전송
-            welcome_message = f"""
-*텔레그램 봇 서비스 시작* 🚀
-시작 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-텔레그램 봇 서비스가 시작되었습니다.
-사용 가능한 명령어 목록을 보려면 /help를 입력하세요.
-"""
-            await telegram_bot_handler.send_message(welcome_message)
+            # 봇 종료 처리
+            telegram_bot_handler.bot_running = False
             
-        except asyncio.TimeoutError:
-            print("⚠️ 텔레그램 봇 준비 시간 초과. 계속 진행합니다.")
-        
-        # 시스템 상태 업데이트
-        db.update_system_status("RUNNING", "텔레그램 봇 서비스 시작됨")
-        
-        print("텔레그램 봇이 백그라운드에서 실행 중입니다. 종료하려면 Ctrl+C를 누르세요.")
-        
-        # 종료 요청이 있을 때까지 실행
-        while not shutdown_requested:
-            await asyncio.sleep(1)
+            # 락 파일 제거
+            remove_lock_file()
             
-        # 종료 처리
-        print("종료 요청을 처리합니다...")
-        status_task.cancel()
-        await shutdown()
-        
-        # 텔레그램 명령으로 종료된 경우 명시적으로 메시지 출력
-        if not signal_handler_called:
-            print("텔레그램 명령으로 시스템 종료됨")
-            # 명시적으로 프로세스 종료 (루프가 계속 실행되는 것을 방지)
-            sys.exit(0)
-        
+            # 수동 종료 프로세스 실행
+            await shutdown()
+            
     except Exception as e:
-        logger.log_error(e, "텔레그램 봇 실행 중 오류 발생")
-        print(f"❌ 오류 발생: {str(e)}")
-        return 1
+        print(f"텔레그램 봇 실행 중 오류: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        # 락 파일 제거
-        remove_lock_file()
-    
-    print("텔레그램 봇 서비스가 정상적으로 종료되었습니다.")
-    return 0
+        # 추가 정리 작업
+        try:
+            if hasattr(telegram_bot_handler, '_session') and telegram_bot_handler._session:
+                if not telegram_bot_handler._session.closed:
+                    await telegram_bot_handler._session.close()
+            remove_lock_file()
+        except Exception as e:
+            print(f"정리 중 오류: {e}")
+        
+        print("=== 텔레그램 봇 종료 ===")
+        
+        # 프로그램 강제 종료
+        sys.exit(0)
 
 if __name__ == "__main__":
     try:
