@@ -19,6 +19,7 @@ class OrderManager:
         self.pending_orders = {}  # {order_id: order_data}
         self.daily_pnl = 0
         self.daily_trades = 0
+        self.trading_paused = False  # 거래 일시 중지 플래그
         
     async def initialize(self):
         """초기화 - 포지션/잔고 로드"""
@@ -33,17 +34,53 @@ class OrderManager:
             for position in db_positions:
                 self.positions[position["symbol"]] = position
             
+            # DB에서 시스템 상태 확인하여 거래 일시 중지 상태 초기화
+            system_status = db.get_system_status()
+            if system_status and system_status.get("status") == "PAUSED":
+                self.trading_paused = True
+                logger.log_system("Trading initialized in paused state")
+            else:
+                self.trading_paused = False
+            
             logger.log_system("Order manager initialized successfully")
             
         except Exception as e:
             logger.log_error(e, "Failed to initialize order manager")
             raise
     
+    def is_trading_paused(self) -> bool:
+        """거래 일시 중지 상태 반환"""
+        return self.trading_paused
+    
+    def pause_trading(self) -> bool:
+        """거래 일시 중지"""
+        if not self.trading_paused:
+            self.trading_paused = True
+            logger.log_system("Trading has been paused")
+            return True
+        return False
+    
+    def resume_trading(self) -> bool:
+        """거래 재개"""
+        if self.trading_paused:
+            self.trading_paused = False
+            logger.log_system("Trading has been resumed")
+            return True
+        return False
+    
     async def place_order(self, symbol: str, side: str, quantity: int, 
                          price: float = None, order_type: str = "MARKET",
-                         strategy: str = None, reason: str = None) -> Dict[str, Any]:
+                         strategy: str = None, reason: str = None, 
+                         bypass_pause: bool = False) -> Dict[str, Any]:
         """주문 실행"""
         try:
+            # 거래 일시 중지 상태 확인 (bypass_pause가 False이고 거래가 일시 중지된 경우)
+            if not bypass_pause and self.trading_paused:
+                # 전략에 의한 자동 거래 (reason에 'user_request'가 없는 경우)인 경우만 거부
+                if not reason or 'user_request' not in reason:
+                    logger.log_system(f"Order rejected for {symbol}: trading is paused")
+                    return {"status": "rejected", "reason": "trading_paused"}
+            
             # 리스크 체크
             if not await self._check_risk(symbol, side, quantity, price):
                 return {"status": "rejected", "reason": "risk_check_failed"}
@@ -89,12 +126,38 @@ class OrderManager:
                 db.save_order(order_data)
                 self.pending_orders[order_id] = order_data
                 
+                # 포지션 업데이트
+                await self.update_position(symbol, side, quantity, price)
+                
+                # 거래 기록 저장 (trades 테이블)
+                trade_data = {
+                    "symbol": symbol,
+                    "side": side,
+                    "price": price,
+                    "quantity": quantity,
+                    "order_type": order_type,
+                    "status": "FILLED",  # 시장가 주문은 즉시 체결로 간주
+                    "order_id": order_id,
+                    "commission": price * quantity * 0.0005,  # 예상 수수료 (0.05%)
+                    "strategy": strategy,
+                    "reason": reason
+                }
+                
+                # 매도인 경우 실현 손익 계산
+                if side == "SELL":
+                    current_position = self.positions.get(symbol, {"avg_price": 0})
+                    pnl = (price - current_position.get("avg_price", 0)) * quantity
+                    trade_data["pnl"] = pnl
+                
+                # 트레이드 DB에 저장
+                db.save_trade(trade_data)
+                
                 # 알림 전송
-                await alert_system.notify_trade(order_data)
+                await alert_system.notify_trade(trade_data)
                 
                 self.daily_trades += 1
                 
-                return {"status": "success", "order_id": order_id}
+                return {"status": "success", "order_id": order_id, "trade_data": trade_data}
             
             else:
                 error_msg = order_result.get("msg1", "Unknown error")
@@ -145,6 +208,10 @@ class OrderManager:
                 "realized_pnl": 0
             })
             
+            # 이전 포지션 정보 저장 (로깅용)
+            old_quantity = current_position.get("quantity", 0)
+            old_avg_price = current_position.get("avg_price", 0)
+            
             if side == "BUY":
                 # 매수 - 평균가 계산
                 new_quantity = current_position["quantity"] + quantity
@@ -184,7 +251,16 @@ class OrderManager:
                 if symbol in self.positions:
                     del self.positions[symbol]
             
-            logger.log_system(f"Position updated for {symbol}")
+            # 포지션 변화 로깅
+            change_description = ""
+            if side == "BUY":
+                change_description = f"증가: {old_quantity} → {current_position['quantity']} 주, 평단가: {old_avg_price:,.0f} → {current_position['avg_price']:,.0f} 원"
+            else:
+                change_description = f"감소: {old_quantity} → {current_position['quantity']} 주"
+                if current_position["quantity"] == 0:
+                    change_description += " (포지션 청산)"
+            
+            logger.log_system(f"Position updated for {symbol}: {change_description}")
             
         except Exception as e:
             logger.log_error(e, f"Position update error: {symbol}")

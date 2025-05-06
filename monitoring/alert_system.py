@@ -80,7 +80,7 @@ class AlertSystem:
             payload = {
                 "chat_id": self.chat_id,
                 "text": formatted_message,
-                "parse_mode": "Markdown"
+                "parse_mode": "HTML"
             }
             
             response = requests.post(self.telegram_bot_url, json=payload)
@@ -120,17 +120,36 @@ class AlertSystem:
         if not self.alert_config.alert_on_trade:
             return
         
+        # 거래 방향에 따른 이모지
+        emoji = "🟢" if trade_data['side'] == "BUY" else "🔴"
+        
+        # 총 거래 금액 계산
+        total_amount = trade_data['price'] * trade_data['quantity']
+        
+        # 현재 한국 시간
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
         message = f"""
-        *Trade Executed*
-        Symbol: {trade_data['symbol']}
-        Side: {trade_data['side']}
-        Price: {trade_data['price']}
-        Quantity: {trade_data['quantity']}
-        Strategy: {trade_data.get('strategy', 'N/A')}
-        Reason: {trade_data.get('reason', 'N/A')}
+{emoji} <b>{trade_data['side']} 거래 체결</b>
+
+<b>종목정보</b>
+종목코드: <code>{trade_data['symbol']}</code>
+거래방향: {trade_data['side']}
+체결가격: {trade_data['price']:,.0f}원
+체결수량: {trade_data['quantity']:,}주
+총거래금액: {total_amount:,.0f}원
+
+<b>거래상세</b>
+주문유형: {trade_data['order_type']}
+주문상태: {trade_data.get('status', 'PENDING')}
+전략: {trade_data.get('strategy', 'N/A')}
+사유: {trade_data.get('reason', 'N/A')}
+시간: {now}
+
+주문번호: {trade_data.get('order_id', 'N/A')}
         """
         
-        await self.send_alert(message, "TRADE")
+        await self.send_alert(message, "TRADE", "telegram")
     
     async def notify_error(self, error: Exception, context: str = None):
         """에러 알림"""
@@ -138,7 +157,7 @@ class AlertSystem:
             return
         
         message = f"""
-        *Error Occurred*
+        <b>Error Occurred</b>
         Context: {context or 'Unknown'}
         Error: {str(error)}
         Type: {type(error).__name__}
@@ -159,7 +178,7 @@ class AlertSystem:
         direction = "급등" if price_change > 0 else "급락"
         
         message = f"""
-        *{direction} 감지*
+        <b>{direction} 감지</b>
         Symbol: {symbol}
         Price Change: {price_change:.2%}
         """
@@ -172,7 +191,7 @@ class AlertSystem:
     async def notify_system_status(self, status: str, details: str = None):
         """시스템 상태 알림"""
         message = f"""
-        *System Status Update*
+        <b>System Status Update</b>
         Status: {status}
         Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
@@ -186,18 +205,18 @@ class AlertSystem:
     async def send_daily_report(self, report_data: Dict[str, Any]):
         """일일 리포트"""
         message = f"""
-        *Daily Trading Report*
+        <b>Daily Trading Report</b>
         Date: {report_data['date']}
         
-        📊 Performance:
+        📊 <b>Performance:</b>
         Total Trades: {report_data['total_trades']}
         Win Rate: {report_data['win_rate']:.2%}
         Total P&L: ₩{report_data['total_pnl']:,.0f}
         
-        📈 Top Gainers:
+        📈 <b>Top Gainers:</b>
         {self._format_top_movers(report_data.get('top_gainers', []))}
         
-        📉 Top Losers:
+        📉 <b>Top Losers:</b>
         {self._format_top_movers(report_data.get('top_losers', []))}
         
         💰 Portfolio Value: ₩{report_data.get('portfolio_value', 0):,.0f}
