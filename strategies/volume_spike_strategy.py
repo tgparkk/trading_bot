@@ -1,0 +1,569 @@
+"""
+볼륨 스파이크 전략 (Volume Spike Strategy)
+비정상적으로 높은 거래량(볼륨 스파이크)이 발생할 때 매매하는 전략
+"""
+import asyncio
+from typing import Dict, Any, List, Optional, Deque
+from datetime import datetime, time, timedelta
+from collections import deque
+import numpy as np
+
+from config.settings import config
+from core.api_client import api_client
+from core.websocket_client import ws_client
+from core.order_manager import order_manager
+from utils.logger import logger
+from monitoring.alert_system import alert_system
+
+class VolumeStrategy:
+    """볼륨 스파이크 전략 클래스"""
+    
+    def __init__(self):
+        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+        self.params = {
+            "volume_multiplier": 2.3,      # 평균 거래량 대비 배수
+            "look_back_periods": 20,       # 평균 계산 기간 (일)
+            "consolidation_minutes": 15,   # 가격 조정 대기 시간 (분)
+            "price_move_threshold": 0.01,  # 가격 변동 임계값 (1%)
+            "stop_loss_pct": 0.02,         # 손절 비율 (2%)
+            "take_profit_pct": 0.03,       # 익절 비율 (3%)
+            "max_positions": 3,            # 최대 포지션 개수
+            "position_size": 1000000,      # 기본 포지션 크기 (100만원)
+            "breakout_confirmation": True  # 추세 방향 확인 필요 여부
+        }
+        
+        # 설정에 volume_params가 있으면 업데이트
+        if hasattr(config["trading"], "volume_params"):
+            self.params.update(config["trading"].volume_params)
+            
+        self.running = False
+        self.paused = False
+        self.watched_symbols = set()
+        self.price_data = {}              # {symbol: deque of price data}
+        self.volume_data = {}             # {symbol: {'avg_volume': float, 'spike_detected': bool}}
+        self.positions = {}               # {position_id: position_data}
+        self.pending_entry = {}           # {symbol: {'side': str, 'detection_time': datetime, 'detection_price': float}}
+        
+    async def start(self, symbols: List[str]):
+        """전략 시작"""
+        try:
+            self.running = True
+            self.paused = False
+            self.watched_symbols = set(symbols)
+            
+            # 각 종목별 데이터 초기화
+            for symbol in symbols:
+                self.price_data[symbol] = deque(maxlen=2000)  # 충분히 많은 데이터 저장
+                self.volume_data[symbol] = {
+                    'avg_volume': None,
+                    'spike_detected': False,
+                    'last_spike_time': None,
+                    'historical_volumes': deque(maxlen=self.params["look_back_periods"]),
+                    'minute_volumes': deque(maxlen=60),  # 1시간 분봉 데이터
+                    'cooldown_until': None
+                }
+                self.pending_entry[symbol] = None
+                
+                # 웹소켓 구독
+                await ws_client.subscribe_price(symbol, self._handle_price_update)
+                
+                # 과거 거래량 데이터 로드
+                await self._load_historical_volumes(symbol)
+            
+            logger.log_system(f"Volume spike strategy started for {len(symbols)} symbols")
+            
+            # 전략 실행 루프
+            asyncio.create_task(self._strategy_loop())
+            
+        except Exception as e:
+            logger.log_error(e, "Failed to start volume spike strategy")
+            await alert_system.notify_error(e, "Volume spike strategy start error")
+    
+    async def _load_historical_volumes(self, symbol: str):
+        """과거 거래량 데이터 로드"""
+        try:
+            # 일봉 데이터 조회
+            price_data = api_client.get_daily_price(symbol)
+            if price_data.get("rt_cd") == "0" and "output" in price_data:
+                daily_data = price_data["output"].get("lst", [])
+                
+                volumes = []
+                for item in daily_data[:self.params["look_back_periods"]]:
+                    volumes.append(int(item.get("acml_vol", 0)))
+                
+                # 평균 거래량 계산
+                if volumes:
+                    self.volume_data[symbol]['historical_volumes'].extend(volumes)
+                    self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
+                    
+                    logger.log_system(f"Loaded historical volume data for {symbol}: Avg={self.volume_data[symbol]['avg_volume']}")
+            
+            # 분봉 데이터 조회 (당일)
+            minute_data = api_client.get_minute_price(symbol)
+            if minute_data.get("rt_cd") == "0" and "output" in minute_data:
+                minute_items = minute_data["output"].get("lst", [])
+                
+                for item in minute_items[:60]:  # 최근 60개 분봉
+                    volume = int(item.get("cntg_vol", 0))
+                    self.volume_data[symbol]['minute_volumes'].append(volume)
+            
+        except Exception as e:
+            logger.log_error(e, f"Error loading historical volume data for {symbol}")
+    
+    async def stop(self):
+        """전략 중지"""
+        self.running = False
+        
+        # 웹소켓 구독 해제
+        for symbol in self.watched_symbols:
+            await ws_client.unsubscribe(symbol, "price")
+        
+        logger.log_system("Volume spike strategy stopped")
+    
+    async def pause(self):
+        """전략 일시 중지"""
+        if not self.paused:
+            self.paused = True
+            logger.log_system("Volume spike strategy paused")
+        return True
+
+    async def resume(self):
+        """전략 재개"""
+        if self.paused:
+            self.paused = False
+            logger.log_system("Volume spike strategy resumed")
+        return True
+    
+    async def _handle_price_update(self, data: Dict[str, Any]):
+        """실시간 체결가 업데이트 처리"""
+        try:
+            symbol = data.get("tr_key")
+            price = float(data.get("stck_prpr", 0))
+            volume = int(data.get("cntg_vol", 0))
+            
+            if symbol in self.price_data and price > 0:
+                timestamp = datetime.now()
+                self.price_data[symbol].append({
+                    "price": price,
+                    "volume": volume,
+                    "timestamp": timestamp
+                })
+                
+                # 분단위 거래량 데이터 업데이트
+                is_new_minute = False
+                if not self.volume_data[symbol]['minute_volumes'] or \
+                   timestamp.minute != self.volume_data[symbol]['minute_volumes'][-1].get('minute'):
+                    # 새로운 분봉 시작
+                    self.volume_data[symbol]['minute_volumes'].append({
+                        'volume': volume,
+                        'minute': timestamp.minute,
+                        'hour': timestamp.hour,
+                        'timestamp': timestamp
+                    })
+                    is_new_minute = True
+                else:
+                    # 기존 분봉 업데이트
+                    self.volume_data[symbol]['minute_volumes'][-1]['volume'] += volume
+                
+                # 일정 간격마다 (1분) 볼륨 스파이크 감지
+                if is_new_minute:
+                    self._detect_volume_spike(symbol, timestamp)
+                
+        except Exception as e:
+            logger.log_error(e, "Error handling price update in volume strategy")
+    
+    def _detect_volume_spike(self, symbol: str, timestamp: datetime):
+        """볼륨 스파이크 감지"""
+        try:
+            volume_data = self.volume_data[symbol]
+            
+            # 평균 거래량이 계산되지 않은 경우
+            if not volume_data['avg_volume']:
+                return
+            
+            # 쿨다운 기간 확인
+            if volume_data['cooldown_until'] and timestamp < volume_data['cooldown_until']:
+                return
+            
+            # 최근 1분 거래량
+            if not volume_data['minute_volumes']:
+                return
+                
+            current_minute_volume = volume_data['minute_volumes'][-1]['volume']
+            
+            # 평균 1분 거래량 계산 (과거 일봉 평균 거래량을 분당으로 환산, 6.5시간 = 390분)
+            avg_minute_volume = volume_data['avg_volume'] / 390
+            
+            # 거래량 배수 계산
+            volume_ratio = current_minute_volume / avg_minute_volume if avg_minute_volume > 0 else 0
+            
+            # 볼륨 스파이크 감지
+            if volume_ratio > self.params["volume_multiplier"]:
+                # 충분한 가격 데이터가 있는지 확인
+                if len(self.price_data[symbol]) < 2:
+                    return
+                
+                current_price = self.price_data[symbol][-1]["price"]
+                prev_price = self.price_data[symbol][-2]["price"]
+                
+                # 가격 변동 계산
+                price_change = (current_price - prev_price) / prev_price
+                
+                # 볼륨 스파이크와 함께 가격 변동이 임계값을 넘는지 확인
+                if abs(price_change) >= self.params["price_move_threshold"]:
+                    # 스파이크 감지
+                    volume_data['spike_detected'] = True
+                    volume_data['last_spike_time'] = timestamp
+                    
+                    # 매매 방향 결정 (가격 상승 -> 매수, 가격 하락 -> 매도)
+                    side = "BUY" if price_change > 0 else "SELL"
+                    
+                    # 진입 대기 등록
+                    self.pending_entry[symbol] = {
+                        'side': side,
+                        'detection_time': timestamp,
+                        'detection_price': current_price,
+                        'detection_volume': current_minute_volume,
+                        'volume_ratio': volume_ratio
+                    }
+                    
+                    logger.log_system(
+                        f"Volume spike detected for {symbol}: ratio={volume_ratio:.2f}, "
+                        f"price_change={price_change:.2%}, side={side}"
+                    )
+                    
+                    # 쿨다운 시간 설정 (30분)
+                    volume_data['cooldown_until'] = timestamp + timedelta(minutes=30)
+            
+        except Exception as e:
+            logger.log_error(e, f"Error detecting volume spike for {symbol}")
+    
+    async def _strategy_loop(self):
+        """전략 실행 루프"""
+        while self.running:
+            try:
+                # 장 시간 체크
+                current_time = datetime.now().time()
+                if not (time(9, 0) <= current_time <= time(15, 30)):
+                    await asyncio.sleep(60)  # 장 시간 아닌 경우 1분 대기
+                    continue
+                
+                # 전략이 일시 중지된 경우 스킵
+                if self.paused or order_manager.is_trading_paused():
+                    await asyncio.sleep(1)
+                    continue
+                
+                # 진입 대기 중인 종목 확인
+                current_timestamp = datetime.now()
+                for symbol in self.watched_symbols:
+                    pending = self.pending_entry.get(symbol)
+                    if pending:
+                        # 가격 조정 대기 시간 확인
+                        elapsed_minutes = (current_timestamp - pending['detection_time']).total_seconds() / 60
+                        
+                        if elapsed_minutes >= self.params["consolidation_minutes"]:
+                            # 대기 시간 충족 - 진입 조건 확인
+                            await self._confirm_and_enter(symbol, pending)
+                            self.pending_entry[symbol] = None  # 처리 완료
+                
+                # 포지션 모니터링
+                await self._monitor_positions()
+                
+                await asyncio.sleep(1)  # 1초 대기
+                
+            except Exception as e:
+                logger.log_error(e, "Volume strategy loop error")
+                await asyncio.sleep(5)  # 에러 시 5초 대기
+    
+    async def _confirm_and_enter(self, symbol: str, pending_data: Dict[str, Any]):
+        """진입 확인 및 포지션 진입"""
+        try:
+            # 전략이 일시 중지 상태인지 확인
+            if self.paused or order_manager.is_trading_paused():
+                return
+            
+            # 이미 포지션 있는지 확인
+            symbol_positions = self._get_symbol_positions(symbol)
+            if len(symbol_positions) >= self.params["max_positions"]:
+                return
+            
+            # 충분한 데이터 있는지 확인
+            if not self.price_data[symbol]:
+                return
+                
+            current_price = self.price_data[symbol][-1]["price"]
+            detection_price = pending_data['detection_price']
+            side = pending_data['side']
+            
+            # 추세 방향 확인 필요 시
+            enter_trade = True
+            if self.params["breakout_confirmation"]:
+                # 가격이 감지 시점과 같은 방향으로 움직였는지 확인
+                price_change = (current_price - detection_price) / detection_price
+                
+                if (side == "BUY" and price_change <= 0) or (side == "SELL" and price_change >= 0):
+                    # 방향이 반대로 바뀌었으면 진입 취소
+                    enter_trade = False
+                    logger.log_system(
+                        f"Volume spike entry cancelled for {symbol}: trend direction changed, "
+                        f"side={side}, price_change={price_change:.2%}"
+                    )
+            
+            if enter_trade:
+                # 주문 수량 계산
+                position_size = self.params["position_size"]  # 100만원
+                quantity = int(position_size / current_price)
+                
+                if quantity <= 0:
+                    return
+                
+                # 주문 실행
+                result = await order_manager.place_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    order_type="MARKET",
+                    strategy="volume_spike",
+                    reason=f"volume_spike_{side.lower()}"
+                )
+                
+                if result["status"] == "success":
+                    # 손절/익절 가격 계산
+                    stop_loss_pct = self.params["stop_loss_pct"]
+                    take_profit_pct = self.params["take_profit_pct"]
+                    
+                    if side == "BUY":
+                        stop_price = current_price * (1 - stop_loss_pct)
+                        target_price = current_price * (1 + take_profit_pct)
+                    else:  # SELL
+                        stop_price = current_price * (1 + stop_loss_pct)
+                        target_price = current_price * (1 - take_profit_pct)
+                    
+                    # 포지션 저장
+                    position_id = result.get("order_id", str(datetime.now().timestamp()))
+                    self.positions[position_id] = {
+                        "symbol": symbol,
+                        "entry_price": current_price,
+                        "entry_time": datetime.now(),
+                        "side": side,
+                        "quantity": quantity,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "volume_ratio": pending_data['volume_ratio']
+                    }
+                    
+                    logger.log_system(
+                        f"Volume: Entered {side} position for {symbol} at {current_price}, "
+                        f"stop: {stop_price}, target: {target_price}, "
+                        f"volume_ratio: {pending_data['volume_ratio']:.2f}"
+                    )
+                    
+        except Exception as e:
+            logger.log_error(e, f"Volume entry error for {symbol}")
+    
+    def _get_symbol_positions(self, symbol: str) -> List[str]:
+        """특정 종목의 포지션 ID 목록 반환"""
+        return [
+            position_id for position_id, position in self.positions.items()
+            if position["symbol"] == symbol
+        ]
+    
+    async def _monitor_positions(self):
+        """포지션 모니터링"""
+        try:
+            for position_id, position in list(self.positions.items()):
+                symbol = position["symbol"]
+                
+                # 현재 가격 확인
+                if symbol not in self.price_data or not self.price_data[symbol]:
+                    continue
+                
+                current_price = self.price_data[symbol][-1]["price"]
+                side = position["side"]
+                entry_time = position["entry_time"]
+                
+                # 손절/익절 확인
+                should_exit = False
+                exit_reason = ""
+                
+                if side == "BUY":
+                    # 매수 포지션
+                    if current_price <= position["stop_price"]:
+                        should_exit = True
+                        exit_reason = "stop_loss"
+                    elif current_price >= position["target_price"]:
+                        should_exit = True
+                        exit_reason = "take_profit"
+                        
+                else:  # SELL
+                    # 매도 포지션
+                    if current_price >= position["stop_price"]:
+                        should_exit = True
+                        exit_reason = "stop_loss"
+                    elif current_price <= position["target_price"]:
+                        should_exit = True
+                        exit_reason = "take_profit"
+                
+                # 시간 만료 확인 (스파이크 크기의 50-100% 이동 목표, 최대 2시간)
+                hold_time = (datetime.now() - entry_time).total_seconds() / 60
+                if hold_time >= 120:  # 2시간
+                    should_exit = True
+                    exit_reason = "time_expired"
+                
+                # 청산 실행
+                if should_exit:
+                    await self._exit_position(position_id, exit_reason)
+                    
+        except Exception as e:
+            logger.log_error(e, "Volume position monitoring error")
+    
+    async def _exit_position(self, position_id: str, reason: str):
+        """포지션 청산"""
+        try:
+            position = self.positions[position_id]
+            symbol = position["symbol"]
+            exit_side = "SELL" if position["side"] == "BUY" else "BUY"
+            
+            result = await order_manager.place_order(
+                symbol=symbol,
+                side=exit_side,
+                quantity=position["quantity"],
+                order_type="MARKET",
+                strategy="volume_spike",
+                reason=reason
+            )
+            
+            if result["status"] == "success":
+                # 포지션 제거
+                del self.positions[position_id]
+                
+                logger.log_system(f"Volume: Exited position for {symbol}, reason: {reason}")
+                
+        except Exception as e:
+            logger.log_error(e, f"Volume exit error for position {position_id}")
+    
+    def get_signal_strength(self, symbol: str) -> float:
+        """신호 강도 측정 (0 ~ 10)"""
+        try:
+            if symbol not in self.price_data or not self.price_data[symbol]:
+                return 0
+                
+            # 볼륨 데이터 확인
+            volume_data = self.volume_data.get(symbol, {})
+            
+            # 스파이크 감지 안된 경우
+            if not volume_data.get('spike_detected', False) or not volume_data.get('last_spike_time'):
+                return 0
+            
+            # 시간 경과 확인
+            elapsed_minutes = (datetime.now() - volume_data['last_spike_time']).total_seconds() / 60
+            
+            # 대기 시간 확인
+            consolidation_minutes = self.params["consolidation_minutes"]
+            if elapsed_minutes < consolidation_minutes:
+                # 아직 대기 중 - 낮은 점수
+                return max(0, min(3, 3 * elapsed_minutes / consolidation_minutes))
+            
+            # 진입 대기 데이터 확인
+            pending = self.pending_entry.get(symbol)
+            if not pending:
+                return 0
+            
+            # 점수 계산 요소들
+            score = 0
+            
+            # 1. 거래량 비율에 따른 점수 (0-6점)
+            volume_ratio = pending.get('volume_ratio', 0)
+            volume_multiplier = self.params["volume_multiplier"]
+            
+            if volume_ratio > volume_multiplier:
+                # 기본 점수 3점
+                volume_score = 3
+                
+                # 추가 점수 - 기준 초과분에 비례
+                excess_ratio = (volume_ratio - volume_multiplier) / volume_multiplier
+                additional_score = min(3, excess_ratio * 5)  # 최대 3점 추가
+                
+                score += volume_score + additional_score
+            
+            # 2. 가격 움직임 점수 (0-4점)
+            current_price = self.price_data[symbol][-1]["price"]
+            detection_price = pending.get('detection_price', current_price)
+            side = pending.get('side')
+            
+            if side:
+                price_change = (current_price - detection_price) / detection_price
+                
+                # 방향이 일치하면 높은 점수
+                if (side == "BUY" and price_change > 0) or (side == "SELL" and price_change < 0):
+                    direction_score = 2
+                    magnitude_score = min(2, abs(price_change) * 100)  # 최대 2점 추가
+                    score += direction_score + magnitude_score
+                else:
+                    # 방향이 반대면 낮은 점수
+                    score += max(0, 1 - abs(price_change) * 50)  # 변화가 클수록 점수 감소
+            
+            # 시간 경과에 따른 점수 감소 (2시간 이후 신호 소멸)
+            time_penalty = min(1, elapsed_minutes / 120)
+            score *= (1 - time_penalty * 0.7)  # 최대 70% 감소
+            
+            return min(10, score)  # 최대 10점
+            
+        except Exception as e:
+            logger.log_error(e, f"Error calculating volume signal strength for {symbol}")
+            return 0
+    
+    def get_signal_direction(self, symbol: str) -> str:
+        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        try:
+            if symbol not in self.price_data or not self.price_data[symbol]:
+                return "NEUTRAL"
+                
+            # 볼륨 데이터 확인
+            volume_data = self.volume_data.get(symbol, {})
+            
+            # 스파이크 감지 안된 경우
+            if not volume_data.get('spike_detected', False):
+                return "NEUTRAL"
+            
+            # 쿨다운 기간인 경우
+            if volume_data.get('cooldown_until') and datetime.now() < volume_data['cooldown_until']:
+                return "NEUTRAL"
+            
+            # 진입 대기 데이터 확인
+            pending = self.pending_entry.get(symbol)
+            if not pending:
+                return "NEUTRAL"
+                
+            # 시간 경과 확인
+            elapsed_minutes = (datetime.now() - pending['detection_time']).total_seconds() / 60
+            
+            # 너무 오래 지난 신호는 무시 (2시간)
+            if elapsed_minutes > 120:
+                return "NEUTRAL"
+            
+            # 대기 시간 충족 확인
+            if elapsed_minutes < self.params["consolidation_minutes"]:
+                return "NEUTRAL"  # 아직 대기 중
+            
+            # 추세 방향 확인 필요 시
+            if self.params["breakout_confirmation"]:
+                current_price = self.price_data[symbol][-1]["price"]
+                detection_price = pending['detection_price']
+                side = pending['side']
+                
+                # 가격이 감지 시점과 같은 방향으로 움직였는지 확인
+                price_change = (current_price - detection_price) / detection_price
+                
+                if (side == "BUY" and price_change <= 0) or (side == "SELL" and price_change >= 0):
+                    # 방향이 반대로 바뀌었으면 중립
+                    return "NEUTRAL"
+            
+            # 매매 방향 반환
+            return pending['side']
+            
+        except Exception:
+            return "NEUTRAL"
+
+# 싱글톤 인스턴스
+volume_strategy = VolumeStrategy() 

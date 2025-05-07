@@ -14,7 +14,7 @@ from core.api_client import api_client
 from core.websocket_client import ws_client
 from core.order_manager import order_manager
 from core.stock_explorer import stock_explorer
-from strategies.scalping_strategy import scalping_strategy
+from strategies.combined_strategy import combined_strategy
 from utils.logger import logger
 from utils.database import db
 from monitoring.alert_system import alert_system
@@ -78,7 +78,7 @@ class TradingBot:
             logger.log_system(f"Found {len(symbols)} tradable symbols")
             
             # 전략 시작
-            await scalping_strategy.start(symbols[:50])  # 상위 50종목만
+            await combined_strategy.start(symbols[:50])  # 상위 50종목만
             
             # 마지막 종목 탐색 시간
             last_symbol_search = datetime.now()
@@ -110,7 +110,7 @@ class TradingBot:
                         new_symbols = await self._get_tradable_symbols()
                         if new_symbols:
                             symbols = new_symbols
-                            await scalping_strategy.update_symbols(symbols[:50])
+                            await combined_strategy.update_symbols(symbols[:50])
                             last_symbol_search = current_datetime
                             logger.log_system(f"Updated tradable symbols: {len(symbols)}")
                     
@@ -194,8 +194,8 @@ class TradingBot:
         logger.log_system(f"Shutdown called. Error: {error}")
         try:
             self.running = False
-            logger.log_system("Stopping scalping strategy...")
-            await scalping_strategy.stop()
+            logger.log_system("Stopping combined strategy...")
+            await combined_strategy.stop()
             logger.log_system("Closing WebSocket connection...")
             await ws_client.close()
 

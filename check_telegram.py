@@ -342,7 +342,7 @@ async def test_pause_resume():
     print_step(step)
     
     # 필요한 임포트 구문
-    from strategies.scalping_strategy import pause, resume
+    from strategies.combined_strategy import pause, resume
     
     try:
         # pause 테스트
