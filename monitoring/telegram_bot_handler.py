@@ -17,7 +17,7 @@ from config.settings import config
 from core.order_manager import order_manager
 from core.api_client import api_client
 from core.stock_explorer import stock_explorer
-from strategies.scalping_strategy import scalping_strategy
+from strategies.combined_strategy import combined_strategy
 from monitoring.alert_system import alert_system
 from utils.logger import logger
 from utils.database import db
@@ -1006,8 +1006,8 @@ class TelegramBotHandler:
                 return "❌ 거래 가능한 종목을 찾을 수 없습니다."
             
             # 전략 업데이트
-            if hasattr(scalping_strategy, 'update_symbols'):
-                await scalping_strategy.update_symbols(symbols[:50])
+            if hasattr(combined_strategy, 'update_symbols'):
+                await combined_strategy.update_symbols(symbols[:50])
             
             result = f"✅ *종목 스캔 완료*\n\n{len(symbols)}개의 종목을 찾았습니다.\n\n"
             
@@ -1240,10 +1240,10 @@ class TelegramBotHandler:
         
         # 전략 일시 중지
         try:
-            await scalping_strategy.pause()
-            logger.log_system("스캘핑 전략을 성공적으로 일시 중지했습니다.")
+            await combined_strategy.pause()
+            logger.log_system("통합 전략을 성공적으로 일시 중지했습니다.")
         except Exception as e:
-            logger.log_error(e, "스캘핑 전략 일시 중지 중 오류 발생")
+            logger.log_error(e, "통합 전략 일시 중지 중 오류 발생")
             
         # order_manager에도 거래 일시 중지 상태 설정
         order_manager.pause_trading()
@@ -1257,10 +1257,10 @@ class TelegramBotHandler:
         
         # 전략 재개
         try:
-            await scalping_strategy.resume()
-            logger.log_system("스캘핑 전략을 성공적으로 재개했습니다.")
+            await combined_strategy.resume()
+            logger.log_system("통합 전략을 성공적으로 재개했습니다.")
         except Exception as e:
-            logger.log_error(e, "스캘핑 전략 재개 중 오류 발생")
+            logger.log_error(e, "통합 전략 재개 중 오류 발생")
             
         # order_manager에도 거래 재개 상태 설정
         order_manager.resume_trading()
