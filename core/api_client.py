@@ -148,12 +148,41 @@ class KISAPIClient:
         if headers:
             default_headers.update(headers)
         
+        token_refresh_attempts = 0
+        max_token_refresh_attempts = 2  # 토큰 갱신 최대 시도 횟수
+        
         for attempt in range(max_retries):
             try:
                 if method.upper() == "GET":
                     response = requests.get(url, headers=default_headers, params=params)
                 else:
                     response = requests.post(url, headers=default_headers, json=data)
+                
+                # 500 에러 발생 시 토큰 강제 갱신
+                if response.status_code == 500:
+                    if token_refresh_attempts >= max_token_refresh_attempts:
+                        logger.log_error("최대 토큰 갱신 시도 횟수 초과")
+                        raise Exception("Maximum token refresh attempts exceeded")
+                    
+                    logger.log_system(f"500 에러 발생, 토큰 강제 갱신 시도... (시도 {token_refresh_attempts + 1}/{max_token_refresh_attempts})")
+                    self.access_token = None  # 토큰 초기화
+                    self.token_expire_time = None
+                    
+                    # 토큰 강제 갱신
+                    try:
+                        new_token = self._get_access_token()
+                        logger.log_system("토큰 강제 갱신 성공")
+                        # 헤더 업데이트
+                        default_headers["authorization"] = f"Bearer {new_token}"
+                        token_refresh_attempts += 1
+                        time.sleep(1)  # 토큰 갱신 후 잠시 대기
+                        continue  # 새 토큰으로 재시도
+                    except Exception as token_error:
+                        logger.log_error(token_error, "토큰 강제 갱신 실패")
+                        if token_refresh_attempts >= max_token_refresh_attempts - 1:
+                            raise Exception("Token refresh failed after multiple attempts")
+                        token_refresh_attempts += 1
+                        continue
                 
                 response.raise_for_status()
                 result = response.json()
@@ -163,10 +192,13 @@ class KISAPIClient:
                     error_msg = result.get("msg1", "Unknown error")
                     logger.log_error(f"API error: {error_msg}")
                     
-                    # 토큰 만료 에러인 경우 토큰 갱신 후 재시도
-                    if "token" in error_msg.lower() and attempt < max_retries - 1:
-                        self.access_token = None  # 토큰 강제 갱신
-                        continue
+                    # 토큰 관련 에러인 경우 토큰 갱신
+                    if any(keyword in error_msg.lower() for keyword in ["token", "auth", "unauthorized"]):
+                        if token_refresh_attempts < max_token_refresh_attempts:
+                            logger.log_system("토큰 관련 에러 발생, 토큰 갱신 시도...")
+                            self.access_token = None  # 토큰 초기화
+                            token_refresh_attempts += 1
+                            continue
                     
                     raise Exception(f"API error: {error_msg}")
                 
@@ -177,8 +209,8 @@ class KISAPIClient:
                     wait_time = (attempt + 1) * 2  # 지수 백오프
                     logger.log_error(f"Request failed, retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
-                    continue
-                raise
+                else:
+                    raise
             
         raise Exception("Max retries exceeded")
     
@@ -451,6 +483,56 @@ class KISAPIClient:
         }
         
         return self._make_request("GET", path, headers=headers, params=params)
+
+    def check_token_status(self) -> Dict[str, Any]:
+        """토큰 상태 확인"""
+        current_time = datetime.now().timestamp()
+        
+        if not self.access_token or not self.token_expire_time:
+            return {
+                "status": "not_initialized",
+                "message": "토큰이 초기화되지 않았습니다."
+            }
+        
+        time_remaining = self.token_expire_time - current_time
+        
+        if time_remaining <= 0:
+            return {
+                "status": "expired",
+                "message": "토큰이 만료되었습니다."
+            }
+        
+        hours_remaining = time_remaining / 3600
+        
+        if hours_remaining <= 1:
+            return {
+                "status": "expires_soon",
+                "message": f"토큰이 곧 만료됩니다. ({hours_remaining:.1f}시간 남음)"
+            }
+        
+        return {
+            "status": "valid",
+            "message": f"토큰이 유효합니다. ({hours_remaining:.1f}시간 남음)",
+            "expires_in_hours": hours_remaining
+        }
+
+    def force_token_refresh(self) -> Dict[str, Any]:
+        """토큰 강제 갱신"""
+        try:
+            self.access_token = None  # 토큰 초기화
+            self.token_expire_time = None
+            new_token = self._get_access_token()
+            
+            return {
+                "status": "success",
+                "message": "토큰이 성공적으로 갱신되었습니다.",
+                "token_status": self.check_token_status()
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"토큰 갱신 실패: {str(e)}"
+            }
 
 # 싱글톤 인스턴스
 api_client = KISAPIClient()

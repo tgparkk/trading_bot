@@ -529,6 +529,36 @@ async def safe_send_message(text, reply_to=None):
         logger.log_error(e, "안전한 텔레그램 메시지 전송 중 오류 발생")
         raise
 
+@app.route('/api/token/status')
+def api_token_status():
+    """토큰 상태 확인"""
+    try:
+        status = api_client.check_token_status()
+        return jsonify(status)
+    except Exception as e:
+        logger.log_error(e, "토큰 상태 확인 중 오류 발생")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/token/refresh', methods=['POST'])
+def api_token_refresh():
+    """토큰 강제 갱신"""
+    try:
+        result = api_client.force_token_refresh()
+        
+        if result["status"] == "success":
+            return jsonify(result)
+        else:
+            return jsonify(result), 500
+    except Exception as e:
+        logger.log_error(e, "토큰 갱신 중 오류 발생")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
 # 서버 시작 시 필요한 초기화 작업
 def initialize_server():
     """서버 시작 시 필요한 초기화 작업 수행"""
