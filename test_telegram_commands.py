@@ -73,7 +73,7 @@ async def test_telegram_commands():
         
         # 봇이 준비될 때까지 대기
         print("3. 텔레그램 봇 준비 대기 중...")
-        await telegram_bot_handler.wait_until_ready(timeout=10)
+        await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=10)
         print("✅ 텔레그램 봇 준비 완료")
         
         # 테스트 시작 메시지 전송
@@ -86,7 +86,7 @@ async def test_telegram_commands():
 """
         
         print("4. 테스트 시작 메시지 전송 중...")
-        await telegram_bot_handler.send_message(start_message)
+        await telegram_bot_handler._send_message(start_message)
         print("✅ 테스트 시작 메시지 전송 완료")
         
         # 잠시 대기
@@ -95,7 +95,7 @@ async def test_telegram_commands():
         # 도움말 명령어 테스트
         print("5. 도움말 명령어 테스트")
         help_message = await telegram_bot_handler.get_help([])
-        await telegram_bot_handler.send_message(help_message)
+        await telegram_bot_handler._send_message(help_message)
         print("✅ 도움말 명령어 테스트 완료")
         
         # 잠시 대기
@@ -104,7 +104,7 @@ async def test_telegram_commands():
         # 상태 명령어 테스트
         print("6. 상태 명령어 테스트")
         status_message = await telegram_bot_handler.get_status([])
-        await telegram_bot_handler.send_message(status_message)
+        await telegram_bot_handler._send_message(status_message)
         print("✅ 상태 명령어 테스트 완료")
         
         # 잠시 대기
@@ -113,13 +113,13 @@ async def test_telegram_commands():
         # 일시정지 명령어 테스트
         print("7. 일시정지(/pause) 명령어 테스트")
         pause_message = await telegram_bot_handler.pause_trading([])
-        await telegram_bot_handler.send_message(pause_message)
+        await telegram_bot_handler._send_message(pause_message)
         print("✅ 일시정지 명령어 테스트 완료")
         
         # 상태 확인하여 일시정지 상태인지 확인
         await asyncio.sleep(2)
         status_after_pause = await telegram_bot_handler.get_status([])
-        await telegram_bot_handler.send_message(f"일시정지 후 상태:\n{status_after_pause}")
+        await telegram_bot_handler._send_message(f"일시정지 후 상태:\n{status_after_pause}")
         
         # 잠시 대기
         await asyncio.sleep(2)
@@ -127,13 +127,13 @@ async def test_telegram_commands():
         # 재개 명령어 테스트
         print("8. 재개(/resume) 명령어 테스트")
         resume_message = await telegram_bot_handler.resume_trading([])
-        await telegram_bot_handler.send_message(resume_message)
+        await telegram_bot_handler._send_message(resume_message)
         print("✅ 재개 명령어 테스트 완료")
         
         # 상태 확인하여 일시정지 해제 상태인지 확인
         await asyncio.sleep(2)
         status_after_resume = await telegram_bot_handler.get_status([])
-        await telegram_bot_handler.send_message(f"재개 후 상태:\n{status_after_resume}")
+        await telegram_bot_handler._send_message(f"재개 후 상태:\n{status_after_resume}")
         
         # 잠시 대기
         await asyncio.sleep(2)
@@ -141,7 +141,7 @@ async def test_telegram_commands():
         # 종료 명령어 테스트 (실제로 종료하지는 않고 메시지만 보여줌)
         print("9. 종료(/stop) 명령어 테스트 - confirm 없이 호출")
         stop_confirmation = await telegram_bot_handler.stop_bot([])
-        await telegram_bot_handler.send_message(f"종료 명령 확인 메시지:\n{stop_confirmation}")
+        await telegram_bot_handler._send_message(f"종료 명령 확인 메시지:\n{stop_confirmation}")
         print("✅ 종료 명령어 확인 메시지 테스트 완료")
         
         # 잠시 대기
@@ -162,7 +162,7 @@ async def test_telegram_commands():
 이제 텔레그램 앱에서 직접 명령어를 테스트해 보세요.
 """
         print("10. 테스트 완료 메시지 전송 중...")
-        await telegram_bot_handler.send_message(test_end_message)
+        await telegram_bot_handler._send_message(test_end_message)
         print("✅ 테스트 완료 메시지 전송 완료")
         
         # 봇이 폴링을 계속하도록 30초 대기 (이 시간 동안 사용자가 직접 테스트 가능)

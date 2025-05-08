@@ -402,31 +402,51 @@ class BreakoutStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        """현재 신호 방향 반환"""
+        if symbol in self.breakout_levels:
+            return self.breakout_levels[symbol].get("signal_direction", "NEUTRAL")
+        return "NEUTRAL"
+        
+    async def update_symbols(self, new_symbols: List[str]):
+        """종목 목록 업데이트"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return "NEUTRAL"
-                
-            # 초기화 안 된 경우
-            if not self.initialization_complete.get(symbol, False):
-                return "NEUTRAL"
-                
-            current_price = self.price_data[symbol][-1]["price"]
-            breakout_data = self.breakout_levels[symbol]
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
             
-            # 돌파 레벨 미설정 시
-            if not breakout_data.get('high_level') or not breakout_data.get('low_level'):
-                return "NEUTRAL"
+            # 현재 감시 중인 종목 집합
+            current_set = set(self.watched_symbols)
             
-            if current_price > breakout_data['high_level']:
-                return "BUY"
-            elif current_price < breakout_data['low_level']:
-                return "SELL"
+            # 제거할 종목들
+            to_remove = current_set - new_set
             
-            return "NEUTRAL"
+            # 추가할 종목들
+            to_add = new_set - current_set
             
-        except Exception:
-            return "NEUTRAL"
+            # 종목 데이터 정리
+            for symbol in to_remove:
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.breakout_levels:
+                    del self.breakout_levels[symbol]
+            
+            # 새 종목 초기화
+            for symbol in to_add:
+                self.price_data[symbol] = deque(maxlen=300)
+                self.breakout_levels[symbol] = {
+                    'high_level': None, 
+                    'low_level': None, 
+                    'range': None,
+                    'init_high': None,
+                    'init_low': None
+                }
+            
+            # 감시 종목 업데이트
+            self.watched_symbols = list(new_set)
+            
+            logger.log_system(f"브레이크아웃 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+        
+        except Exception as e:
+            logger.log_error(e, "브레이크아웃 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
 breakout_strategy = BreakoutStrategy() 

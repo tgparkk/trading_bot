@@ -851,6 +851,42 @@ class Database:
             "updated_at": updated_at,
             "error_message": status["error_message"]
         }
+        
+    def get_start_time(self) -> datetime:
+        """시스템 시작 시간 반환
+        시스템이 처음 'RUNNING' 상태가 된 시간을 반환하거나
+        시작 시간 정보가 없는 경우 현재 시간을 반환합니다.
+        
+        Returns:
+            datetime: 시스템 시작 시간
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                # 가장 최근의 RUNNING 상태 기록을 찾음
+                cursor.execute("""
+                    SELECT created_at FROM system_status 
+                    WHERE status = 'RUNNING' 
+                    ORDER BY created_at ASC LIMIT 1
+                """)
+                result = cursor.fetchone()
+                
+                if result and result['created_at']:
+                    try:
+                        # 문자열 시간을 datetime 객체로 변환
+                        start_time = datetime.strptime(result['created_at'], "%Y-%m-%d %H:%M:%S")
+                        return start_time
+                    except (ValueError, TypeError):
+                        # 시간 파싱 오류 시 현재 시간 반환
+                        logger.log_system("시작 시간 파싱 오류, 현재 시간 사용", level="WARNING")
+                        return datetime.now()
+                else:
+                    # 시작 기록이 없으면 현재 시간 반환
+                    return datetime.now()
+        except Exception as e:
+            # 오류 발생 시 현재 시간 반환
+            logger.log_error(e, "시작 시간 조회 중 오류 발생, 현재 시간 사용")
+            return datetime.now()
 
 # 싱글톤 인스턴스 생성
 db = Database()

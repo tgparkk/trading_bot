@@ -43,6 +43,7 @@ class VolumeStrategy:
         self.volume_data = {}             # {symbol: {'avg_volume': float, 'spike_detected': bool}}
         self.positions = {}               # {position_id: position_data}
         self.pending_entry = {}           # {symbol: {'side': str, 'detection_time': datetime, 'detection_price': float}}
+        self.signals = {}                  # {symbol: {'strength': float, 'direction': str, 'last_update': datetime}}
         
     async def start(self, symbols: List[str]):
         """전략 시작"""
@@ -514,56 +515,54 @@ class VolumeStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        """신호 방향 반환"""
+        if symbol in self.signals:
+            return self.signals[symbol].get("direction", "NEUTRAL")
+        return "NEUTRAL"
+        
+    async def update_symbols(self, new_symbols: List[str]):
+        """종목 목록 업데이트"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return "NEUTRAL"
-                
-            # 볼륨 데이터 확인
-            volume_data = self.volume_data.get(symbol, {})
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
             
-            # 스파이크 감지 안된 경우
-            if not volume_data.get('spike_detected', False):
-                return "NEUTRAL"
+            # 현재 감시 중인 종목 집합
+            current_set = set(self.watched_symbols)
             
-            # 쿨다운 기간인 경우
-            if volume_data.get('cooldown_until') and datetime.now() < volume_data['cooldown_until']:
-                return "NEUTRAL"
+            # 제거할 종목들
+            to_remove = current_set - new_set
             
-            # 진입 대기 데이터 확인
-            pending = self.pending_entry.get(symbol)
-            if not pending:
-                return "NEUTRAL"
-                
-            # 시간 경과 확인
-            elapsed_minutes = (datetime.now() - pending['detection_time']).total_seconds() / 60
+            # 추가할 종목들
+            to_add = new_set - current_set
             
-            # 너무 오래 지난 신호는 무시 (2시간)
-            if elapsed_minutes > 120:
-                return "NEUTRAL"
+            # 종목 데이터 정리
+            for symbol in to_remove:
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.volume_data:
+                    del self.volume_data[symbol]
+                if symbol in self.pending_entry:
+                    del self.pending_entry[symbol]
+                if symbol in self.signals:
+                    del self.signals[symbol]
             
-            # 대기 시간 충족 확인
-            if elapsed_minutes < self.params["consolidation_minutes"]:
-                return "NEUTRAL"  # 아직 대기 중
+            # 새 종목 초기화
+            for symbol in to_add:
+                self.price_data[symbol] = deque(maxlen=100)
+                self.volume_data[symbol] = deque(maxlen=50)
+                self.signals[symbol] = {
+                    'strength': 0,
+                    'direction': "NEUTRAL",
+                    'last_update': None
+                }
             
-            # 추세 방향 확인 필요 시
-            if self.params["breakout_confirmation"]:
-                current_price = self.price_data[symbol][-1]["price"]
-                detection_price = pending['detection_price']
-                side = pending['side']
-                
-                # 가격이 감지 시점과 같은 방향으로 움직였는지 확인
-                price_change = (current_price - detection_price) / detection_price
-                
-                if (side == "BUY" and price_change <= 0) or (side == "SELL" and price_change >= 0):
-                    # 방향이 반대로 바뀌었으면 중립
-                    return "NEUTRAL"
+            # 감시 종목 업데이트
+            self.watched_symbols = list(new_set)
             
-            # 매매 방향 반환
-            return pending['side']
-            
-        except Exception:
-            return "NEUTRAL"
+            logger.log_system(f"볼륨 스파이크 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+        
+        except Exception as e:
+            logger.log_error(e, "볼륨 스파이크 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
 volume_strategy = VolumeStrategy() 

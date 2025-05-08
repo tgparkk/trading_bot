@@ -7,12 +7,13 @@ import hashlib
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from config.settings import config
+from config.settings import config, APIConfig
 from utils.logger import logger
 import os
 from dotenv import load_dotenv
 from pathlib import Path
 from utils.database import db
+import asyncio
 
 class KISAPIClient:
     """한국투자증권 REST API 클라이언트"""
@@ -28,32 +29,19 @@ class KISAPIClient:
         self.app_secret = os.getenv("KIS_APP_SECRET")
         self.account_no = os.getenv("KIS_ACCOUNT_NO")
         
-        self.access_token      = None
-        self.token_expire_time = None
-        self.token_issue_time  = None
+        self.access_token = None
+        self.token_expire_time = None  # 만료 시간 (Unix timestamp)
+        self.token_issue_time = None   # 발급 시간 (Unix timestamp)
+        self._token_lock = asyncio.Lock()  # 토큰 발급 및 검증을 위한 락
+        
+        self.config = config.get("api", APIConfig.from_env())
+        self.base_url = self.config.base_url
+        self.app_key = self.config.app_key
+        self.app_secret = self.config.app_secret
+        self.account_no = self.config.account_no
         
         # 앱 시작 시 DB에서 유효한 토큰 로드
-        try:
-            logger.log_system("앱 시작 시 저장된 토큰 확인 중...")
-            latest_token = db.get_latest_token()
-            
-            if latest_token and latest_token.get('token') and latest_token.get('expire_time'):
-                expire_time = datetime.fromisoformat(latest_token['expire_time']).timestamp()
-                current_time = datetime.now().timestamp()
-                
-                # 토큰이 아직 유효한지 확인 (만료 1시간 이상 남은 경우)
-                if current_time < expire_time - 3600:
-                    self.access_token = latest_token['token']
-                    self.token_expire_time = expire_time
-                    self.token_issue_time = datetime.fromisoformat(latest_token['issue_time']).timestamp() if latest_token.get('issue_time') else None
-                    
-                    logger.log_system(f"저장된 유효한 토큰을 로드했습니다. 만료까지 {((expire_time - current_time) / 3600):.1f}시간 남음")
-                else:
-                    logger.log_system("저장된 토큰이 곧 만료되거나 이미 만료되었습니다. 새 토큰을 발급합니다.")
-            else:
-                logger.log_system("저장된 유효한 토큰이 없습니다. 필요시 새 토큰을 발급합니다.")
-        except Exception as e:
-            logger.log_error(e, "저장된 토큰 로드 중 오류 발생. 필요시 새 토큰을 발급합니다.")
+        self.load_token_from_db()
         
     def _get_access_token(self) -> str:
         """접근 토큰 발급/갱신"""
@@ -63,15 +51,15 @@ class KISAPIClient:
         if self.access_token and self.token_expire_time:
             # 만료 1시간 전까지는 기존 토큰 재사용
             if current_time < self.token_expire_time - 3600:
-                db.save_token_log(
-                    event_type="ACCESS",
-                    token=self.access_token,
-                    status="SUCCESS"
-                )
+                # 토큰 로그를 무분별하게 남기지 않도록 삭제
+                logger.log_system("기존 토큰이 유효하여 재사용합니다.")
                 return self.access_token
             
             # 만료 1시간 전이면 토큰 갱신
             logger.log_system("Token will expire soon, refreshing...")
+        
+        # 토큰 발급/갱신 작업 로그
+        logger.log_system("새로운 KIS API 토큰 발급을 시작합니다...")
         
         # 토큰 발급/갱신
         url = f"{self.base_url}/oauth2/tokenP"
@@ -138,8 +126,12 @@ class KISAPIClient:
         """API 요청 실행"""
         url = f"{self.base_url}{path}"
         
+        # 토큰이 이미 있고 유효하다면 매번 토큰 발급을 시도하지 않도록 함
+        current_time = datetime.now().timestamp()
+        token_valid = self.access_token and self.token_expire_time and current_time < self.token_expire_time - 3600
+        
         default_headers = {
-            "authorization": f"Bearer {self._get_access_token()}",
+            "authorization": f"Bearer {self.access_token if token_valid else self._get_access_token()}",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
             "tr_cont": "",
@@ -243,9 +235,20 @@ class KISAPIClient:
     def get_account_balance(self) -> Dict[str, Any]:
         """계좌 잔고 조회"""
         path = "/uapi/domestic-stock/v1/trading/inquire-balance"
+        
+        # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
+        test_mode_str = os.getenv("TEST_MODE", "False").strip()
+        is_test_mode = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+        
+        logger.log_system(f"계좌 조회 - 테스트 모드: {is_test_mode} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        
+        # 거래소코드 설정 (모의투자 또는 실전투자)
+        tr_id = "VTTC8434R" if is_test_mode else "TTTC8434R"  # 모의투자(V) vs 실전투자(T)
+        
         headers = {
-            "tr_id": "TTTC8434R"  # 실전투자
+            "tr_id": tr_id
         }
+        
         params = {
             "CANO": self.account_no[:8],
             "ACNT_PRDT_CD": self.account_no[8:],
@@ -260,7 +263,53 @@ class KISAPIClient:
             "CTX_AREA_NK100": ""
         }
         
-        return self._make_request("GET", path, headers=headers, params=params)
+        try:
+            # API 요청 전 유효한 토큰 확보
+            if not self.access_token or not self.token_expire_time:
+                logger.log_system("계좌 정보 조회 전 토큰 발급이 필요합니다.")
+                self._get_access_token()
+                
+            # API 요청 실행
+            result = self._make_request("GET", path, headers=headers, params=params)
+            
+            # 응답 로깅 (디버깅용)
+            if result and result.get("rt_cd") == "0":
+                logger.log_system(f"계좌 정보 조회 성공: {result.get('msg1', '정상')}")
+            else:
+                error_msg = result.get("msg1", "알 수 없는 오류") if result else "응답 없음"
+                logger.log_system(f"계좌 정보 조회 실패: {error_msg}", level="ERROR")
+                
+            return result
+        except Exception as e:
+            logger.log_error(e, "계좌 정보 조회 중 예외 발생")
+            return {"rt_cd": "9999", "msg1": str(e), "output": {}}
+    
+    def get_account_info(self) -> Dict[str, Any]:
+        """
+        계좌 정보 조회
+        텔레그램 봇 핸들러와의 호환성을 위한 메서드
+        """
+        # 기존 get_account_balance 함수 호출
+        return self.get_account_balance()
+    
+    async def get_account_info(self) -> Dict[str, Any]:
+        """
+        계좌 정보 조회 (비동기 버전)
+        텔레그램 봇 핸들러와의 호환성을 위한 메서드
+        """
+        try:
+            # 동기 함수를 비동기적으로 실행
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.get_account_balance)
+            return result
+        except Exception as e:
+            logger.log_error(e, "비동기 계좌 정보 조회 중 오류 발생")
+            # 오류 발생 시 에러 정보 반환
+            return {
+                "rt_cd": "9999", 
+                "msg1": f"계좌 정보 조회 실패: {str(e)}", 
+                "output": {}
+            }
     
     def place_order(self, symbol: str, order_type: str, side: str, 
                    quantity: int, price: int = 0) -> Dict[str, Any]:
@@ -297,18 +346,32 @@ class KISAPIClient:
         
         # 주문 결과 로깅
         if result.get("rt_cd") == "0":
+            order_id = result.get("output", {}).get("ODNO")
+            logger.log_system(f"[💰 주문성공] {symbol} {side} 주문 성공! - 가격: {price:,}원, 수량: {quantity}주, 주문ID: {order_id}")
             logger.log_trade(
-                action=side,
+                action=f"{side}_API", 
                 symbol=symbol,
                 price=price,
                 quantity=quantity,
-                order_id=result.get("output", {}).get("ODNO"),
-                order_type=order_type
+                order_id=order_id,
+                order_type=order_type,
+                status="SUCCESS",
+                reason="API 주문 전송 성공"
             )
         else:
+            error_msg = result.get("msg1", "Unknown error")
+            logger.log_system(f"[🚸 주문실패] {symbol} {side} 주문 실패 - 오류: {error_msg}")
             logger.log_error(
-                Exception(f"Order failed: {result.get('msg1')}"),
+                Exception(f"Order failed: {error_msg}"),
                 f"Place order for {symbol}"
+            )
+            logger.log_trade(
+                action=f"{side}_API_FAILED",
+                symbol=symbol,
+                price=price,
+                quantity=quantity,
+                reason=f"API 주문 실패: {error_msg}",
+                status="FAILED"
             )
         
         return result
@@ -533,6 +596,93 @@ class KISAPIClient:
                 "status": "error",
                 "message": f"토큰 갱신 실패: {str(e)}"
             }
+
+    async def is_token_valid(self, min_hours: float = 0.5) -> bool:
+        """토큰이 유효한지 확인
+        
+        Args:
+            min_hours (float): 최소 유효 시간 (시간 단위, 기본값 30분)
+            
+        Returns:
+            bool: 토큰 유효 여부 (True: 유효, False: 만료 또는 없음)
+        """
+        async with self._token_lock:
+            # 토큰이 없으면 유효하지 않음
+            if not self.access_token or not self.token_expire_time:
+                return False
+                
+            # 토큰 만료 시간을 확인
+            try:
+                current_time = datetime.now().timestamp()
+                time_remaining = self.token_expire_time - current_time
+                
+                # 최소 유효 시간 이상 남았는지 확인
+                if time_remaining > (min_hours * 3600):
+                    hours_remaining = time_remaining / 3600
+                    logger.log_debug(f"토큰이 유효함. 만료까지 {hours_remaining:.1f}시간 남음")
+                    return True
+                
+                # 만료 시간이 min_hours 이내로 남았거나 이미 만료됨
+                if time_remaining <= 0:
+                    logger.log_debug("토큰이 만료됨")
+                else:
+                    minutes_remaining = time_remaining / 60
+                    logger.log_debug(f"토큰 만료가 임박함. {minutes_remaining:.1f}분 남음")
+                return False
+                
+            except Exception as e:
+                logger.log_error(e, "토큰 유효성 확인 중 오류 발생")
+                return False
+    
+    async def ensure_token(self) -> str:
+        """토큰이 있고 유효한지 확인하고, 없거나 유효하지 않으면 새로 발급"""
+        async with self._token_lock:
+            # 토큰 유효성 먼저 확인
+            if await self.is_token_valid():
+                logger.log_system("토큰이 유효함. 새로 발급하지 않고 기존 토큰 사용")
+                return self.access_token
+            
+            # 토큰이 유효하지 않으면 새로 발급
+            logger.log_system("토큰이 없거나 만료됨. 새로 발급 진행")
+            await self.issue_token()
+            return self.access_token
+    
+    async def issue_token(self) -> str:
+        """비동기적으로 토큰 발급 (Python 3.7+ 호환)"""
+        async with self._token_lock:
+            try:
+                # 동기 함수 _get_access_token을 실행하여 토큰 발급 (run_in_executor 사용)
+                loop = asyncio.get_event_loop()
+                token = await loop.run_in_executor(None, self._get_access_token)
+                logger.log_system("토큰 발급 성공")
+                return token
+            except Exception as e:
+                logger.log_error(e, "토큰 발급 실패")
+                raise
+
+    def load_token_from_db(self):
+        # 앱 시작 시 DB에서 유효한 토큰 로드
+        try:
+            logger.log_system("앱 시작 시 저장된 토큰 확인 중...")
+            latest_token = db.get_latest_token()
+            
+            if latest_token and latest_token.get('token') and latest_token.get('expire_time'):
+                expire_time = datetime.fromisoformat(latest_token['expire_time']).timestamp()
+                current_time = datetime.now().timestamp()
+                
+                # 토큰이 아직 유효한지 확인 (만료 1시간 이상 남은 경우)
+                if current_time < expire_time - 3600:
+                    self.access_token = latest_token['token']
+                    self.token_expire_time = expire_time
+                    self.token_issue_time = datetime.fromisoformat(latest_token['issue_time']).timestamp() if latest_token.get('issue_time') else None
+                    
+                    logger.log_system(f"저장된 유효한 토큰을 로드했습니다. 만료까지 {((expire_time - current_time) / 3600):.1f}시간 남음")
+                else:
+                    logger.log_system("저장된 토큰이 곧 만료되거나 이미 만료되었습니다. 새 토큰을 발급합니다.")
+            else:
+                logger.log_system("저장된 유효한 토큰이 없습니다. 필요시 새 토큰을 발급합니다.")
+        except Exception as e:
+            logger.log_error(e, "저장된 토큰 로드 중 오류 발생. 필요시 새 토큰을 발급합니다.")
 
 # 싱글톤 인스턴스
 api_client = KISAPIClient()

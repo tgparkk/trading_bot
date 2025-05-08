@@ -42,6 +42,7 @@ class MomentumStrategy:
         self.price_data = {}            # {symbol: deque of price data}
         self.positions = {}             # {position_id: position_data}
         self.indicators = {}            # {symbol: {'rsi': value, 'ma_short': value, 'ma_long': value}}
+        self.signals = {}               # {symbol: {'strength': value, 'direction': str, 'last_update': datetime}}
         
     async def start(self, symbols: List[str]):
         """전략 시작"""
@@ -566,58 +567,59 @@ class MomentumStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        """신호 방향 반환"""
+        if symbol in self.signals:
+            return self.signals[symbol].get("direction", "NEUTRAL")
+        return "NEUTRAL"
+        
+    async def update_symbols(self, new_symbols: List[str]):
+        """종목 목록 업데이트"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return "NEUTRAL"
-                
-            # 지표 계산 안된 경우
-            indicators = self.indicators.get(symbol, {})
-            if not indicators or indicators.get('rsi') is None:
-                return "NEUTRAL"
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
             
-            # 매수/매도 신호 카운트
-            buy_signals = 0
-            sell_signals = 0
+            # 현재 감시 중인 종목 집합
+            current_set = set(self.watched_symbols)
             
-            # RSI 기반 신호
-            rsi = indicators['rsi']
-            if rsi < self.params["rsi_buy_threshold"]:
-                buy_signals += 1
-            elif rsi > self.params["rsi_sell_threshold"]:
-                sell_signals += 1
+            # 제거할 종목들
+            to_remove = current_set - new_set
             
-            # 이동평균 교차 기반 신호
-            ma_short = indicators.get('ma_short')
-            ma_long = indicators.get('ma_long')
-            if ma_short is not None and ma_long is not None:
-                if ma_short > ma_long:  # 골든 크로스
-                    buy_signals += 1
-                else:  # 데드 크로스
-                    sell_signals += 1
+            # 추가할 종목들
+            to_add = new_set - current_set
             
-            # MACD 기반 신호
-            macd = indicators.get('macd')
-            macd_signal = indicators.get('macd_signal')
-            if macd is not None and macd_signal is not None:
-                macd_value = macd if isinstance(macd, float) else macd[-1]
-                signal_value = macd_signal if isinstance(macd_signal, float) else macd_signal[-1]
-                
-                if macd_value > signal_value:  # 매수 신호
-                    buy_signals += 1
-                else:  # 매도 신호
-                    sell_signals += 1
+            # 종목 데이터 정리
+            for symbol in to_remove:
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.indicators:
+                    del self.indicators[symbol]
+                if symbol in self.signals:
+                    del self.signals[symbol]
             
-            # 최종 방향 결정
-            if buy_signals > sell_signals:
-                return "BUY"
-            elif sell_signals > buy_signals:
-                return "SELL"
-            else:
-                return "NEUTRAL"
+            # 새 종목 초기화
+            for symbol in to_add:
+                self.price_data[symbol] = deque(maxlen=100)
+                self.indicators[symbol] = {
+                    'rsi': [],
+                    'ma_short': [],
+                    'ma_long': [],
+                    'macd': [],
+                    'macd_signal': [],
+                    'macd_hist': []
+                }
+                self.signals[symbol] = {
+                    'strength': 0,
+                    'direction': "NEUTRAL",
+                    'last_update': None
+                }
             
-        except Exception:
-            return "NEUTRAL"
+            # 감시 종목 업데이트
+            self.watched_symbols = list(new_set)
+            
+            logger.log_system(f"모멘텀 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+        
+        except Exception as e:
+            logger.log_error(e, "모멘텀 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
 momentum_strategy = MomentumStrategy() 
