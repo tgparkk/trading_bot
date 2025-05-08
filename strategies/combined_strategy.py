@@ -410,20 +410,49 @@ class CombinedStrategy:
             
             # 매수/매도 판단 정보 trade.log에 자세히 기록
             strategies = self.signals[symbol]['strategies']
+            
+            # 평가 상태 결정
+            evaluation_status = "NEUTRAL"
+            failure_reason = []
+            
+            if direction == "BUY":
+                if score >= buy_threshold:
+                    evaluation_status = "BUY_SIGNAL"
+                else:
+                    evaluation_status = "BUY_THRESHOLD_FAIL"
+                    failure_reason.append(f"매수점수 미달 (목표: {buy_threshold:.1f}, 실제: {score:.1f})")
+            elif direction == "SELL":
+                if score >= sell_threshold:
+                    evaluation_status = "SELL_SIGNAL"
+                else:
+                    evaluation_status = "SELL_THRESHOLD_FAIL"
+                    failure_reason.append(f"매도점수 미달 (목표: {sell_threshold:.1f}, 실제: {score:.1f})")
+            else:  # NEUTRAL
+                evaluation_status = "NEUTRAL"
+                buy_count = agreements.get("BUY", 0)
+                sell_count = agreements.get("SELL", 0)
+                failure_reason.append(f"방향성 불명확 (매수동의: {buy_count}, 매도동의: {sell_count}, 최소필요: {min_agreement})")
+            
+            # 매수/매도/중립/점수미달 등 모든 상태에 대해 상세 로깅
             logger.log_trade(
-                action="BUY_EVALUATION",
+                action="TRADE_EVALUATION",
                 symbol=symbol,
                 price=current_price,
                 quantity=0,
-                reason=f"매수 평가 - 점수: {score:.1f}/10.0, 임계값: {buy_threshold}, 방향: {direction}",
+                reason=f"{evaluation_status} - 점수: {score:.1f}/10.0, 임계값(매수:{buy_threshold}/매도:{sell_threshold}), 방향: {direction}",
                 score=f"{score:.1f}",
-                threshold=f"{buy_threshold}",
+                buy_threshold=f"{buy_threshold}",
+                sell_threshold=f"{sell_threshold}",
                 direction=direction,
+                status=evaluation_status,
+                failure_reasons=", ".join(failure_reason) if failure_reason else "",
                 breakout=f"{strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']})",
                 momentum=f"{strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']})",
                 gap=f"{strategies['gap']['signal']:.1f}({strategies['gap']['direction']})",
                 vwap=f"{strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']})",
                 volume=f"{strategies['volume']['signal']:.1f}({strategies['volume']['direction']})",
+                buy_agreements=agreements.get('BUY', 0),
+                sell_agreements=agreements.get('SELL', 0),
                 time=datetime.now().strftime("%H:%M:%S")
             )
             

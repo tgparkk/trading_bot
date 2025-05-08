@@ -51,10 +51,11 @@ for /f "tokens=2-4 delims=/ " %%a in ('date /t') do (
     set today=%%c-%%a-%%b
 )
 
-REM 해당 날짜의 로그 폴더가 이미 있으면 삭제
+REM 해당 날짜의 로그 폴더가 이미 있으면 유지, 없으면 생성
 if exist logs\%today% (
-    echo 테스트를 위해 오늘 로그 폴더 삭제 및 재생성...
-    rd /s /q logs\%today%
+    echo 오늘(%today%) 로그 폴더가 이미 존재합니다. 기존 폴더를 유지합니다...
+) else (
+    echo 오늘(%today%) 로그 폴더가 없습니다. 새로 생성합니다...
 )
 
 REM 로그 폴더 확인
