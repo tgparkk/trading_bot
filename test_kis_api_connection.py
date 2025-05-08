@@ -17,7 +17,7 @@ async def test_kis_api_connection():
     try:
         # 텔레그램 봇 핸들러 준비 대기
         print("텔레그램 봇 핸들러 준비 대기 중...")
-        await telegram_bot_handler.wait_until_ready(timeout=10)
+        await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=10)
         print("텔레그램 봇 핸들러 준비 완료")
         
         # KIS API 접속 시도 전 메시지 전송
@@ -30,7 +30,7 @@ async def test_kis_api_connection():
         """
         
         print("KIS API 접속 시도 전 메시지 전송 중...")
-        await telegram_bot_handler.send_message(pre_message)
+        await telegram_bot_handler._send_message(pre_message)
         print("KIS API 접속 시도 전 메시지 전송 완료")
         
         # 접속 시도 시간 기록을 위해 1초 대기
@@ -57,7 +57,7 @@ async def test_kis_api_connection():
             """
             
             print("KIS API 접속 성공 메시지 전송 중...")
-            await telegram_bot_handler.send_message(success_message)
+            await telegram_bot_handler._send_message(success_message)
             print("KIS API 접속 성공 메시지 전송 완료")
             return True
         else:
@@ -74,7 +74,7 @@ async def test_kis_api_connection():
             """
             
             print("KIS API 접속 실패 메시지 전송 중...")
-            await telegram_bot_handler.send_message(fail_message)
+            await telegram_bot_handler._send_message(fail_message)
             print("KIS API 접속 실패 메시지 전송 완료")
             return False
             
@@ -94,7 +94,7 @@ async def test_kis_api_connection():
         
         try:
             print("KIS API 접속 오류 메시지 전송 중...")
-            await telegram_bot_handler.send_message(error_message)
+            await telegram_bot_handler._send_message(error_message)
             print("KIS API 접속 오류 메시지 전송 완료")
         except Exception as msg_error:
             print(f"텔레그램 메시지 전송 실패: {str(msg_error)}")

@@ -498,50 +498,53 @@ class VWAPStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        """신호 방향 반환"""
+        if symbol in self.vwap_data:
+            return self.vwap_data[symbol].get("signal_direction", "NEUTRAL")
+        return "NEUTRAL"
+        
+    async def update_symbols(self, new_symbols: List[str]):
+        """종목 목록 업데이트"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return "NEUTRAL"
-                
-            # VWAP 데이터 있는지 확인
-            vwap_data = self.vwap_data.get(symbol, {})
-            if not vwap_data.get('vwap') or not vwap_data.get('upper_band') or not vwap_data.get('lower_band'):
-                return "NEUTRAL"
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
             
-            # 현재가와 이전가
-            if len(self.price_data[symbol]) < 2:
-                return "NEUTRAL"
-                
-            current_price = self.price_data[symbol][-1]["price"]
-            prev_price = self.price_data[symbol][-2]["price"]
+            # 현재 감시 중인 종목 집합
+            current_set = set(self.watched_symbols)
             
-            vwap = vwap_data['vwap']
-            upper_band = vwap_data['upper_band']
-            lower_band = vwap_data['lower_band']
-            entry_threshold = self.params['entry_threshold']
+            # 제거할 종목들
+            to_remove = current_set - new_set
             
-            # 매수 신호
-            if (prev_price < vwap and current_price > vwap * (1 + entry_threshold)) or \
-               (current_price < lower_band * (1 + entry_threshold) and current_price > prev_price):
-                return "BUY"
+            # 추가할 종목들
+            to_add = new_set - current_set
             
-            # 매도 신호
-            if (prev_price > vwap and current_price < vwap * (1 - entry_threshold)) or \
-               (current_price > upper_band * (1 - entry_threshold) and current_price < prev_price):
-                return "SELL"
+            # 종목 데이터 정리
+            for symbol in to_remove:
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.vwap_data:
+                    del self.vwap_data[symbol]
             
-            # 가격이 VWAP보다 상당히 높고 상승 중인 경우 - 매수 편향
-            if current_price > vwap * 1.01 and current_price > prev_price:
-                return "BUY"
+            # 새 종목 초기화
+            for symbol in to_add:
+                self.price_data[symbol] = deque(maxlen=100)
+                self.vwap_data[symbol] = {
+                    'vwap': None,
+                    'upper_band': None,
+                    'lower_band': None,
+                    'std_dev': None,
+                    'signal_strength': 0,
+                    'signal_direction': "NEUTRAL",
+                    'last_update': None
+                }
             
-            # 가격이 VWAP보다 상당히 낮고 하락 중인 경우 - 매도 편향
-            if current_price < vwap * 0.99 and current_price < prev_price:
-                return "SELL"
+            # 감시 종목 업데이트
+            self.watched_symbols = list(new_set)
             
-            return "NEUTRAL"
-            
-        except Exception:
-            return "NEUTRAL"
+            logger.log_system(f"VWAP 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+        
+        except Exception as e:
+            logger.log_error(e, "VWAP 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
 vwap_strategy = VWAPStrategy() 

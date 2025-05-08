@@ -514,41 +514,59 @@ class GapStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """신호 방향 (BUY/SELL/NEUTRAL)"""
+        """신호 방향 반환"""
+        if symbol in self.gap_data:
+            return self.gap_data[symbol].get("signal_direction", "NEUTRAL")
+        return "NEUTRAL"
+        
+    async def update_symbols(self, new_symbols: List[str]):
+        """종목 목록 업데이트"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return "NEUTRAL"
-                
-            # 갭 확인 안된 경우
-            gap_data = self.gap_data.get(symbol, {})
-            if not gap_data.get('gap_identified', False):
-                return "NEUTRAL"
+            # 새로운 종목 집합
+            new_set = set(new_symbols)
             
-            # 갭 크기가 임계값 내에 있는지 확인
-            gap_pct = abs(gap_data.get('gap_pct', 0))
-            if gap_pct < self.params["min_gap_pct"] or gap_pct > self.params["max_gap_pct"]:
-                return "NEUTRAL"
+            # 현재 감시 중인 종목 집합
+            current_set = set(self.watched_symbols)
             
-            # 거래량 임계치 미달인 경우
-            volume_ratio = self.volume_data[symbol].get('volume_ratio', 0)
-            if volume_ratio < self.params["volume_threshold"]:
-                return "NEUTRAL"
+            # 제거할 종목들
+            to_remove = current_set - new_set
             
-            # 이미 포지션 있는 경우
-            if self._get_symbol_positions(symbol):
-                return "NEUTRAL"
+            # 추가할 종목들
+            to_add = new_set - current_set
             
-            # 갭 방향에 따른 신호
-            direction = gap_data.get('direction')
-            if direction == "UP":
-                return "SELL"  # 갭업 -> 갭 채우기 위한 하락 예상 -> 매도
-            elif direction == "DOWN":
-                return "BUY"   # 갭다운 -> 갭 채우기 위한 상승 예상 -> 매수
+            # 종목 데이터 정리
+            for symbol in to_remove:
+                if symbol in self.price_data:
+                    del self.price_data[symbol]
+                if symbol in self.volume_data:
+                    del self.volume_data[symbol]
+                if symbol in self.gap_data:
+                    del self.gap_data[symbol]
             
-            return "NEUTRAL"
+            # 새 종목 초기화
+            for symbol in to_add:
+                self.price_data[symbol] = deque(maxlen=100)
+                self.volume_data[symbol] = deque(maxlen=20)
+                self.gap_data[symbol] = {
+                    'prev_close': None,
+                    'open_price': None,
+                    'gap_pct': None,
+                    'gap_identified': False,
+                    'direction': "NEUTRAL",
+                    'fill_target': None,
+                    'avg_volume': None,
+                    'signal_strength': 0,
+                    'signal_direction': "NEUTRAL",
+                    'last_update': None
+                }
             
-        except Exception:
-            return "NEUTRAL"
+            # 감시 종목 업데이트
+            self.watched_symbols = list(new_set)
+            
+            logger.log_system(f"갭 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+        
+        except Exception as e:
+            logger.log_error(e, "갭 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
 gap_strategy = GapStrategy() 

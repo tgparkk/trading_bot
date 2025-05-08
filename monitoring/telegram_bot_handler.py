@@ -15,13 +15,16 @@ from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime, timedelta
 from config.settings import config
 from core.order_manager import order_manager
-from core.api_client import api_client
+from core.api_client import KISAPIClient
 from core.stock_explorer import stock_explorer
 from strategies.combined_strategy import combined_strategy
 from monitoring.alert_system import alert_system
 from utils.logger import logger
 from utils.database import db
 from utils.dotenv_helper import dotenv_helper
+
+# API 클라이언트 인스턴스 생성
+api_client = KISAPIClient()
 
 class TelegramBotHandler:
     """텔레그램 봇 핸들러"""
@@ -90,6 +93,139 @@ class TelegramBotHandler:
         """종료 콜백 설정"""
         self.shutdown_callback = callback
         
+    async def _send_message(self, text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
+        """텔레그램으로 메시지 전송"""
+        if not self.token or not self.chat_id:
+            logger.log_system("텔레그램 토큰 또는 채팅 ID가 설정되지 않았습니다. 메시지를 보낼 수 없습니다.", level="ERROR")
+            return None
+        
+        # 메시지 전송 URL
+        url = f"{self.base_url}/sendMessage"
+        
+        # 메시지 데이터
+        data = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        
+        # 답장 ID 추가 (있는 경우)
+        if reply_to_message_id:
+            data["reply_to_message_id"] = reply_to_message_id
+        
+        # 동시성 제어를 위한 락 사용
+        async with self.message_lock:
+            try:
+                if self._session is None or self._session.closed:
+                    logger.log_system("세션이 종료되어 있어 새 세션을 생성합니다.", level="WARNING")
+                    self._session = aiohttp.ClientSession()
+                
+                async with self._session.post(url, json=data) as response:
+                    result = await response.json()
+                    
+                    if result.get("ok"):
+                        message_id = result.get("result", {}).get("message_id")
+                        return message_id
+                    else:
+                        error_code = result.get("error_code")
+                        description = result.get("description")
+                        logger.log_system(f"텔레그램 메시지 전송 실패: {error_code} - {description}", level="ERROR")
+                        return None
+            except Exception as e:
+                logger.log_error(e, "텔레그램 메시지 전송 중 오류 발생")
+                return None
+    
+    async def _get_updates(self) -> List[Dict]:
+        """텔레그램에서 새로운 메시지 업데이트 받기"""
+        if not self.token:
+            logger.log_system("텔레그램 토큰이 설정되지 않았습니다. 업데이트를 받을 수 없습니다.", level="ERROR")
+            return []
+        
+        # 업데이트 URL
+        url = f"{self.base_url}/getUpdates"
+        
+        # 파라미터
+        params = {
+            "offset": self.last_update_id + 1 if self.last_update_id > 0 else 0,
+            "timeout": 5,  # 롱 폴링 타임아웃 (초)
+            "allowed_updates": json.dumps(["message"])  # 메시지 업데이트만 허용
+        }
+        
+        try:
+            if self._session is None or self._session.closed:
+                logger.log_system("세션이 종료되어 있어 새 세션을 생성합니다.", level="WARNING")
+                self._session = aiohttp.ClientSession()
+                
+            async with self._session.get(url, params=params) as response:
+                result = await response.json()
+                
+                if result.get("ok"):
+                    updates = result.get("result", [])
+                    
+                    # 마지막 업데이트 ID 저장
+                    if updates:
+                        self.last_update_id = max(update.get("update_id", 0) for update in updates)
+                    
+                    return updates
+                else:
+                    error_code = result.get("error_code")
+                    description = result.get("description")
+                    logger.log_system(f"텔레그램 업데이트 조회 실패: {error_code} - {description}", level="ERROR")
+                    return []
+        except Exception as e:
+            logger.log_error(e, "텔레그램 업데이트 조회 중 오류 발생")
+            return []
+    
+    async def _process_update(self, update: Dict) -> None:
+        """텔레그램 업데이트 처리"""
+        try:
+            # 메시지 추출
+            message = update.get("message", {})
+            if not message:
+                return
+            
+            # 메시지 정보 추출
+            chat_id = message.get("chat", {}).get("id")
+            message_id = message.get("message_id")
+            text = message.get("text", "")
+            
+            # 권한 확인
+            if str(chat_id) != str(self.chat_id):
+                logger.log_system(f"권한 없는 사용자 (Chat ID: {chat_id})로부터 메시지 수신: {text}", level="WARNING")
+                return
+            
+            # 비어 있거나 명령어가 아닌 경우 무시
+            if not text or not text.startswith("/"):
+                return
+            
+            # 명령어 및 인자 추출
+            parts = text.split()
+            command = parts[0].lower()  # 명령어 (소문자로 변환)
+            args = parts[1:] if len(parts) > 1 else []  # 인자 목록
+            
+            # 명령어 로깅
+            logger.log_system(f"텔레그램 명령어 수신: {command} {args}", level="INFO")
+            
+            # 명령어 처리 메서드 가져오기
+            handler = self.commands.get(command)
+            
+            if handler:
+                try:
+                    # 명령어 처리 및 응답
+                    response = await handler(args)
+                    if response:
+                        await self._send_message(response, reply_to_message_id=message_id)
+                except Exception as e:
+                    logger.log_error(e, f"텔레그램 명령어 처리 중 오류: {command}")
+                    error_response = f"❌ <b>명령어 처리 중 오류 발생</b>\n\n{str(e)}"
+                    await self._send_message(error_response, reply_to_message_id=message_id)
+            else:
+                # 알 수 없는 명령어
+                unknown_cmd_response = f"❌ 알 수 없는 명령어: {command}\n\n도움말을 보려면 /help를 입력하세요."
+                await self._send_message(unknown_cmd_response, reply_to_message_id=message_id)
+        except Exception as e:
+            logger.log_error(e, "텔레그램 업데이트 처리 중 오류 발생")
+        
     async def start_polling(self):
         """메시지 폴링 시작"""
         # 현재 이벤트 루프에서 사용할 ready_event 초기화
@@ -155,914 +291,6 @@ class TelegramBotHandler:
                     logger.log_system("텔레그램 봇 aiohttp 세션 정상 종료")
             except Exception as e:
                 logger.log_error(e, "텔레그램 봇 세션 종료 중 오류")
-
-    async def _get_updates(self) -> List[Dict[str, Any]]:
-        """업데이트 가져오기"""
-        try:
-            params = {
-                "offset": self.last_update_id + 1,
-                "timeout": 30
-            }
-            logger.log_system(f"텔레그램 업데이트 요청: offset={self.last_update_id + 1}")
-            
-            # requests 대신 aiohttp 사용 (비동기 환경에서 중요)
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession()
-                logger.log_system("텔레그램 업데이트용 새 aiohttp 세션 생성")
-                
-            async with self._session.get(f"{self.base_url}/getUpdates", params=params, timeout=30) as response:
-                if response.status != 200:
-                    logger.log_system(f"텔레그램 업데이트 요청 실패: {response.status}", level="WARNING")
-                    # 409 오류인 경우 (충돌), 다른 인스턴스가 이미 실행 중일 수 있음
-                    # 오프셋을 재설정하여 다시 시도
-                    if response.status == 409:
-                        # 다른 인스턴스가 이미 실행 중인 경우 처리
-                        logger.log_system("텔레그램 봇 충돌 감지, 오프셋 재설정 시도", level="WARNING")
-                        # 충돌 해결을 위해 오프셋 재설정 (deleteWebhook 호출로 상태 초기화)
-                        try:
-                            async with self._session.get(f"{self.base_url}/deleteWebhook") as reset_response:
-                                reset_data = await reset_response.json()
-                                logger.log_system(f"웹훅 초기화 결과: {reset_data}")
-                                
-                                # 잠시 대기 후 다음 루프에서 다시 시도
-                                await asyncio.sleep(2)
-                        except Exception as reset_error:
-                            logger.log_error(reset_error, "웹훅 초기화 중 오류 발생")
-                    
-                    return []
-                    
-                data = await response.json()
-                logger.log_system(f"텔레그램 응답: {data}")
-                
-                if data.get("ok") and data.get("result"):
-                    updates = data["result"]
-                    if updates:
-                        self.last_update_id = max(update["update_id"] for update in updates)
-                        logger.log_system(f"새 업데이트 ID: {self.last_update_id}")
-                    return updates
-            return []
-        except aiohttp.ClientError as e:
-            logger.log_error(e, "텔레그램 업데이트 조회 중 aiohttp 오류")
-            return []
-        except asyncio.TimeoutError:
-            logger.log_system("텔레그램 업데이트 요청 타임아웃", level="WARNING")
-            return []
-        except Exception as e:
-            logger.log_error(e, "텔레그램 업데이트 조회 오류")
-            return []
-    
-    async def _process_update(self, update: Dict[str, Any]):
-        """업데이트 처리"""
-        try:
-            message = update.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            message_id = message.get("message_id")
-            update_id = update.get("update_id")
-            text = message.get("text", "")
-            
-            # 메시지가 없거나 텍스트가 없는 경우 무시
-            if not message or not text:
-                return
-            
-            logger.log_system(f"텔레그램 메시지 수신: {text[:30]}... (chat_id: {chat_id}, message_id: {message_id})")
-                
-            # 메시지 ID가 있는 경우 이미 처리된 메시지인지 확인
-            if message_id:
-                # DB에서 이 메시지 ID로 저장된 메시지가 있는지 확인
-                try:
-                    existing_messages = db.get_telegram_messages(
-                        direction="INCOMING",
-                        message_id=str(message_id),
-                        limit=1
-                    )
-                    
-                    # 메시지가 이미 저장되어 있고 처리된 경우 건너뜀
-                    if existing_messages and existing_messages[0].get("processed"):
-                        logger.log_system(f"이미 처리된 메시지 무시: ID {message_id}", level="INFO")
-                        return
-                except Exception as e:
-                    logger.log_error(e, f"메시지 처리 상태 확인 중 오류: {message_id}")
-                    # 오류가 발생해도 계속 진행 (중복 처리보다 누락이 더 위험함)
-            
-            # 수신 메시지 DB에 저장
-            is_command = text.startswith('/')
-            command = text.split()[0].lower() if is_command else None
-            
-            try:
-                db_message_id = db.save_telegram_message(
-                    direction="INCOMING",
-                    chat_id=str(chat_id) if chat_id else "unknown",
-                    message_text=text,
-                    message_id=str(message_id) if message_id else None,
-                    update_id=update_id,
-                    is_command=is_command,
-                    command=command
-                )
-                logger.log_system(f"수신 메시지 DB 저장 성공 (DB ID: {db_message_id})")
-            except Exception as e:
-                logger.log_error(e, "수신 메시지 DB 저장 실패")
-                # DB 저장 실패해도 메시지 처리는 계속함
-            
-            # 권한 확인 (설정된 chat_id와 일치해야 함)
-            if not chat_id or str(chat_id) != str(self.chat_id):
-                logger.log_system(f"허가되지 않은 접근 (채팅 ID: {chat_id})", level="WARNING")
-                # 메시지 처리 실패 상태 업데이트
-                if message_id:
-                    try:
-                        db.update_telegram_message_status(
-                            message_id=str(message_id),
-                            processed=True,
-                            status="FAIL",
-                            error_message="Unauthorized chat ID"
-                        )
-                    except Exception as e:
-                        logger.log_error(e, "메시지 상태 업데이트 실패")
-                return
-            
-            if is_command:
-                await self._handle_command(text, str(chat_id), str(message_id) if message_id else None)
-                
-        except Exception as e:
-            logger.log_error(e, f"텔레그램 업데이트 처리 오류: {update}")
-            # 오류 발생 시 메시지 상태 업데이트
-            message_id = update.get("message", {}).get("message_id")
-            if message_id:
-                try:
-                    db.update_telegram_message_status(
-                        message_id=str(message_id),
-                        processed=True,
-                        status="FAIL",
-                        error_message=str(e)
-                    )
-                except Exception as update_error:
-                    logger.log_error(update_error, "메시지 상태 업데이트 실패")
-    
-    async def _handle_command(self, command_text: str, chat_id: str, message_id: str = None):
-        """명령어 처리"""
-        parts = command_text.split()
-        command = parts[0].lower()
-        args = parts[1:] if len(parts) > 1 else []
-        
-        logger.log_system(f"텔레그램 명령 수신: {command_text} (chat_id: {chat_id}, message_id: {message_id})")
-        
-        handler = self.commands.get(command)
-        if handler:
-            try:
-                # 명령 처리 전 상태 업데이트
-                if message_id:
-                    db.update_telegram_message_status(
-                        message_id=str(message_id),
-                        processed=True,
-                        status="PROCESSING"
-                    )
-                
-                logger.log_system(f"텔레그램 명령 처리 시작: {command}")
-                response = await handler(args)
-                
-                # 명령 처리 성공 상태 업데이트
-                if message_id:
-                    db.update_telegram_message_status(
-                        message_id=str(message_id),
-                        processed=True,
-                        status="SUCCESS"
-                    )
-                
-                # 응답 전송
-                if response:  # None인 경우 응답하지 않음 (이미 다른 방식으로 응답한 경우)
-                    logger.log_system(f"텔레그램 명령 응답 전송: {command} (길이: {len(response)})")
-                    await self._send_message(response, reply_to=message_id)
-                else:
-                    logger.log_system(f"텔레그램 명령에 대한 응답 없음: {command}")
-            except Exception as e:
-                # 스택 트레이스를 포함한 상세 오류 로깅
-                error_msg = f"명령 처리 중 오류 발생: {str(e)}"
-                stack_trace = traceback.format_exc()
-                logger.log_error(e, f"명령어 오류 ({command}): {error_msg}\n{stack_trace}")
-                
-                # 명령 처리 실패 상태 업데이트
-                if message_id:
-                    db.update_telegram_message_status(
-                        message_id=str(message_id),
-                        processed=True,
-                        status="FAIL",
-                        error_message=str(e)
-                    )
-                
-                # 사용자에게 보여줄 간결한 오류 메시지
-                user_error_msg = f"명령 처리 중 오류가 발생했습니다: {str(e)[:100]}"
-                if "object has no attribute" in str(e):
-                    user_error_msg += "\n\n이 기능은 현재 개발 중이거나 사용할 수 없습니다."
-                    
-                # 오류 응답
-                await self._send_message(f"❌ *오류 발생*\n\n{user_error_msg}", reply_to=message_id)
-        else:
-            # 알 수 없는 명령어
-            unknown_cmd_msg = f"알 수 없는 명령어입니다: {command}\n/help를 입력하여 사용 가능한 명령어를 확인하세요."
-            logger.log_system(f"알 수 없는 텔레그램 명령: {command}")
-            await self._send_message(unknown_cmd_msg, reply_to=message_id)
-            
-            # 알 수 없는 명령어 처리 상태 업데이트
-            if message_id:
-                db.update_telegram_message_status(
-                    message_id=str(message_id),
-                    processed=True,
-                    status="FAIL",
-                    error_message="Unknown command"
-                )
-    
-    async def _send_message(self, text: str, reply_to: str = None, max_retries: int = 3):
-        """텔레그램 메시지 전송 내부 메서드
-        
-        텔레그램 API를 통해 메시지를 전송하고 DB에 로그를 저장합니다.
-        중요 메시지(오류, 경고, 종료)는 봇 중단 상태에서도 전송됩니다.
-        
-        Args:
-            text: 전송할 메시지 텍스트
-            reply_to: 답장할 메시지 ID
-            max_retries: 최대 재시도 횟수
-        
-        Returns:
-            성공 시 메시지 ID, 실패 시 None
-        """
-        # 중요 메시지 여부 확인 (오류, 경고, 봇 종료 관련 메시지)
-        is_important = any(keyword in text for keyword in [
-            "❌", "⚠️", "오류", "실패", "error", "fail", "종료", "stop", "ERROR", "WARNING", "CRITICAL"
-        ])
-        
-        # 봇이 실행 중이 아니고, 중요 메시지도 아닌 경우
-        if not self.bot_running and not is_important:
-            logger.log_system("봇이 종료되어 일반 메시지를 전송하지 않습니다.", level="WARNING")
-            return None
-        
-        # 이벤트 루프가 닫혀있는지 확인
-        try:
-            current_loop = asyncio.get_running_loop()
-            if current_loop.is_closed():
-                logger.log_system("이벤트 루프가 닫혀 메시지 전송이 불가능합니다.", level="WARNING")
-                # DB에 저장만 하고 전송은 하지 않음
-                db_message_id = db.save_telegram_message(
-                    direction="OUTGOING",
-                    chat_id=self.chat_id,
-                    message_text=text,
-                    reply_to=reply_to,
-                    status="FAIL",
-                    error_message="이벤트 루프 닫힘"
-                )
-                return None
-        except RuntimeError:
-            # 이벤트 루프가 없는 상태 - 프로그램 종료 중일 가능성이 높음
-            logger.log_system("이벤트 루프를 가져올 수 없습니다. 프로그램이 종료 중일 수 있습니다.", level="WARNING")
-            # DB에 저장만 하고 전송은 하지 않음
-            db_message_id = db.save_telegram_message(
-                direction="OUTGOING",
-                chat_id=self.chat_id,
-                message_text=text,
-                reply_to=reply_to,
-                status="FAIL", 
-                error_message="이벤트 루프 없음"
-            )
-            return None
-        
-        # 메시지 ID 생성 및 DB 저장
-        db_message_id = db.save_telegram_message(
-            direction="OUTGOING",
-            chat_id=self.chat_id,
-            message_text=text,
-            reply_to=reply_to
-        )
-        
-        logger.log_system(f"발신 메시지 DB 저장 완료 (ID: {db_message_id})")
-        
-        # 텔레그램 API 요청 준비
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        params = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": "HTML"  # HTML 형식 지정
-        }
-        
-        if reply_to:
-            params["reply_to_message_id"] = reply_to
-        
-        # 메시지 전송 시도
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.log_system(f"텔레그램 API 요청 시도 #{attempt}: {url}")
-                
-                # 세션이 없거나 닫혀있는 경우 새로 생성
-                if self._session is None or self._session.closed:
-                    logger.log_system("텔레그램 API 세션이 없거나 닫혀 있어 새로 생성합니다.", level="WARNING")
-                    try:
-                        self._session = aiohttp.ClientSession()
-                    except RuntimeError as e:
-                        # 이벤트 루프 관련 오류 (이벤트 루프가 닫혀있을 가능성)
-                        logger.log_system(f"세션 생성 중 이벤트 루프 오류: {str(e)}", level="WARNING")
-                        db.update_telegram_message(db_message_id, status="FAIL", error_message=f"세션 생성 실패: {str(e)}")
-                        return None
-                
-                # API 요청 전송 시도
-                try:
-                    async with self._session.post(url, params=params, timeout=10) as response:
-                        logger.log_system(f"텔레그램 API 응답 수신: {response.status}")
-                        
-                        # 응답 처리
-                        if response.status == 200:
-                            result = await response.json()
-                            
-                            if result.get("ok"):
-                                # 성공적으로 전송된 메시지 ID 저장
-                                message_id = result.get("result", {}).get("message_id")
-                                
-                                # DB에 메시지 ID 및 상태 업데이트
-                                db.update_telegram_message(db_message_id, message_id=str(message_id), status="SUCCESS")
-                                logger.log_system(f"발신 메시지 DB 상태 업데이트 완료 (Status: SUCCESS)")
-                                
-                                return message_id
-                            else:
-                                # 텔레그램 API 오류 처리
-                                error_code = result.get("error_code")
-                                description = result.get("description", "알 수 없는 오류")
-                                
-                                logger.log_system(f"텔레그램 API 오류: {error_code} - {description}", level="ERROR")
-                                
-                                # DB에 오류 상태 업데이트
-                                db.update_telegram_message(
-                                    db_message_id, 
-                                    status="FAIL", 
-                                    error_message=f"API 오류: {error_code} - {description}"
-                                )
-                                
-                                # 재시도 가능한 오류인 경우 계속 시도
-                                if error_code in [429, 500, 502, 503, 504] and attempt < max_retries:
-                                    await asyncio.sleep(attempt * 2)  # 지수 백오프
-                                    continue
-                                
-                                return None
-                        else:
-                            # HTTP 오류 처리
-                            error_text = await response.text()
-                            logger.log_system(f"텔레그램 API HTTP 오류: {response.status} - {error_text}", level="ERROR")
-                            
-                            # DB에 오류 상태 업데이트
-                            db.update_telegram_message(
-                                db_message_id, 
-                                status="FAIL", 
-                                error_message=f"HTTP 오류: {response.status} - {error_text[:100]}"
-                            )
-                            
-                            # 재시도 가능한 HTTP 오류인 경우 계속 시도
-                            if response.status in [429, 500, 502, 503, 504] and attempt < max_retries:
-                                await asyncio.sleep(attempt * 2)  # 지수 백오프
-                                continue
-                            
-                            return None
-                except RuntimeError as e:
-                    # 이벤트 루프 관련 오류 (이벤트 루프가 닫혀있을 가능성)
-                    if "loop is closed" in str(e) or "Event loop is closed" in str(e):
-                        logger.log_system("이벤트 루프가 닫혀 텔레그램 API 요청을 보낼 수 없습니다.", level="WARNING")
-                        db.update_telegram_message(db_message_id, status="FAIL", error_message="이벤트 루프 닫힘")
-                        return None
-                    raise  # 다른 런타임 오류는 다시 발생시킴
-            
-            except aiohttp.ClientError as e:
-                # 네트워크 관련 오류 처리
-                logger.log_system(f"텔레그램 API 요청 네트워크 오류: {str(e)}", level="ERROR")
-                
-                # DB에 오류 상태 업데이트
-                db.update_telegram_message(db_message_id, status="FAIL", error_message=f"네트워크 오류: {str(e)}")
-                
-                # 재시도
-                if attempt < max_retries:
-                    await asyncio.sleep(attempt * 2)  # 지수 백오프
-                    continue
-                
-                return None
-                
-            except asyncio.TimeoutError:
-                # 타임아웃 오류 처리
-                logger.log_system("텔레그램 API 요청 타임아웃", level="ERROR")
-                
-                # DB에 오류 상태 업데이트
-                db.update_telegram_message(db_message_id, status="FAIL", error_message="요청 타임아웃")
-                
-                # 재시도
-                if attempt < max_retries:
-                    await asyncio.sleep(attempt * 2)  # 지수 백오프
-                    continue
-                
-                return None
-                
-            except Exception as e:
-                # 기타 예외 처리
-                logger.log_error(e, "텔레그램 메시지 전송 중 예외 발생")
-                
-                # DB에 오류 상태 업데이트
-                db.update_telegram_message(db_message_id, status="FAIL", error_message=f"예외: {str(e)}")
-                
-                # 치명적인 오류는 재시도하지 않음
-                return None
-        
-        # 모든 시도 실패
-        logger.log_system(f"텔레그램 메시지 전송 최대 시도 횟수 초과 ({max_retries}회)", level="ERROR")
-        return None
-    
-    async def send_message(self, text: str, reply_to: str = None):
-        """외부에서 호출할 수 있는 메시지 전송 메소드"""
-        # 동시 전송 방지를 위한 락 사용
-        async with self.message_lock:
-            try:
-                return await self._send_message(text, reply_to)
-            except Exception as e:
-                logger.log_error(e, "텔레그램 메시지 전송 실패")
-                return None
-    
-    async def wait_until_ready(self, timeout: Optional[float] = None):
-        """봇이 준비될 때까지 대기"""
-        try:
-            # 이벤트 루프가 닫혀있는지 확인
-            try:
-                current_loop = asyncio.get_running_loop()
-                if current_loop.is_closed():
-                    logger.log_system("이벤트 루프가 닫혀 있어 텔레그램 봇 준비 상태를 확인할 수 없습니다.", level="WARNING")
-                    return False
-            except RuntimeError:
-                logger.log_system("현재 실행 중인 이벤트 루프를 가져올 수 없습니다.", level="WARNING")
-                return False
-                
-            # ready_event가 None이면 봇이 아직 시작되지 않은 것
-            if self.ready_event is None:
-                logger.log_system("텔레그램 봇 핸들러가 아직 시작되지 않았습니다. 자동으로 시작합니다.", level="WARNING")
-                # 이벤트 초기화 및 폴링 시작
-                self.ready_event = asyncio.Event()
-                # 백그라운드에서 폴링 시작
-                try:
-                    asyncio.create_task(self.start_polling())
-                except RuntimeError as e:
-                    if "loop is closed" in str(e) or "Event loop is closed" in str(e):
-                        logger.log_system("이벤트 루프가 닫혀 텔레그램 봇을 시작할 수 없습니다.", level="WARNING")
-                        return False
-                    raise
-                
-            # 타임아웃과 함께 대기
-            if timeout is not None:
-                try:
-                    await asyncio.wait_for(self.ready_event.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.log_system(f"텔레그램 봇 준비 시간 초과 ({timeout}초)", level="WARNING")
-                    raise
-            else:
-                await self.ready_event.wait()
-                
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.log_system(f"텔레그램 봇 준비 시간 초과 ({timeout}초)", level="WARNING")
-            raise
-        except RuntimeError as e:
-            if "loop is closed" in str(e) or "Event loop is closed" in str(e):
-                logger.log_system("이벤트 루프가 닫혀 있어 텔레그램 봇 준비 상태를 확인할 수 없습니다.", level="WARNING")
-                return False
-            raise
-        except Exception as e:
-            logger.log_error(e, "텔레그램 봇 준비 대기 중 오류 발생")
-            return False
-    
-    # 명령어 핸들러들
-    async def get_status(self, args: List[str]) -> str:
-        """시스템 상태 조회"""
-        status = db.get_system_status()
-        
-        # 시간 형식 개선 - 날짜 확인 및 현재 시간 사용
-        updated_at = status['updated_at']
-        try:
-            # 시간 문자열 파싱 및 포매팅
-            if updated_at:
-                from datetime import datetime
-                # DB에서 가져온 시간이 이상한 경우, 현재 시간으로 대체
-                try:
-                    dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
-                    # 날짜가 미래이거나 2025년 이전인 경우 현재 시간으로 대체
-                    now = datetime.now()
-                    if dt.year < 2025 or dt > now:
-                        dt = now
-                    updated_at = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    # 시간 형식이 잘못된 경우 현재 시간으로 대체
-                    updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                # updated_at이 없는 경우 현재 시간 사용
-                updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            # 파싱 에러 발생 시 현재 시간 사용
-            from datetime import datetime
-            updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logger.log_error(e, "시스템 상태 시간 파싱 실패")
-        
-        # 상태에 따른 이모지 결정
-        status_emoji = "✅" if status['status'] == "RUNNING" else "⚠️" if status['status'] == "PAUSED" else "❌"
-        
-        # 현재 시간 표시 추가
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 거래 건수와 포지션 가져오기
-        today_orders_count = len(await order_manager.get_today_orders())
-        positions_count = len(await order_manager.get_positions())
-        
-        return f"""<b>📊 시스템 상태</b>
-
-상태: {status_emoji} <b>{status['status']}</b>
-마지막 업데이트: {updated_at}
-현재 시간: {current_time}
-거래 일시정지: {'⚠️ 활성화' if self.trading_paused else '✅ 비활성화'}
-
-<b>성능 요약</b>
-금일 거래: {today_orders_count}건
-보유 포지션: {positions_count}개"""
-    
-    async def get_help(self, args: List[str]) -> str:
-        """도움말"""
-        return """<b>📝 사용 가능한 명령어</b>
-
-<b>조회 명령어</b>
-/status - 시스템 상태 조회
-/positions - 보유 종목 조회
-/balance - 계좌 잔고 조회
-/performance - 성과 조회
-/price - 종목 현재가 조회
-/trades - 최근 거래 내역 조회 (예시: /trades 005930 10)
-
-<b>거래 명령어</b>
-/buy - 종목 매수 (예시: /buy 005930 10)
-/sell - 종목 매도 (예시: /sell 005930 10)
-/close_all - 모든 포지션 청산
-/scan - 종목 탐색 실행
-
-<b>제어 명령어</b>
-/pause - 자동 거래 일시정지
-/resume - 자동 거래 재개
-/stop - 프로그램 종료
-/help - 도움말"""
-    
-    async def buy_stock(self, args: List[str]) -> str:
-        """종목 매수"""
-        if len(args) < 2:
-            return "사용법: /buy 종목코드 수량"
-        
-        symbol = args[0]
-        try:
-            quantity = int(args[1])
-        except ValueError:
-            return "수량은 숫자여야 합니다."
-        
-        if self.trading_paused:
-            return "⚠️ 거래가 일시정지되었습니다. /resume으로 재개하세요."
-        
-        # 현재가 조회
-        stock_info = await stock_explorer.get_symbol_info(symbol)
-        if not stock_info:
-            return f"❌ {symbol} 종목 정보를 조회할 수 없습니다."
-        
-        price = stock_info.get("current_price", 0)
-        if price <= 0:
-            return f"❌ {symbol} 종목의 가격을 조회할 수 없습니다."
-        
-        result = await order_manager.place_order(
-            symbol=symbol,
-            side="BUY",
-            quantity=quantity,
-            price=price,
-            order_type="MARKET",
-            reason="user_request_telegram"  # 사용자 요청으로 인한 주문임을 명시
-        )
-        
-        if result and result.get("status") == "success":
-            order_no = result.get("order_id", "알 수 없음")
-            trade_data = result.get("trade_data", {})
-            total_amount = price * quantity
-            
-            # 기존 포지션 정보 가져오기
-            positions = await order_manager.get_positions()
-            position = next((p for p in positions if p["symbol"] == symbol), None)
-            avg_price = position["avg_price"] if position else price
-            total_quantity = position["quantity"] if position else quantity
-            
-            return f"""
-<b>💰 매수 주문 성공</b>
-종목: {symbol} ({stock_info.get('name', symbol)})
-수량: {quantity}주
-체결가: {price:,}원
-총액: {total_amount:,}원
-주문번호: {order_no}
-
-<b>포지션 정보</b>
-평균단가: {avg_price:,}원
-총보유수량: {total_quantity}주
-예상수수료: {trade_data.get('commission', total_amount * 0.0005):,.0f}원
-            """
-        else:
-            error = result.get("reason", "알 수 없는 오류") if result else "API 호출 실패"
-            return f"❌ <b>매수 주문 실패</b>\n{symbol} 매수 실패: {error}"
-    
-    async def sell_stock(self, args: List[str]) -> str:
-        """종목 매도"""
-        if len(args) < 2:
-            return "사용법: /sell 종목코드 수량"
-        
-        symbol = args[0]
-        try:
-            quantity = int(args[1])
-        except ValueError:
-            return "수량은 숫자여야 합니다."
-        
-        if self.trading_paused:
-            return "⚠️ 거래가 일시정지되었습니다. /resume으로 재개하세요."
-            
-        # 보유 수량 확인
-        positions = await order_manager.get_positions()
-        position = next((p for p in positions if p["symbol"] == symbol), None)
-        
-        if not position:
-            return f"❌ {symbol} 종목을 보유하고 있지 않습니다."
-            
-        if position["quantity"] < quantity:
-            return f"❌ 보유 수량({position['quantity']}주)보다 많은 수량({quantity}주)을 매도할 수 없습니다."
-        
-        # 현재가 조회
-        stock_info = await stock_explorer.get_symbol_info(symbol)
-        if not stock_info:
-            return f"❌ {symbol} 종목 정보를 조회할 수 없습니다."
-        
-        price = stock_info.get("current_price", 0)
-        
-        result = await order_manager.place_order(
-            symbol=symbol,
-            side="SELL",
-            quantity=quantity,
-            price=price,
-            order_type="MARKET",
-            reason="user_request_telegram"  # 사용자 요청으로 인한 주문임을 명시
-        )
-        
-        if result and result.get("status") == "success":
-            order_no = result.get("order_id", "알 수 없음")
-            trade_data = result.get("trade_data", {})
-            total_amount = price * quantity
-            
-            # 매도 후 포지션 정보 가져오기
-            positions = await order_manager.get_positions()
-            position = next((p for p in positions if p["symbol"] == symbol), None)
-            remaining = position["quantity"] if position else 0
-            
-            # 손익 계산
-            avg_buy_price = position["avg_price"] if position else 0
-            pnl = trade_data.get("pnl", (price - avg_buy_price) * quantity)
-            pnl_percent = ((price / avg_buy_price) - 1) * 100 if avg_buy_price > 0 else 0
-            
-            # 이모지 결정
-            emoji = "🔴" if pnl < 0 else "🟢"
-            
-            return f"""
-<b>💰 매도 주문 성공</b>
-종목: {symbol} ({stock_info.get('name', symbol)})
-수량: {quantity}주
-체결가: {price:,}원
-총액: {total_amount:,}원
-주문번호: {order_no}
-
-<b>거래 결과</b>
-손익: {emoji} {pnl:,.0f}원 ({pnl_percent:.2f}%)
-남은수량: {remaining}주
-예상수수료: {trade_data.get('commission', total_amount * 0.0005):,.0f}원
-            """
-        else:
-            error = result.get("reason", "알 수 없는 오류") if result else "API 호출 실패"
-            return f"❌ <b>매도 주문 실패</b>\n{symbol} 매도 실패: {error}"
-    
-    async def get_positions(self, args: List[str]) -> str:
-        """보유 종목 조회"""
-        positions = await order_manager.get_positions()
-        
-        if not positions:
-            return "현재 보유 중인 종목이 없습니다."
-        
-        result = "<b>현재 보유 종목</b>\n\n"
-        
-        total_value = 0
-        for pos in positions:
-            symbol = pos["symbol"]
-            quantity = pos["quantity"]
-            
-            # 종목 정보 조회
-            stock_info = await stock_explorer.get_symbol_info(symbol)
-            name = stock_info.get("name", symbol) if stock_info else symbol
-            current_price = stock_info.get("current_price", 0) if stock_info else 0
-            
-            # 매수 금액 및 현재 평가 금액
-            avg_price = pos.get("avg_price", 0)
-            buy_amount = avg_price * quantity
-            eval_amount = current_price * quantity
-            
-            # 손익
-            pnl = eval_amount - buy_amount
-            pnl_pct = (pnl / buy_amount) * 100 if buy_amount > 0 else 0
-            
-            # 이모지 결정
-            emoji = "🔴" if pnl < 0 else "🟢"
-            
-            result += f"{emoji} <b>{name}</b> ({symbol})\n"
-            result += f"   수량: {quantity}주\n"
-            result += f"   평균단가: {avg_price:,.0f}원\n"
-            result += f"   현재가: {current_price:,.0f}원\n"
-            result += f"   손익: {pnl:,.0f}원 ({pnl_pct:.2f}%)\n"
-            result += f"   평가금액: {eval_amount:,.0f}원\n\n"
-            
-            total_value += eval_amount
-        
-        result += f"<b>총 평가금액: {total_value:,.0f}원</b>"
-        return result
-    
-    async def get_balance(self, args: List[str]) -> str:
-        """계좌 잔고 조회"""
-        try:
-            balance_data = await order_manager.get_account_balance()
-            
-            # 데이터 형식 로깅하여 확인
-            logger.log_system(f"계좌 잔고 데이터 형식: {type(balance_data)}, 데이터: {balance_data}")
-            
-            if not balance_data:
-                return "❌ 계좌 잔고를 조회할 수 없습니다."
-            
-            # 리스트인 경우 처리
-            if isinstance(balance_data, list):
-                if not balance_data:
-                    return "❌ 계좌 잔고 정보가 비어 있습니다."
-                    
-                # 첫 번째 항목을 사용
-                first_item = balance_data[0]
-                if isinstance(first_item, dict):
-                    total_balance = float(first_item.get("tot_evlu_amt", "0"))
-                    deposit = float(first_item.get("dnca_tot_amt", "0"))
-                    stock_value = float(first_item.get("scts_evlu_amt", "0"))
-                    available = float(first_item.get("nass_amt", "0"))
-                else:
-                    return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {first_item}"
-            # 딕셔너리인 경우 처리
-            elif isinstance(balance_data, dict):
-                # output1이 비어있거나 리스트인 경우 output2 확인
-                output1 = balance_data.get("output1", {})
-                output2 = balance_data.get("output2", [])
-                
-                if (not output1 or isinstance(output1, list) and not output1) and output2 and isinstance(output2, list) and len(output2) > 0:
-                    # output2의 첫 번째 항목 사용
-                    first_item = output2[0]
-                    if isinstance(first_item, dict):
-                        total_balance = float(first_item.get("tot_evlu_amt", "0"))
-                        deposit = float(first_item.get("dnca_tot_amt", "0"))
-                        stock_value = float(first_item.get("scts_evlu_amt", "0"))
-                        available = float(first_item.get("nass_amt", "0"))
-                    else:
-                        return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {first_item}"
-                else:
-                    # 기존 코드 - output1에서 시도
-                    if isinstance(output1, dict):
-                        total_balance = float(output1.get("tot_evlu_amt", "0"))
-                        deposit = float(output1.get("dnca_tot_amt", "0"))
-                        stock_value = float(output1.get("scts_evlu_amt", "0"))
-                        available = float(output1.get("nass_amt", "0"))
-                    else:
-                        return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {output1}"
-            else:
-                return f"❌ 계좌 잔고 데이터 형식이 예상과 다릅니다: {type(balance_data)}"
-            
-            return f"""
-<b>💵 계좌 잔고 정보</b>
-
-총 평가금액: {total_balance:,.0f}원
-예수금: {deposit:,.0f}원
-주식 평가금액: {stock_value:,.0f}원
-매수 가능금액: {available:,.0f}원
-"""
-        except Exception as e:
-            logger.log_error(e, "계좌 잔고 조회 중 오류 발생")
-            return f"❌ 계좌 잔고 조회 중 오류 발생: {str(e)}"
-    
-    async def get_performance(self, args: List[str]) -> str:
-        """성과 조회"""
-        today_orders = await order_manager.get_today_orders()
-        
-        if not today_orders:
-            return "오늘의 거래 내역이 없습니다."
-        
-        buy_orders = [o for o in today_orders if o["side"] == "BUY"]
-        sell_orders = [o for o in today_orders if o["side"] == "SELL"]
-        
-        total_buy = sum(o["price"] * o["quantity"] for o in buy_orders)
-        total_sell = sum(o["price"] * o["quantity"] for o in sell_orders)
-        
-        # 간단한 손익 계산 (정확한 계산은 아님)
-        realized_pnl = total_sell - total_buy
-        
-        result = f"""
-<b>📈 오늘의 거래 성과</b>
-
-총 거래: {len(today_orders)}건
-- 매수: {len(buy_orders)}건 (₩{total_buy:,.0f})
-- 매도: {len(sell_orders)}건 (₩{total_sell:,.0f})
-
-잠정 손익: {realized_pnl:,.0f}원
-"""
-        
-        # 개별 종목 성과 계산
-        symbols = set([o["symbol"] for o in today_orders])
-        
-        if symbols:
-            result += "\n<b>종목별 거래</b>\n"
-            
-            for symbol in symbols:
-                symbol_orders = [o for o in today_orders if o["symbol"] == symbol]
-                symbol_buys = [o for o in symbol_orders if o["side"] == "BUY"]
-                symbol_sells = [o for o in symbol_orders if o["side"] == "SELL"]
-                
-                symbol_buy_amount = sum(o["price"] * o["quantity"] for o in symbol_buys)
-                symbol_sell_amount = sum(o["price"] * o["quantity"] for o in symbol_sells)
-                
-                symbol_pnl = symbol_sell_amount - symbol_buy_amount
-                pnl_emoji = "🔴" if symbol_pnl < 0 else "🟢"
-                
-                result += f"{pnl_emoji} {symbol}: {symbol_pnl:,.0f}원\n"
-        
-        return result
-    
-    async def scan_symbols(self, args: List[str]) -> str:
-        """종목 탐색 수동 실행"""
-        market_type = args[0].upper() if args and args[0].upper() in ["KOSPI", "KOSDAQ", "ALL"] else "ALL"
-        
-        await self._send_message(f"🔍 {market_type} 시장 종목 스캔을 시작합니다. 이 작업은 시간이 걸릴 수 있습니다...")
-        
-        try:
-            symbols = await stock_explorer.get_tradable_symbols(market_type=market_type)
-            
-            if not symbols:
-                return "❌ 거래 가능한 종목을 찾을 수 없습니다."
-            
-            # 전략 업데이트
-            if hasattr(combined_strategy, 'update_symbols'):
-                await combined_strategy.update_symbols(symbols[:50])
-            
-            result = f"✅ *종목 스캔 완료*\n\n{len(symbols)}개의 종목을 찾았습니다.\n\n"
-            
-            # 상위 10개 종목 표시
-            result += "*상위 10개 종목*\n"
-            
-            for i, symbol in enumerate(symbols[:10], 1):
-                stock_info = await stock_explorer.get_symbol_info(symbol)
-                name = stock_info.get("name", symbol) if stock_info else symbol
-                result += f"{i}. {name} ({symbol})\n"
-            
-            return result
-            
-        except Exception as e:
-            logger.log_error(e, "종목 스캔 오류")
-            return f"❌ 종목 스캔 중 오류 발생: {str(e)}"
-    
-    async def stop_bot(self, args: List[str]) -> str:
-        """프로그램 종료"""
-        # 확인 요청
-        if not args or not args[0] == "confirm":
-            return "⚠️ 정말로 트레이딩 봇을 종료하시겠습니까? 확인하려면 <code>/stop confirm</code>을 입력하세요."
-        
-        await self._send_message("🛑 <b>트레이딩 봇을 종료합니다...</b>")
-        
-        # 콜백이 없어도 자체적으로 종료 처리
-        if self.shutdown_callback is None:
-            logger.log_system("종료 콜백이 설정되지 않았습니다. 직접 종료 처리를 시도합니다.", level="WARNING")
-            # 직접 종료 처리 시도
-            asyncio.create_task(self._direct_shutdown())
-        else:
-            # 비동기로 종료 처리
-            asyncio.create_task(self._shutdown_bot())
-        
-        return None  # 이미 메시지를 보냈으므로 추가 메시지 필요 없음
-        
-    async def _direct_shutdown(self):
-        """콜백 없이 직접 종료 처리"""
-        # 필요한 모듈 임포트
-        import os
-        import sys
-        
-        logger.log_system("직접 종료 처리 시작", level="INFO")
-        # 잠시 대기 후 종료 (메시지 전송 시간 확보)
-        await asyncio.sleep(2)
-        self.bot_running = False
-        
-        # 세션 정리 (새 메시지 전송 방지)
-        try:
-            if self._session and not self._session.closed:
-                await self._session.close()
-                self._session = None
-                logger.log_system("텔레그램 세션 정상 종료", level="INFO")
-        except Exception as e:
-            logger.log_error(e, "텔레그램 세션 종료 중 오류")
         
         # DB에 상태 업데이트
         try:
@@ -1408,6 +636,291 @@ class TelegramBotHandler:
 
 {f'종목코드 {symbol}의 ' if symbol else ''}최근 {len(trades)}건 표시 (최대 {limit}건)"""
 
+    async def get_balance(self, args: List[str]) -> str:
+        """계좌 잔고 조회"""
+        try:
+            # 안전한 숫자 변환 함수 정의 (다른 메서드에서 참조할 수 있으므로 최상단에 위치)
+            def safe_float(value, default=0.0):
+                """문자열을 실수로 안전하게 변환"""
+                try:
+                    return float(value) if value else default
+                except (ValueError, TypeError):
+                    return default
+                    
+            # 실제 API 호출 시도
+            account_info = await api_client.get_account_info()
+            
+            # API 응답 결과 로깅 (디버깅용)
+            logger.log_system(f"API 계좌 응답 코드: {account_info.get('rt_cd', 'N/A')}")
+            logger.log_system(f"API 계좌 응답 메시지: {account_info.get('msg1', 'N/A')}")
+            
+            # output, output1, output2 모두 확인
+            output_data = account_info.get("output", {})
+            
+            # output이 없으면 output1 확인
+            if not output_data and "output1" in account_info:
+                output_data = account_info.get("output1", {})
+            
+            # output2가 있는지 확인 (예수금 정보는 여기에 있을 수 있음)
+            output2_data = None
+            if "output2" in account_info and isinstance(account_info["output2"], list) and account_info["output2"]:
+                output2_data = account_info["output2"][0]  # 첫 번째 항목 사용
+                logger.log_system(f"output2 데이터 발견: {output2_data}")
+            
+            # 주요 계좌 데이터 로깅
+            if output_data:
+                logger.log_system(f"API 계좌 정보 output 키: {list(output_data.keys() if output_data else [])}")
+                logger.log_system(f"dnca_tot_amt: {output_data.get('dnca_tot_amt', 'N/A')}")
+                logger.log_system(f"tot_evlu_amt: {output_data.get('tot_evlu_amt', 'N/A')}")
+            
+            if output2_data:
+                logger.log_system(f"output2 dnca_tot_amt: {output2_data.get('dnca_tot_amt', 'N/A')}")
+            
+            # API 응답 성공 시 데이터 추출 및 형식화
+            if account_info.get("rt_cd") == "0":
+                # 데이터 준비
+                main_data = output_data if output_data else {}
+                cash_data = output2_data if output2_data else {}
+                
+                if not main_data and not cash_data:
+                    # "조회할 내용이 없습니다" 메시지일 때 기본 응답
+                    if account_info.get("msg1") == "조회할 내용이 없습니다":
+                        return "💰 계좌 정보 (실시간)\n\n계좌에 잔고나 주식이 없습니다.\n총 평가금액: 0원\n예수금: 0원"
+                    return "💰 계좌 정보 (실시간)\n\n계좌 정보가 없습니다."
+                
+                # 계좌 잔고 정보 추출 (output 또는 output2에서)
+                deposit = safe_float(main_data.get("dnca_tot_amt") or cash_data.get("dnca_tot_amt", 0))  # 예수금
+                total_assets = safe_float(main_data.get("tot_evlu_amt", 0))  # 총 평가금액
+                securities = safe_float(main_data.get("scts_evlu_amt", 0))  # 유가증권 평가금액
+                today_profit = safe_float(main_data.get("thdt_evlu_pfls_amt", 0))  # 금일 평가손익
+                total_profit = safe_float(main_data.get("evlu_pfls_smtl_amt", 0))  # 평가손익 합계금액
+                
+                # 출금 가능 금액 (실시간으로 중요한 정보)
+                withdrawable_amount = safe_float(main_data.get("psbl_wtdrw_amt") or cash_data.get("prvs_rcdl_excc_amt", 0))
+                
+                # 총 평가금액 정보가 없는 경우 예수금을 총 평가금액으로 설정
+                if total_assets == 0:
+                    total_assets = deposit
+                
+                # 형식화된 메시지 생성
+                message = (
+                    f"💰 계좌 정보 (실시간)\n\n"
+                    f"총 평가금액: {total_assets:,.0f}원\n"
+                )
+                
+                if securities > 0:
+                    message += f"유가증권: {securities:,.0f}원\n"
+                
+                message += f"예수금: {deposit:,.0f}원\n"
+                
+                if withdrawable_amount > 0:
+                    message += f"출금가능금액: {withdrawable_amount:,.0f}원\n"
+                
+                if today_profit != 0:
+                    message += f"금일 손익: {today_profit:,.0f}원\n"
+                
+                if total_profit != 0:
+                    message += f"총 손익: {total_profit:,.0f}원"
+                
+                # 오늘 수익률 계산 시도
+                try:
+                    if securities > 0 and today_profit != 0:
+                        today_profit_rate = today_profit / (securities - today_profit) * 100
+                        message += f"\n금일 수익률: {today_profit_rate:.2f}%"
+                    
+                    if securities > 0 and total_profit != 0:
+                        total_profit_rate = total_profit / (securities - total_profit) * 100
+                        message += f"\n총 수익률: {total_profit_rate:.2f}%"
+                except Exception as e:
+                    logger.log_system(f"수익률 계산 중 오류: {str(e)}")
+                
+                return message
+            else:
+                # API 요청 실패 시 에러 메시지 반환
+                error_message = account_info.get("msg1", "알 수 없는 오류") if account_info else "API 응답 없음"
+                logger.log_system(f"계좌 정보 조회 실패: {error_message}", level="ERROR")
+                return f"❌ 계좌 정보 조회 실패: {error_message}\n상세 내용은 로그를 확인하세요."
+        
+        except Exception as e:
+            # 예외 발생 시 에러 메시지 반환
+            error_detail = traceback.format_exc()
+            logger.log_error(e, f"계좌 잔고 조회 중 예외 발생: {error_detail}")
+            return f"❌ 계좌 정보 조회 중 오류 발생: {str(e)}"
+    
+    async def get_performance(self, args: List[str]) -> str:
+        """성과 지표 조회"""
+        try:
+            # 기간 설정 (기본: 7일)
+            days = 7
+            if args and args[0].isdigit():
+                days = min(int(args[0]), 30)  # 최대 30일
+            
+            # 시작 날짜 계산
+            start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # 거래 내역 조회
+            trades = db.get_trades(start_date=start_date, end_date=f"{end_date} 23:59:59")
+            
+            if not trades:
+                return f"📊 <b>성과 지표</b>\n\n최근 {days}일간 거래 내역이 없습니다."
+            
+            # 통계 계산
+            total_trades = len(trades)
+            buy_trades = sum(1 for t in trades if t.get("side") == "BUY")
+            sell_trades = sum(1 for t in trades if t.get("side") == "SELL")
+            
+            # 수익/손실 계산
+            total_pnl = sum(t.get("pnl", 0) or 0 for t in trades if t.get("side") == "SELL")
+            
+            # 승률 계산
+            win_trades = sum(1 for t in trades if t.get("side") == "SELL" and (t.get("pnl", 0) or 0) > 0)
+            loss_trades = sum(1 for t in trades if t.get("side") == "SELL" and (t.get("pnl", 0) or 0) < 0)
+            
+            win_rate = win_trades / sell_trades * 100 if sell_trades > 0 else 0
+            
+            # 일평균 거래 횟수
+            avg_trades_per_day = total_trades / days
+            
+            # 평균 수익/손실
+            avg_pnl = total_pnl / sell_trades if sell_trades > 0 else 0
+            
+            # 수익/손실 이모지
+            pnl_emoji = "🔴" if total_pnl < 0 else "🟢" if total_pnl > 0 else "⚪"
+            
+            return f"""📊 <b>성과 지표 (최근 {days}일)</b>
+
+<b>총 거래 횟수:</b> {total_trades}회 (매수: {buy_trades}, 매도: {sell_trades})
+<b>일평균 거래:</b> {avg_trades_per_day:.1f}회
+
+<b>총 손익:</b> {pnl_emoji} {total_pnl:,.0f}원
+<b>평균 손익:</b> {pnl_emoji} {avg_pnl:,.0f}원/거래
+
+<b>승률:</b> {win_rate:.1f}% ({win_trades}/{sell_trades})
+<b>기간:</b> {start_date} ~ {end_date}
+"""
+        except Exception as e:
+            logger.log_error(e, "성과 지표 조회 오류")
+            return f"❌ <b>성과 지표 조회 중 오류 발생</b>\n{str(e)}"
+    
+    async def get_help(self, args: List[str]) -> str:
+        """도움말"""
+        return """🤖 <b>트레이딩 봇 명령어 도움말</b>
+
+<b>기본 명령어:</b>
+/status - 시스템 상태 확인
+/scan [KOSPI|KOSDAQ] - 거래 가능 종목 스캔
+
+<b>계좌 및 거래:</b>
+/balance - 계좌 잔고 조회
+/positions - 보유 종목 조회
+/trades [숫자] - 최근 거래 내역 조회 (기본값: 5개)
+/performance [일수] - 성과 지표 조회 (기본값: 7일)
+
+<b>매매 명령어:</b>
+/buy 종목코드 수량 [가격] - 종목 매수
+/sell 종목코드 수량 [가격] - 종목 매도
+/price 종목코드 - 종목 현재가 조회
+/close_all confirm - 모든 포지션 청산 (confirm 필수)
+
+<b>시스템 제어:</b>
+/pause - 자동 거래 일시 중지
+/resume - 자동 거래 재개
+/stop - 프로그램 종료
+"""
+
+    async def scan_symbols(self, args: List[str]) -> str:
+        """거래 가능 종목 스캔
+        사용법: /scan [KOSPI|KOSDAQ]
+        """
+        # 스캔 시작 메시지 전송
+        await self._send_message("🔍 종목 스캔 중... 잠시만 기다려주세요.")
+        
+        try:
+            # 인자 처리 (KOSPI/KOSDAQ)
+            market = None
+            if args and args[0].upper() in ["KOSPI", "KOSDAQ"]:
+                market = args[0].upper()
+                
+            # 종목 스캔 실행
+            logger.log_system(f"텔레그램 명령(/scan)으로 종목 스캔 시작 - 시장: {market or '전체'}")
+            
+            # 토큰 유효성 확인 - 비동기 메소드 사용
+            is_valid = await api_client.is_token_valid(min_hours=1.0)
+            if is_valid:
+                logger.log_system("텔레그램 스캔 명령어: 기존 토큰이 유효합니다. 토큰 재발급 없이 진행합니다.")
+            else:
+                logger.log_system("텔레그램 스캔 명령어: 토큰이 없거나 곧 만료됩니다. 토큰 발급을 진행합니다.")
+                # 토큰 발급 요청
+                await api_client.ensure_token()
+            
+            # stock_explorer를 통해 종목 스캔
+            top_volume_symbols = await stock_explorer.get_top_volume_stocks(market=market, limit=20)
+            
+            if not top_volume_symbols:
+                return "❌ <b>종목 스캔 실패</b>\n\n거래량 상위 종목을 찾을 수 없습니다."
+            
+            # 스캔 결과 포맷팅
+            symbols_text = ""
+            for idx, symbol_info in enumerate(top_volume_symbols, 1):
+                symbol = symbol_info.get("symbol", "N/A")
+                name = symbol_info.get("name", "N/A")
+                volume = symbol_info.get("volume", 0)
+                price = symbol_info.get("current_price", 0)
+                change_rate = symbol_info.get("change_rate", 0)
+                
+                # 상승/하락 이모지
+                emoji = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
+                
+                # 한 종목에 대한 텍스트
+                symbols_text += f"{idx}. <b>{name}</b> ({symbol}) - {emoji} {change_rate:.2f}%\n"
+                symbols_text += f"   가격: {price:,.0f}원 | 거래량: {volume:,}주\n\n"
+            
+            # 결과 메시지 구성 
+            result = f"""📊 <b>거래량 상위 종목 스캔 결과</b>{f' ({market})' if market else ''}
+
+{symbols_text}
+<b>거래 방법</b>: /buy 종목코드 수량 [가격]
+
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 기준
+"""
+            
+            # 스캔 종료 로그
+            logger.log_system(f"텔레그램 종목 스캔 완료 - {len(top_volume_symbols)}개 종목 발견")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.log_error(e, "텔레그램 종목 스캔 중 오류 발생")
+            return f"❌ <b>종목 스캔 중 오류 발생</b>\n\n{error_msg}"
+
+    async def stop_bot(self, args: List[str]) -> str:
+        """봇 종료"""
+        # 확인 요청
+        if not args or not args[0] == "confirm":
+            return "⚠️ <b>시스템 종료 확인</b>\n\n정말로 시스템을 종료하시겠습니까? 확인하려면 <code>/stop confirm</code>을 입력하세요."
+            
+        # 종료 확인
+        logger.log_system("텔레그램 명령으로 시스템 종료 요청 수신됨", level="INFO")
+        
+        # 종료 메시지 전송
+        response = "🔴 <b>시스템을 종료합니다...</b>\n\n잠시 후 시스템이 완전히 종료됩니다."
+        await self._send_message(response)
+        
+        # 시스템 상태 업데이트
+        try:
+            db.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
+            logger.log_system("시스템 상태를 '종료됨'으로 업데이트", level="INFO")
+        except Exception as e:
+            logger.log_error(e, "상태 업데이트 중 오류")
+        
+        # 봇 종료 프로세스 시작 - 비동기로 실행
+        asyncio.create_task(self._shutdown_bot())
+        
+        # 종료 메시지 반환 (이것은 실제로 전송되지 않을 수 있음)
+        return response
+
     async def close_session(self):
         """세션 명시적 종료 메소드 - 프로그램 종료 전 호출용"""
         logger.log_system("텔레그램 봇 세션 명시적 종료 요청 받음...")
@@ -1426,6 +939,241 @@ class TelegramBotHandler:
         except Exception as e:
             logger.log_error(e, "텔레그램 봇 세션 종료 중 오류")
             return False
+
+    def is_ready(self) -> bool:
+        """봇이 준비되었는지 확인"""
+        return self.ready_event.is_set()
+
+    async def get_status(self, args: List[str]) -> str:
+        """시스템 상태 조회"""
+        try:
+            # 통합 전략 상태
+            strategy_status = combined_strategy.get_strategy_status()
+            
+            # 시스템 상태
+            system_status = db.get_system_status()
+            status = system_status.get("status", "UNKNOWN")
+            status_emoji = {
+                "RUNNING": "✅",
+                "PAUSED": "⚠️",
+                "STOPPED": "❌",
+                "ERROR": "⚠️",
+                "INITIALIZING": "🔄"
+            }.get(status, "❓")
+            
+            # 포지션 수
+            positions_count = len(await order_manager.get_positions())
+            
+            # 잔고 정보
+            account_info = await api_client.get_account_info()
+            
+            # 안전하게 잔고 정보 추출
+            try:
+                balance_value = 0
+                if account_info and account_info.get("rt_cd") == "0":
+                    balance_str = account_info.get("output", {}).get("dnca_tot_amt", "0")
+                    if balance_str and balance_str != "N/A":
+                        balance_value = float(balance_str)
+                balance = f"{int(balance_value):,}"
+            except (ValueError, TypeError):
+                logger.log_error(Exception("잔고 정보 변환 오류"), "잔고 정보를 숫자로 변환하는 중 오류 발생")
+                balance = "0"
+            
+            # API 상태
+            api_status = "🟢 정상" if await api_client.is_token_valid() else "🔴 오류"
+            
+            # 웹소켓 상태
+            from core.websocket_client import ws_client
+            ws_status = "🟢 연결됨" if ws_client.is_connected() else "🔴 끊김"
+            
+            # 실행 시간
+            uptime = datetime.now() - db.get_start_time()
+            hours, remainder = divmod(uptime.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime_str = f"{int(hours)}시간 {int(minutes)}분"
+            
+            return f"""📊 <b>시스템 상태</b>
+
+{status_emoji} 상태: <b>{status}</b>
+⏱ 실행 시간: {uptime_str}
+💰 계좌 잔고: {balance}원
+📈 포지션: {positions_count}개
+🔌 API: {api_status}
+🌐 웹소켓: {ws_status}
+
+<b>전략 정보:</b>
+- 실행 중: {'✅' if strategy_status.get('running', False) else '❌'}
+- 일시 중지: {'⚠️' if strategy_status.get('paused', False) else '✅'}
+- 감시 중인 종목: {strategy_status.get('symbols', 0)}개
+"""
+        except Exception as e:
+            logger.log_error(e, "상태 조회 오류")
+            return f"❌ <b>상태 조회 중 오류 발생</b>\n{str(e)}"
+    
+    async def buy_stock(self, args: List[str]) -> str:
+        """주식 매수"""
+        if len(args) < 2:
+            return "사용법: /buy 종목코드 수량 [가격]"
+            
+        symbol = args[0]
+        
+        try:
+            quantity = int(args[1])
+            if quantity <= 0:
+                return "❌ 수량은 양수여야 합니다."
+        except ValueError:
+            return "❌ 올바른 수량을 입력하세요."
+        
+        price = 0  # 시장가 주문
+        if len(args) >= 3:
+            try:
+                price = float(args[2])
+            except ValueError:
+                return "❌ 올바른 가격을 입력하세요."
+        
+        # 현재가 조회
+        if price == 0:
+            try:
+                stock_info = await stock_explorer.get_symbol_info(symbol)
+                if stock_info:
+                    price = stock_info.get("current_price", 0)
+            except Exception as e:
+                logger.log_error(e, f"현재가 조회 실패: {symbol}")
+        
+        # 주문 실행
+        order_type = "LIMIT" if price > 0 else "MARKET"
+        result = await order_manager.place_order(
+            symbol=symbol,
+            side="BUY",
+            quantity=quantity,
+            price=price,
+            order_type=order_type,
+            reason="telegram_command"
+        )
+        
+        if result and result.get("status") == "success":
+            order_id = result.get("order_id", "N/A")
+            return f"""✅ <b>매수 주문 성공</b>
+
+종목: {symbol}
+수량: {quantity}주
+가격: {price:,.0f}원
+타입: {order_type}
+주문번호: {order_id}"""
+        else:
+            error = result.get("message", "알 수 없는 오류") if result else "주문 실패"
+            return f"❌ <b>매수 주문 실패</b>\n{error}"
+    
+    async def sell_stock(self, args: List[str]) -> str:
+        """주식 매도"""
+        if len(args) < 2:
+            return "사용법: /sell 종목코드 수량 [가격]"
+            
+        symbol = args[0]
+        
+        try:
+            quantity = int(args[1])
+            if quantity <= 0:
+                return "❌ 수량은 양수여야 합니다."
+        except ValueError:
+            return "❌ 올바른 수량을 입력하세요."
+        
+        price = 0  # 시장가 주문
+        if len(args) >= 3:
+            try:
+                price = float(args[2])
+            except ValueError:
+                return "❌ 올바른 가격을 입력하세요."
+        
+        # 현재가 조회
+        if price == 0:
+            try:
+                stock_info = await stock_explorer.get_symbol_info(symbol)
+                if stock_info:
+                    price = stock_info.get("current_price", 0)
+            except Exception as e:
+                logger.log_error(e, f"현재가 조회 실패: {symbol}")
+        
+        # 주문 실행
+        order_type = "LIMIT" if price > 0 else "MARKET"
+        result = await order_manager.place_order(
+            symbol=symbol,
+            side="SELL",
+            quantity=quantity,
+            price=price,
+            order_type=order_type,
+            reason="telegram_command"
+        )
+        
+        if result and result.get("status") == "success":
+            order_id = result.get("order_id", "N/A")
+            return f"""✅ <b>매도 주문 성공</b>
+
+종목: {symbol}
+수량: {quantity}주
+가격: {price:,.0f}원
+타입: {order_type}
+주문번호: {order_id}"""
+        else:
+            error = result.get("message", "알 수 없는 오류") if result else "주문 실패"
+            return f"❌ <b>매도 주문 실패</b>\n{error}"
+    
+    async def get_positions(self, args: List[str]) -> str:
+        """보유 포지션 조회"""
+        positions = await order_manager.get_positions()
+        
+        if not positions:
+            return "📊 <b>보유 종목 없음</b>\n\n현재 보유 중인 종목이 없습니다."
+        
+        positions_text = ""
+        total_value = 0
+        
+        for pos in positions:
+            symbol = pos.get("symbol", "N/A")
+            quantity = pos.get("quantity", 0)
+            avg_price = pos.get("avg_price", 0)
+            current_price = pos.get("current_price", 0)
+            
+            # 현재가가 없으면 API에서 조회
+            if current_price == 0:
+                try:
+                    stock_info = await stock_explorer.get_symbol_info(symbol)
+                    if stock_info:
+                        current_price = stock_info.get("current_price", 0)
+                except Exception:
+                    pass
+            
+            # 손익 계산
+            if avg_price > 0 and current_price > 0:
+                profit_pct = (current_price - avg_price) / avg_price * 100
+                profit_emoji = "🔴" if profit_pct < 0 else "🟢" if profit_pct > 0 else "⚪"
+            else:
+                profit_pct = 0
+                profit_emoji = "⚪"
+            
+            # 종목 총 가치
+            position_value = current_price * quantity
+            total_value += position_value
+            
+            # 종목명 가져오기
+            stock_name = "N/A"
+            try:
+                stock_info = await stock_explorer.get_symbol_info(symbol)
+                if stock_info:
+                    stock_name = stock_info.get("name", "N/A")
+            except Exception:
+                pass
+            
+            positions_text += f"{profit_emoji} <b>{symbol}</b> - {stock_name}\\n"
+            positions_text += f"   {quantity}주 | {avg_price:,.0f}원 → {current_price:,.0f}원 | {profit_pct:.2f}%\\n"
+            positions_text += f"   가치: {position_value:,.0f}원\\n\\n"
+        
+        return f"""📊 <b>보유 종목 현황</b>
+
+{positions_text}
+<b>총 자산 가치:</b> {total_value:,.0f}원
+<b>보유 종목 수:</b> {len(positions)}개
+"""
 
 # 싱글톤 인스턴스
 telegram_bot_handler = TelegramBotHandler() 

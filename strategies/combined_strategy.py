@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, time, timedelta
 from collections import deque
 import numpy as np
+import os
 
 from config.settings import config
 from core.api_client import api_client
@@ -37,7 +38,7 @@ class CombinedStrategy:
             "volume_weight": 0.15,      # 볼륨 스파이크 전략 가중치
             
             # 매매 신호 기준
-            "buy_threshold": 6.0,       # 매수 신호 임계값 (0~10)
+            "buy_threshold": 5.0,       # 매수 신호 임계값 (0~10) - 5.0으로 낮춤 (원래 6.0)
             "sell_threshold": 6.0,      # 매도 신호 임계값 (0~10)
             "min_agreement": 2,         # 최소 몇 개 전략이 일치해야 하는지
             
@@ -243,10 +244,24 @@ class CombinedStrategy:
             self.signals[symbol]['agreements'] = agreements
             
             # 로그 (신호 강도가 충분히 강한 경우에만)
-            if score >= 4.0:
+            if score >= 3.0:
                 logger.log_system(
                     f"Combined signal for {symbol}: {direction} (Score: {score:.2f}, "
                     f"Agreements: {agreements['BUY']}/{agreements['SELL']})"
+                )
+                
+                # trade.log에도 신호 기록
+                logger.log_trade(
+                    action="SIGNAL",
+                    symbol=symbol,
+                    price=0,
+                    quantity=0,
+                    reason=f"{direction} 신호 강도: {score:.1f}/10.0",
+                    score=f"{score:.1f}",
+                    direction=direction,
+                    buy_agreements=agreements['BUY'],
+                    sell_agreements=agreements['SELL'],
+                    time=datetime.now().strftime("%H:%M:%S")
                 )
             
         except Exception as e:
@@ -388,13 +403,78 @@ class CombinedStrategy:
             # 신호 계산
             score, direction, agreements = self._calculate_combined_signal(symbol)
             
+            # 매수/매도 기준값
+            buy_threshold = self.params["buy_threshold"]
+            sell_threshold = self.params["sell_threshold"]
+            min_agreement = self.params["min_agreement"]
+            
+            # 매수/매도 판단 정보 trade.log에 자세히 기록
+            strategies = self.signals[symbol]['strategies']
+            logger.log_trade(
+                action="BUY_EVALUATION",
+                symbol=symbol,
+                price=current_price,
+                quantity=0,
+                reason=f"매수 평가 - 점수: {score:.1f}/10.0, 임계값: {buy_threshold}, 방향: {direction}",
+                score=f"{score:.1f}",
+                threshold=f"{buy_threshold}",
+                direction=direction,
+                breakout=f"{strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']})",
+                momentum=f"{strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']})",
+                gap=f"{strategies['gap']['signal']:.1f}({strategies['gap']['direction']})",
+                vwap=f"{strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']})",
+                volume=f"{strategies['volume']['signal']:.1f}({strategies['volume']['direction']})",
+                time=datetime.now().strftime("%H:%M:%S")
+            )
+            
             # 매수 신호
-            if direction == "BUY" and score >= self.params["buy_threshold"]:
+            if direction == "BUY" and score >= buy_threshold:
+                logger.log_system(f"[BUY_SIGNAL] {symbol} - 점수 {score:.1f} >= 임계값 {buy_threshold} - 매수 신호 감지!")
                 await self._enter_position(symbol, "BUY", current_price, score, agreements)
             
             # 매도 신호
-            elif direction == "SELL" and score >= self.params["sell_threshold"]:
+            elif direction == "SELL" and score >= sell_threshold:
+                logger.log_system(f"[SELL_SIGNAL] {symbol} - 점수 {score:.1f} >= 임계값 {sell_threshold} - 매도 신호 감지!")
                 await self._enter_position(symbol, "SELL", current_price, score, agreements)
+            
+            # 매수/매도 조건 미충족 이유 로그 기록
+            else:
+                failure_reason = []
+                
+                # 점수 미달 여부 체크
+                if direction == "BUY" and score < buy_threshold:
+                    failure_reason.append(f"매수점수 미달 (목표: {buy_threshold:.1f}, 실제: {score:.1f})")
+                elif direction == "SELL" and score < sell_threshold:
+                    failure_reason.append(f"매도점수 미달 (목표: {sell_threshold:.1f}, 실제: {score:.1f})")
+                
+                # 방향성 중립 체크
+                if direction == "NEUTRAL":
+                    buy_count = agreements.get("BUY", 0)
+                    sell_count = agreements.get("SELL", 0)
+                    failure_reason.append(f"방향성 불명확 (매수동의: {buy_count}, 매도동의: {sell_count}, 최소필요: {min_agreement})")
+                
+                # 상세 로그를 system.log에 남김
+                if failure_reason:
+                    strategies = self.signals[symbol]['strategies']
+                    strategy_details = (
+                        f"전략별 점수: "
+                        f"브레이크아웃={strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']}), "
+                        f"모멘텀={strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']}), "
+                        f"갭={strategies['gap']['signal']:.1f}({strategies['gap']['direction']}), "
+                        f"VWAP={strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']}), "
+                        f"볼륨={strategies['volume']['signal']:.1f}({strategies['volume']['direction']})"
+                    )
+                    
+                    # 매수 조건 미달 정보를 system.log에 명확하게 기록
+                    detail_msg = f"[TRADE_ANALYSIS] {symbol} - {direction} 방향 - 종합점수: {score:.1f}, " + ", ".join(failure_reason)
+                    detail_msg += f" | 전략별 점수: BR={strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']}), "
+                    detail_msg += f"MM={strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']}), "
+                    detail_msg += f"GAP={strategies['gap']['signal']:.1f}({strategies['gap']['direction']}), "
+                    detail_msg += f"VWAP={strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']}), "
+                    detail_msg += f"VOL={strategies['volume']['signal']:.1f}({strategies['volume']['direction']})"
+                    
+                    # 시스템 로그에 직접 기록
+                    logger.log_system(detail_msg)
                 
         except Exception as e:
             logger.log_error(e, f"Error checking trade signals for {symbol}")
@@ -456,10 +536,26 @@ class CombinedStrategy:
                     "lowest_price": price if side == "SELL" else None
                 }
                 
+                # 시스템 로그에 매매 성공 기록
                 logger.log_system(
-                    f"Combined: Entered {side} position for {symbol} at {price}, "
-                    f"score: {score:.1f}, agreements: {sum(agreements.values())}, "
-                    f"stop: {stop_price}, target: {target_price}"
+                    f"[{side}_SUCCESS] {symbol} - {quantity}주 {price}원에 성공, "
+                    f"점수: {score:.1f}, 합의수: {sum(agreements.values())}, "
+                    f"손절가: {stop_price:.0f}, 익절가: {target_price:.0f}"
+                )
+                
+                # trade.log에도 매매 성공 기록
+                logger.log_trade(
+                    action=side,
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason=f"{side} 신호에 따른 매매 성공",
+                    score=f"{score:.1f}",
+                    position_id=position_id,
+                    stop_price=f"{stop_price:.0f}",
+                    target_price=f"{target_price:.0f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="SUCCESS"
                 )
                 
         except Exception as e:
@@ -645,6 +741,47 @@ class CombinedStrategy:
     async def update_symbols(self, new_symbols: List[str]):
         """관심 종목 업데이트"""
         try:
+            # 종목 스캔 시작 로그 (백엔드에 표시)
+            logger.log_system("=" * 50)
+            logger.log_system(f"🔍 종목 스캔 시작 - 통합 전략 update_symbols 호출")
+            logger.log_system("=" * 50)
+            
+            # 종목 스캔 시작 trade 로그 기록
+            logger.log_trade(
+                action="SYMBOL_SCAN_START",
+                symbol="SYSTEM",
+                price=0,
+                quantity=0,
+                reason=f"통합 전략 종목 스캔 시작",
+                scan_type="통합 전략",
+                time=datetime.now().strftime("%H:%M:%S"),
+                status="START"
+            )
+            
+            # 환경 변수 확인 - SKIP_WEBSOCKET이 설정되어 있는지 직접 확인
+            skip_websocket = os.environ.get('SKIP_WEBSOCKET', '').lower() in ('true', 't', '1', 'yes', 'y')
+            
+            # 스킵 여부 로그
+            if skip_websocket:
+                logger.log_system(f"⚠️ SKIP_WEBSOCKET=True 환경 변수 감지됨 - 웹소켓 연결 없이 종목 업데이트를 진행합니다.")
+            
+            if not new_symbols:
+                # 빈 종목 리스트인 경우 fail 로그
+                logger.log_system("⚠️ 업데이트할 관심 종목이 없습니다. 기존 종목 유지.")
+                logger.log_trade(
+                    action="SYMBOL_SCAN_FAILED",
+                    symbol="SYSTEM",
+                    price=0,
+                    quantity=0,
+                    reason=f"업데이트할 관심 종목이 없음",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="FAIL"
+                )
+                return
+                
+            logger.log_system(f"통합 전략 - 관심 종목 업데이트 시작: {len(new_symbols)}개 종목")
+            start_time = datetime.now()
+            
             # 새로운 종목 집합
             new_set = set(new_symbols)
             
@@ -654,45 +791,201 @@ class CombinedStrategy:
             # 새로 구독할 종목들 (새로운 목록에 있던 종목 중 기존에 없던 것)
             to_subscribe = new_set - self.watched_symbols
             
+            logger.log_system(f"구독 해제 대상: {len(to_unsubscribe)}개, 새로 구독 대상: {len(to_subscribe)}개")
+            
             # 구독 해제
             for symbol in to_unsubscribe:
-                await ws_client.unsubscribe(symbol, "price")
-                if symbol in self.price_data:
-                    del self.price_data[symbol]
-                if symbol in self.signals:
-                    del self.signals[symbol]
+                try:
+                    await ws_client.unsubscribe(symbol, "price")
+                    if symbol in self.price_data:
+                        del self.price_data[symbol]
+                    if symbol in self.signals:
+                        del self.signals[symbol]
+                except Exception as e:
+                    logger.log_error(e, f"Failed to unsubscribe from {symbol}")
+                    # 에러가 발생해도 계속 진행
             
-            # 새로 구독
-            for symbol in to_subscribe:
-                self.price_data[symbol] = deque(maxlen=100)
-                self.signals[symbol] = {
-                    'score': 0,
-                    'direction': "NEUTRAL",
-                    'strategies': {
-                        'breakout': {'signal': 0, 'direction': "NEUTRAL"},
-                        'momentum': {'signal': 0, 'direction': "NEUTRAL"},
-                        'gap': {'signal': 0, 'direction': "NEUTRAL"},
-                        'vwap': {'signal': 0, 'direction': "NEUTRAL"},
-                        'volume': {'signal': 0, 'direction': "NEUTRAL"}
-                    },
-                    'last_update': None
-                }
-                await ws_client.subscribe_price(symbol, self._handle_price_update)
+            # 새로 구독 (최대 세 개씩 처리하며 잠시 대기하여 서버 부하 감소)
+            subscribed_count = 0
+            failed_count = 0
+            batch_size = 3
             
-            # 개별 전략 업데이트
-            await breakout_strategy.update_symbols(new_symbols)
-            await momentum_strategy.update_symbols(new_symbols)
-            await gap_strategy.update_symbols(new_symbols)
-            await vwap_strategy.update_symbols(new_symbols)
-            await volume_strategy.update_symbols(new_symbols)
+            # 종목을 batch_size 단위로 나누어 처리
+            for i in range(0, len(to_subscribe), batch_size):
+                batch = list(to_subscribe)[i:i+batch_size]
+                
+                for symbol in batch:
+                    try:
+                        # 가격 데이터와 시그널 초기화
+                        self.price_data[symbol] = deque(maxlen=100)
+                        self.signals[symbol] = {
+                            'score': 0,
+                            'direction': "NEUTRAL",
+                            'strategies': {
+                                'breakout': {'signal': 0, 'direction': "NEUTRAL"},
+                                'momentum': {'signal': 0, 'direction': "NEUTRAL"},
+                                'gap': {'signal': 0, 'direction': "NEUTRAL"},
+                                'vwap': {'signal': 0, 'direction': "NEUTRAL"},
+                                'volume': {'signal': 0, 'direction': "NEUTRAL"}
+                            },
+                            'last_update': None
+                        }
+                        
+                        # 웹소켓 구독 - SKIP_WEBSOCKET 상태에 따라 처리
+                        if skip_websocket:
+                            # 웹소켓 구독 건너뛰기
+                            logger.log_system(f"SKIP_WEBSOCKET=True 설정으로 {symbol} 웹소켓 구독 건너뜀")
+                            # 콜백 정보 직접 설정
+                            callback_key = f"H0STCNT0|{symbol}"
+                            ws_client.callbacks[callback_key] = self._handle_price_update
+                            # 구독 정보 직접 추가
+                            ws_client.subscriptions[symbol] = {"type": "price", "callback": self._handle_price_update}
+                            # 성공으로 처리
+                            subscribed_count += 1
+                        else:
+                            # 실제 웹소켓 구독 시도
+                            subscription_result = await ws_client.subscribe_price(symbol, self._handle_price_update)
+                            if subscription_result:
+                                subscribed_count += 1
+                            else:
+                                failed_count += 1
+                                logger.log_system(f"웹소켓 구독 실패: {symbol}")
+                    except Exception as e:
+                        failed_count += 1
+                        logger.log_error(e, f"Failed to subscribe to {symbol}")
+                        # 에러가 발생해도 계속 진행
+                
+                # 배치 처리 후 잠시 대기 (서버 부하 방지)
+                if i + batch_size < len(to_subscribe):
+                    await asyncio.sleep(0.5)
+            
+            # 진행 상황 로그
+            if skip_websocket:
+                logger.log_system(f"종목 업데이트 완료 (SKIP_WEBSOCKET=True): 성공={subscribed_count}, 실패={failed_count}")
+            else:
+                logger.log_system(f"웹소켓 구독 처리 완료: 성공={subscribed_count}, 실패={failed_count}")
+            
+            # 개별 전략 업데이트 (에러 처리 강화)
+            strategy_update_results = {
+                "breakout": False,
+                "momentum": False,
+                "gap": False, 
+                "vwap": False,
+                "volume": False
+            }
+            
+            # 개별 전략 업데이트 시작 로그
+            logger.log_system("개별 전략 업데이트 시작...")
+            
+            try:
+                await breakout_strategy.update_symbols(new_symbols)
+                strategy_update_results["breakout"] = True
+                logger.log_system("✅ 브레이크아웃 전략 업데이트 성공")
+            except Exception as e:
+                logger.log_error(e, "❌ Failed to update symbols in breakout strategy")
+                
+            try:
+                await momentum_strategy.update_symbols(new_symbols)
+                strategy_update_results["momentum"] = True
+                logger.log_system("✅ 모멘텀 전략 업데이트 성공")
+            except Exception as e:
+                logger.log_error(e, "❌ Failed to update symbols in momentum strategy")
+                
+            try:
+                await gap_strategy.update_symbols(new_symbols)
+                strategy_update_results["gap"] = True
+                logger.log_system("✅ 갭 전략 업데이트 성공")
+            except Exception as e:
+                logger.log_error(e, "❌ Failed to update symbols in gap strategy")
+                
+            try:
+                await vwap_strategy.update_symbols(new_symbols)
+                strategy_update_results["vwap"] = True
+                logger.log_system("✅ VWAP 전략 업데이트 성공")
+            except Exception as e:
+                logger.log_error(e, "❌ Failed to update symbols in vwap strategy")
+                
+            try:
+                await volume_strategy.update_symbols(new_symbols)
+                strategy_update_results["volume"] = True
+                logger.log_system("✅ 볼륨 전략 업데이트 성공")
+            except Exception as e:
+                logger.log_error(e, "❌ Failed to update symbols in volume strategy")
             
             # 관심 종목 업데이트
             self.watched_symbols = new_set
             
-            logger.log_system(f"Updated watched symbols in combined strategy: {len(self.watched_symbols)}")
+            # 완료 시간 계산 및 상세 로그
+            end_time = datetime.now()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
+            
+            success_strategies = [name for name, result in strategy_update_results.items() if result]
+            failed_strategies = [name for name, result in strategy_update_results.items() if not result]
+            
+            # 종목 스캔 완료 구분선 추가
+            logger.log_system("=" * 50)
+            
+            # 상세 로그 추가
+            if failed_strategies:
+                # 일부 전략 실패 시
+                logger.log_system(
+                    f"⚠️ 통합 전략 관심 종목 업데이트 부분 완료: {len(self.watched_symbols)}개 종목 "
+                    f"(구독 성공: {subscribed_count}, 실패: {failed_count}, 소요시간: {duration_ms:.0f}ms)"
+                )
+                logger.log_system(f"성공한 전략: {', '.join(success_strategies)}")
+                logger.log_system(f"실패한 전략: {', '.join(failed_strategies)}")
+            else:
+                # 모든 전략 성공 시
+                logger.log_system(
+                    f"✅ 통합 전략 관심 종목 업데이트 완전 성공: {len(self.watched_symbols)}개 종목 "
+                    f"(구독 성공: {subscribed_count}, 실패: {failed_count}, 소요시간: {duration_ms:.0f}ms)"
+                )
+                logger.log_system(f"모든 전략 업데이트 성공")
+            
+            # 종목 스캔 완료 구분선 추가
+            logger.log_system("=" * 50)
+            
+            # 스캔 상태 결정
+            scan_status = "SUCCESS" if len(failed_strategies) == 0 else "PARTIAL"
+            if len(success_strategies) == 0:
+                scan_status = "FAIL"
+            
+            # trade.log에 스캔 결과 기록
+            logger.log_trade(
+                action="SYMBOL_SCAN_COMPLETE",
+                symbol="SYSTEM",
+                price=0,
+                quantity=len(self.watched_symbols),
+                reason=f"통합 전략 관심 종목 업데이트 완료",
+                watched_symbols=len(self.watched_symbols),
+                new_subscriptions=subscribed_count,
+                failed_subscriptions=failed_count,
+                success_strategies=",".join(success_strategies),
+                failed_strategies=",".join(failed_strategies),
+                duration_ms=f"{duration_ms:.0f}",
+                time=end_time.strftime("%H:%M:%S"),
+                status=scan_status
+            )
             
         except Exception as e:
+            # 종목 스캔 실패 로그
+            logger.log_system("=" * 50)
+            logger.log_system(f"❌ 종목 스캔 실패 - 통합 전략 오류: {str(e)}")
+            logger.log_system("=" * 50)
+            
             logger.log_error(e, "Failed to update symbols in combined strategy")
+            
+            # 실패 로그 기록
+            logger.log_trade(
+                action="SYMBOL_SCAN_FAILED",
+                symbol="SYSTEM", 
+                price=0,
+                quantity=0,
+                reason=f"통합 전략 오류: {str(e)}",
+                time=datetime.now().strftime("%H:%M:%S"),
+                status="FAIL"
+            )
+            
             await alert_system.notify_error(e, "Symbol update error in combined strategy")
 
 # 싱글톤 인스턴스

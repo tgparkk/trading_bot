@@ -143,21 +143,133 @@ async def reset_telegram_webhook():
         token = telegram_bot_handler.token
         base_url = f"https://api.telegram.org/bot{token}"
         
+        # 먼저 동일한 봇이 실행 중인지 완전히 확인하기 위해
+        # 실행 중인 모든 python 프로세스를 검색
+        try:
+            import psutil
+            current_pid = os.getpid()
+            telegram_processes = []
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # 자기 자신은 제외
+                    if proc.info['pid'] == current_pid:
+                        continue
+                    
+                    proc_name = proc.info['name'].lower()
+                    if "python" in proc_name or "pythonw" in proc_name:
+                        cmd = " ".join(proc.cmdline())
+                        # 텔레그램 봇 관련 프로세스 확인
+                        if any(x in cmd for x in ['start_telegram_bot.py', 'telegram_bot']):
+                            telegram_processes.append(proc)
+                            print(f"⚠️ 다른 텔레그램 봇 인스턴스 발견: PID {proc.pid}, CMD: {cmd}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                    continue
+            
+            # 발견된 텔레그램 봇 프로세스 강제 종료
+            if telegram_processes:
+                print(f"⚠️ {len(telegram_processes)}개의 텔레그램 봇 인스턴스가 이미 실행 중입니다. 모두 종료합니다...")
+                for proc in telegram_processes:
+                    try:
+                        proc.terminate()
+                        print(f"PID {proc.pid} 종료 요청")
+                    except Exception as e:
+                        print(f"PID {proc.pid} 종료 중 오류: {e}")
+                
+                # 최대 5초간 종료 대기
+                await asyncio.sleep(2)
+                
+                # 여전히 살아있는 프로세스 확인
+                still_alive = []
+                for proc in telegram_processes:
+                    try:
+                        if proc.is_running():
+                            still_alive.append(proc)
+                    except:
+                        pass
+                        
+                # 여전히 살아있는 프로세스 강제 종료
+                if still_alive:
+                    print(f"응답하지 않는 {len(still_alive)}개 프로세스 강제 종료...")
+                    for proc in still_alive:
+                        try:
+                            proc.kill()
+                        except:
+                            pass
+                
+                # 텔레그램 충돌 문제 해결을 위해 잠시 대기
+                print("다른 텔레그램 봇 인스턴스가 완전히 종료되기를 기다립니다...")
+                await asyncio.sleep(3)
+        except ImportError:
+            print("psutil이 설치되어 있지 않아 다른 텔레그램 봇 인스턴스 확인을 건너뜁니다.")
+        except Exception as e:
+            print(f"다른 텔레그램 봇 인스턴스 확인 중 오류: {e}")
+        
+        # 더욱 강화된 웹훅 초기화 로직
+        print("웹훅 초기화 및 업데이트 큐 정리 시작...")
+        
         async with aiohttp.ClientSession() as session:
-            # 웹훅 삭제
-            async with session.get(f"{base_url}/deleteWebhook") as response:
+            # 1. 웹훅 정보 확인
+            async with session.get(f"{base_url}/getWebhookInfo") as response:
+                data = await response.json()
+                webhook_url = data.get("result", {}).get("url", "")
+                
+                if webhook_url:
+                    print(f"기존 웹훅 URL 발견: {webhook_url}, 삭제 시도...")
+                
+            # 2. 웹훅 강제 삭제 (drop_pending_updates=True 추가)
+            async with session.get(f"{base_url}/deleteWebhook", params={"drop_pending_updates": True}) as response:
                 data = await response.json()
                 success = data.get("ok", False)
                 
                 if success:
-                    print("✅ 웹훅 초기화 성공")
-                    # 업데이트 초기화 (오프셋 리셋)
-                    async with session.get(f"{base_url}/getUpdates", params={"offset": -1, "limit": 1}) as reset_response:
-                        reset_data = await reset_response.json()
-                        print(f"업데이트 초기화 결과: {reset_data}")
-                        return True
+                    print("✅ 웹훅 초기화 성공 (대기 중인 업데이트 모두 제거)")
                 else:
-                    print(f"❌ 웹훅 초기화 실패: {data}")
+                    print(f"⚠️ 웹훅 초기화 실패: {data}")
+            
+            # 3. 업데이트 큐 초기화 (큰 오프셋 값으로 모든 이전 업데이트 건너뛰기)
+            print("업데이트 큐 초기화 중...")
+            try:
+                # 먼저 현재 업데이트 ID 확인
+                async with session.get(f"{base_url}/getUpdates", params={"limit": 1}) as response:
+                    data = await response.json()
+                    updates = data.get("result", [])
+                    
+                    if updates:
+                        # 가장 최근 업데이트의 ID + 1로 오프셋 설정 (이전 업데이트 모두 무시)
+                        last_update_id = updates[0].get("update_id", 0)
+                        offset = last_update_id + 1
+                        
+                        # 새 오프셋으로 업데이트 초기화
+                        async with session.get(f"{base_url}/getUpdates", params={"offset": offset}) as reset_response:
+                            reset_data = await reset_response.json()
+                            print(f"업데이트 큐 초기화 완료: 오프셋 {offset}으로 설정됨")
+                    else:
+                        # 업데이트가 없는 경우 큰 음수 값으로 초기화
+                        async with session.get(f"{base_url}/getUpdates", params={"offset": -1}) as reset_response:
+                            reset_data = await reset_response.json()
+                            print("업데이트 큐 초기화 완료 (업데이트 없음)")
+            except Exception as e:
+                print(f"업데이트 큐 초기화 중 오류: {e}")
+            
+            # 4. 웹훅 상태 최종 확인
+            async with session.get(f"{base_url}/getWebhookInfo") as response:
+                data = await response.json()
+                if not data.get("result", {}).get("url", ""):
+                    print("✅ 웹훅이 성공적으로 제거되었습니다. 폴링 모드로 전환됩니다.")
+                    
+                    # 5. 텔레그램 API 서버 응답 확인
+                    async with session.get(f"{base_url}/getMe") as me_response:
+                        me_data = await me_response.json()
+                        if me_data.get("ok"):
+                            bot_name = me_data.get("result", {}).get("username", "")
+                            print(f"✅ 텔레그램 API 서버 응답 확인: {bot_name} 봇에 연결됨")
+                        else:
+                            print(f"⚠️ 텔레그램 API 서버 응답 오류: {me_data}")
+                    
+                    return True
+                else:
+                    print(f"⚠️ 웹훅 제거 실패: {data}")
                     return False
                     
     except Exception as e:
@@ -367,7 +479,7 @@ async def main():
                 
                 # 최대 10초 동안 봇이 준비될 때까지 대기
                 try:
-                    await asyncio.wait_for(telegram_bot_handler.wait_until_ready(), timeout=10)
+                    await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=10)
                     print("텔레그램 봇 초기화 완료!")
                     init_success = True
                     break
@@ -396,7 +508,7 @@ async def main():
         
         # 초기 상태 메시지 전송
         try:
-            await telegram_bot_handler.send_message("📡 <b>텔레그램 봇이 성공적으로 시작되었습니다.</b>\n\n/help 명령어로 사용 가능한 명령어를 확인하세요.")
+            await telegram_bot_handler._send_message("📡 <b>텔레그램 봇이 성공적으로 시작되었습니다.</b>\n\n/help 명령어로 사용 가능한 명령어를 확인하세요.")
             print("초기 상태 메시지 전송 성공")
         except Exception as e:
             print(f"초기 상태 메시지 전송 실패: {e}")
