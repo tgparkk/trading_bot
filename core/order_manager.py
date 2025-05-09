@@ -2,6 +2,7 @@
 주문 관리자
 """
 import asyncio
+import threading
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from config.settings import config
@@ -12,14 +13,30 @@ from monitoring.alert_system import alert_system
 
 class OrderManager:
     """주문 관리자"""
+
+    _instance = None
+    _lock = threading.Lock()
     
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+    
+
     def __init__(self):
-        self.trading_config = config["trading"]
-        self.positions = {}  # {symbol: position_data}
-        self.pending_orders = {}  # {order_id: order_data}
-        self.daily_pnl = 0
-        self.daily_trades = 0
-        self.trading_paused = False  # 거래 일시 중지 플래그
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            self.trading_config = config["trading"]
+            self.positions = {}  # {symbol: position_data}
+            self.pending_orders = {}  # {order_id: order_data}
+            self.daily_pnl = 0
+            self.daily_trades = 0
+            self.trading_paused = False  # 거래 일시 중지 플래그
+            self._async_lock = asyncio.Lock()  # 비동기 작업을 위한 락
+            self._initialized = True
         
     async def initialize(self):
         """초기화 - 포지션/잔고 로드"""

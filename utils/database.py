@@ -14,7 +14,7 @@ from utils.logger import logger
 KST = pytz.timezone('Asia/Seoul')
 
 class Database:
-    """트레이딩 데이터베이스"""
+    """트레이딩 데이터베이스 (리팩토링: 쿼리 헬퍼 및 CRUD 간소화)"""
     
     _instance = None
     
@@ -107,22 +107,87 @@ class Database:
         now_kst = now_utc.astimezone(KST)
         return now_kst.strftime('%Y-%m-%d %H:%M:%S')
     
-    def _initialize_db(self, force_initialize=False):
-        """데이터베이스 초기화"""
+    # --- 쿼리 빌더/실행 헬퍼 ---
+    def _build_where_clause(self, conditions):
+        where_clauses = []
+        params = []
+        for key, value in (conditions or {}).items():
+            if isinstance(value, tuple):
+                operator, val = value
+                where_clauses.append(f"{key} {operator} ?")
+                params.append(val)
+            else:
+                where_clauses.append(f"{key} = ?")
+                params.append(value)
+        return (" AND ".join(where_clauses), params) if where_clauses else ("", [])
+
+    def _build_query(self, operation, table, data=None, conditions=None, order_by=None, limit=None):
+        params = []
+        if operation == "SELECT":
+            query = f"SELECT * FROM {table}"
+            where, where_params = self._build_where_clause(conditions)
+            if where:
+                query += f" WHERE {where}"
+                params.extend(where_params)
+            if order_by:
+                direction = "DESC" if order_by.startswith("-") else "ASC"
+                column = order_by[1:] if order_by.startswith("-") else order_by
+                query += f" ORDER BY {column} {direction}"
+            if limit:
+                query += f" LIMIT {limit}"
+        elif operation == "INSERT":
+            columns = list(data.keys())
+            placeholders = ["?"] * len(columns)
+            values = list(data.values())
+            query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+            params.extend(values)
+        elif operation == "REPLACE" or operation == "UPSERT":
+            columns = list(data.keys())
+            placeholders = ["?"] * len(columns)
+            values = list(data.values())
+            query = f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+            params.extend(values)
+
+        elif operation == "UPDATE":
+            set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
+            values = list(data.values())
+            query = f"UPDATE {table} SET {set_clause}"
+            params.extend(values)
+            where, where_params = self._build_where_clause(conditions)
+            if where:
+                query += f" WHERE {where}"
+                params.extend(where_params)
+        return query, params
+
+    def _execute_query(self, operation, table, data=None, conditions=None, order_by=None, limit=None, single=False):
+        query, params = self._build_query(operation, table, data, conditions, order_by, limit)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            
-            # 주문 테이블
-            cursor.execute("""
+            cursor.execute(query, params)
+            if operation == "SELECT":
+                if single:
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+                else:
+                    return [dict(row) for row in cursor.fetchall()]
+            elif operation == "INSERT":
+                return cursor.lastrowid
+            elif operation == "UPDATE":
+                return cursor.rowcount
+
+    # --- 테이블 스키마 정의 통합 ---
+    def _initialize_db(self, force_initialize=False):
+        table_schemas = {
+            "orders": """
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id TEXT UNIQUE,
                     symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,  -- BUY/SELL
-                    order_type TEXT NOT NULL,  -- MARKET/LIMIT
+                    side TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
                     price REAL,
                     quantity INTEGER NOT NULL,
-                    status TEXT NOT NULL,  -- PENDING/FILLED/CANCELLED/REJECTED
+                    status TEXT NOT NULL,
                     filled_quantity INTEGER DEFAULT 0,
                     avg_price REAL,
                     commission REAL,
@@ -131,10 +196,8 @@ class Database:
                     strategy TEXT,
                     reason TEXT
                 )
-            """)
-            
-            # 포지션 테이블
-            cursor.execute("""
+            """,
+            "positions": """
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT UNIQUE,
@@ -146,10 +209,8 @@ class Database:
                     created_at TIMESTAMP DEFAULT (kst_datetime()),
                     updated_at TIMESTAMP DEFAULT (kst_datetime())
                 )
-            """)
-            
-            # 거래 기록 테이블
-            cursor.execute("""
+            """,
+            "trades": """
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -166,10 +227,8 @@ class Database:
                     order_type TEXT,
                     status TEXT
                 )
-            """)
-            
-            # 성과 테이블
-            cursor.execute("""
+            """,
+            "performance": """
                 CREATE TABLE IF NOT EXISTS performance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date DATE NOT NULL,
@@ -184,52 +243,44 @@ class Database:
                     created_at TIMESTAMP DEFAULT (kst_datetime()),
                     UNIQUE(date, symbol)
                 )
-            """)
-            
-            # 시스템 상태 테이블
-            cursor.execute("""
+            """,
+            "system_status": """
                 CREATE TABLE IF NOT EXISTS system_status (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    status TEXT NOT NULL,  -- RUNNING/STOPPED/ERROR
+                    status TEXT NOT NULL,
                     last_heartbeat TIMESTAMP,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
-            """)
-            
-            # 토큰 관리 테이블
-            cursor.execute("""
+            """,
+            "token_logs": """
                 CREATE TABLE IF NOT EXISTS token_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,  -- ISSUE/ACCESS/FAIL
+                    event_type TEXT NOT NULL,
                     token TEXT,
                     issue_time TIMESTAMP,
                     expire_time TIMESTAMP,
-                    status TEXT,  -- SUCCESS/FAIL
+                    status TEXT,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
-            """)
-            
-            # 종목 탐색 테이블
-            cursor.execute("""
+            """,
+            "symbol_search_logs": """
                 CREATE TABLE IF NOT EXISTS symbol_search_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     search_time TIMESTAMP,
                     total_symbols INTEGER,
                     filtered_symbols INTEGER,
-                    search_criteria TEXT,  -- JSON 형식
+                    search_criteria TEXT,
                     status TEXT,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
-            """)
-            
-            # 텔레그램 메시지 테이블
-            cursor.execute("""
+            """,
+            "telegram_messages": """
                 CREATE TABLE IF NOT EXISTS telegram_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    direction TEXT NOT NULL,  -- INCOMING/OUTGOING
+                    direction TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     message_text TEXT NOT NULL,
                     message_id TEXT,
@@ -242,293 +293,98 @@ class Database:
                     reply_to TEXT,
                     created_at TIMESTAMP DEFAULT (kst_datetime())
                 )
-            """)
-            
-            # 초기화 완료 로그
+            """
+        }
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for schema in table_schemas.values():
+                cursor.execute(schema)
             logger.log_system("Database initialized successfully")
-            
-            # 기존 테이블의 타임스탬프를 KST로 변환하는 함수 등록
             self._update_timestamps_to_kst(conn)
-            
             conn.commit()
-    
+
     def _update_timestamps_to_kst(self, conn):
         """기존 데이터베이스의 타임스탬프를 KST로 변환"""
         try:
-            # 기존 테이블 및 컬럼 조회
+            timestamp_columns = {
+                "orders": ["created_at", "updated_at"],
+                "positions": ["created_at", "updated_at"],
+                "trades": ["created_at"],
+                "system_status": ["created_at", "last_heartbeat"],
+                "token_logs": ["created_at", "issue_time", "expire_time"],
+                "symbol_search_logs": ["created_at", "search_time"],
+                "telegram_messages": ["created_at"]
+            }
             cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            
-            for table in tables:
-                # 테이블 컬럼 정보 조회
-                cursor.execute(f"PRAGMA table_info({table})")
-                columns = cursor.fetchall()
-                
-                # 타임스탬프 컬럼 찾기
-                timestamp_columns = []
-                for col in columns:
-                    col_name = col[1]
-                    col_type = col[2].upper()
-                    if "TIMESTAMP" in col_type or col_name in ["created_at", "updated_at", "last_heartbeat", "issue_time", "expire_time", "search_time"]:
-                        timestamp_columns.append(col_name)
-                
-                # 각 타임스탬프 컬럼에 대해 KST로 변환
-                for col_name in timestamp_columns:
-                    try:
-                        # 현재 값이 있는 레코드만 업데이트
+            for table, columns in timestamp_columns.items():
+                for column in columns:
+                    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
+                    if cursor.fetchone():
                         cursor.execute(f"""
                             UPDATE {table} 
-                            SET {col_name} = datetime({col_name}, '+9 hours')
-                            WHERE {col_name} IS NOT NULL
-                              AND {col_name} NOT LIKE '%+09:00%'
-                              AND {col_name} NOT LIKE '%+0900%'
+                            SET {column} = datetime({column}, '+9 hours')
+                            WHERE {column} IS NOT NULL
+                              AND {column} NOT LIKE '%+09:00%'
+                              AND {column} NOT LIKE '%+0900%'
                         """)
-                        rows_updated = cursor.rowcount
-                        if rows_updated > 0:
-                            logger.log_system(f"타임스탬프 변환: {table}.{col_name}, {rows_updated}개 레코드 업데이트")
-                    except Exception as e:
-                        logger.log_error(e, f"타임스탬프 변환 중 오류 발생: {table}.{col_name}")
-        
         except Exception as e:
             logger.log_error(e, "타임스탬프 변환 중 오류 발생")
     
     def save_order(self, order_data: Dict[str, Any]) -> int:
         """주문 저장"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO orders (
-                    order_id, symbol, side, order_type, price, quantity, 
-                    status, strategy, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                order_data.get('order_id'),
-                order_data['symbol'],
-                order_data['side'],
-                order_data['order_type'],
-                order_data.get('price'),
-                order_data['quantity'],
-                order_data['status'],
-                order_data.get('strategy'),
-                order_data.get('reason')
-            ))
-            
-            conn.commit()
-            return cursor.lastrowid
+        return self._execute_query("INSERT", "orders", data=order_data)
     
     def update_order(self, order_id: str, update_data: Dict[str, Any]):
         """주문 업데이트"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            set_clause = ", ".join([f"{k} = ?" for k in update_data.keys()])
-            values = list(update_data.values()) + [order_id]
-            
-            cursor.execute(f"""
-                UPDATE orders 
-                SET {set_clause}, updated_at = kst_datetime()
-                WHERE order_id = ?
-            """, values)
-            
-            conn.commit()
+        data = {**update_data, "updated_at": self._current_kst_datetime()}
+        return self._execute_query("UPDATE", "orders", data=data, conditions={"order_id": order_id})
     
     def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
         """주문 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        return self._execute_query("SELECT", "orders", conditions={"order_id": order_id}, single=True)
     
     def save_position(self, position_data: Dict[str, Any]):
         """포지션 저장/업데이트"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO positions (
-                    symbol, quantity, avg_price, current_price, 
-                    unrealized_pnl, realized_pnl
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                position_data['symbol'],
-                position_data['quantity'],
-                position_data['avg_price'],
-                position_data.get('current_price'),
-                position_data.get('unrealized_pnl', 0),
-                position_data.get('realized_pnl', 0)
-            ))
-            
-            conn.commit()
+        return self._execute_query("REPLACE", "positions", data=position_data)
     
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         """포지션 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM positions WHERE symbol = ?", (symbol,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        return self._execute_query("SELECT", "positions", conditions={"symbol": symbol}, single=True)
     
     def get_all_positions(self) -> List[Dict[str, Any]]:
         """모든 포지션 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM positions WHERE quantity != 0")
-            return [dict(row) for row in cursor.fetchall()]
+        return self._execute_query("SELECT", "positions", conditions={"quantity": ("!=", 0)})
     
     def save_trade(self, trade_data: Dict[str, Any]):
         """거래 기록 저장"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 먼저 trades 테이블 구조를 확인하고 필요하면 수정
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    pnl REAL,
-                    commission REAL,
-                    created_at TIMESTAMP DEFAULT (kst_datetime()),
-                    strategy TEXT,
-                    entry_reason TEXT,
-                    exit_reason TEXT,
-                    order_id TEXT,
-                    order_type TEXT,
-                    status TEXT
-                )
-            """)
-            
-            cursor.execute("""
-                INSERT INTO trades (
-                    symbol, side, price, quantity, pnl, commission,
-                    strategy, entry_reason, exit_reason, order_id, order_type, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                trade_data['symbol'],
-                trade_data['side'],
-                trade_data['price'],
-                trade_data['quantity'],
-                trade_data.get('pnl'),
-                trade_data.get('commission'),
-                trade_data.get('strategy'),
-                trade_data.get('entry_reason', trade_data.get('reason')),  # reason 필드도 체크
-                trade_data.get('exit_reason'),
-                trade_data.get('order_id'),
-                trade_data.get('order_type'),
-                trade_data.get('status', 'FILLED')
-            ))
-            
-            # 거래 ID 반환
-            trade_id = cursor.lastrowid
-            
-            conn.commit()
-            
-            logger.log_system(f"Trade saved to database: ID={trade_id}, Symbol={trade_data['symbol']}, Side={trade_data['side']}")
-            
-            return trade_id
+        return self._execute_query("INSERT", "trades", data=trade_data)
     
     def get_trades(self, symbol: str = None, start_date: str = None, 
                    end_date: str = None) -> List[Dict[str, Any]]:
         """거래 기록 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = "SELECT * FROM trades WHERE 1=1"
-            params = []
-            
-            if symbol:
-                query += " AND symbol = ?"
-                params.append(symbol)
-            
-            if start_date:
-                query += " AND created_at >= ?"
-                params.append(start_date)
-            
-            if end_date:
-                query += " AND created_at <= ?"
-                params.append(end_date)
-            
-            query += " ORDER BY created_at DESC"
-            
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        conditions = {}
+        if symbol:
+            conditions["symbol"] = symbol
+        if start_date:
+            conditions["created_at"] = (">=", start_date)
+        if end_date:
+            conditions["created_at"] = ("<=", end_date)
+        return self._execute_query("SELECT", "trades", conditions=conditions, order_by="-created_at")
     
     def save_performance(self, performance_data: Dict[str, Any]):
         """성과 기록 저장"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO performance (
-                    date, symbol, total_trades, winning_trades, losing_trades,
-                    total_pnl, win_rate, sharpe_ratio, max_drawdown
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                performance_data['date'],
-                performance_data.get('symbol'),
-                performance_data['total_trades'],
-                performance_data['winning_trades'],
-                performance_data['losing_trades'],
-                performance_data['total_pnl'],
-                performance_data.get('win_rate'),
-                performance_data.get('sharpe_ratio'),
-                performance_data.get('max_drawdown')
-            ))
-            
-            conn.commit()
+        return self._execute_query("INSERT", "performance", data=performance_data)
     
     def update_system_status(self, status: str, error_message: str = None):
         """시스템 상태 업데이트"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO system_status (status, last_heartbeat, error_message)
-                VALUES (?, kst_datetime(), ?)
-            """, (status, error_message))
-            
-            conn.commit()
+        data = {"status": status, "last_heartbeat": self._current_kst_datetime(), "error_message": error_message}
+        return self._execute_query("INSERT", "system_status", data=data)
     
     def get_latest_system_status(self) -> Optional[Dict[str, Any]]:
         """최신 시스템 상태 조회"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT * FROM system_status 
-                    ORDER BY created_at DESC 
-                    LIMIT 1
-                """)
-                row = cursor.fetchone()
-                if row:
-                    return dict(row)
-                
-                # 상태 정보가 없으면 기본값 반환
-                logger.log_system("시스템 상태 정보가 없어 기본값을 반환합니다", level="WARNING")
-                return {
-                    "id": 0,
-                    "status": "UNKNOWN",
-                    "last_heartbeat": datetime.now().isoformat(),
-                    "error_message": None,
-                    "created_at": datetime.now().isoformat()
-                }
-        except Exception as e:
-            logger.log_error(e, "시스템 상태 조회 오류")
-            # 오류 발생 시 기본값 반환
-            return {
-                "id": 0,
-                "status": "ERROR",
-                "last_heartbeat": datetime.now().isoformat(),
-                "error_message": str(e),
-                "created_at": datetime.now().isoformat()
-            }
+        return self._execute_query("SELECT", "system_status", order_by="-created_at", single=True)
     
-    def backup_database(self, backup_path: str = None):
+    def backup_database(self, backup_path: Optional[str] = None):
         """데이터베이스 백업"""
         if backup_path is None:
             backup_path = f"{self.db_path}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -544,139 +400,58 @@ class Database:
                       issue_time: datetime = None, expire_time: datetime = None,
                       status: str = None, error_message: str = None):
         """토큰 관련 로그 저장"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 시간 데이터를 한국 시간으로 변환
-            if issue_time and not issue_time.tzinfo:
-                issue_time = pytz.UTC.localize(issue_time).astimezone(KST)
-            if expire_time and not expire_time.tzinfo:
-                expire_time = pytz.UTC.localize(expire_time).astimezone(KST)
-                
-            cursor.execute("""
-                INSERT INTO token_logs (
-                    event_type, token, issue_time, expire_time, 
-                    status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                event_type,
-                token,
-                issue_time.isoformat() if issue_time else None,
-                expire_time.isoformat() if expire_time else None,
-                status,
-                error_message
-            ))
-            
-            conn.commit()
+        data = {
+            "event_type": event_type,
+            "token": token,
+            "issue_time": issue_time.isoformat() if issue_time else None,
+            "expire_time": expire_time.isoformat() if expire_time else None,
+            "status": status,
+            "error_message": error_message
+        }
+        return self._execute_query("INSERT", "token_logs", data=data)
     
     def save_symbol_search_log(self, total_symbols: int, filtered_symbols: int,
                              search_criteria: Dict[str, Any], status: str,
                              error_message: str = None):
         """종목 탐색 로그 저장"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 현재 한국 시간
-            now_kst = datetime.now(KST).isoformat()
-            
-            cursor.execute("""
-                INSERT INTO symbol_search_logs (
-                    search_time, total_symbols, filtered_symbols,
-                    search_criteria, status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                now_kst,
-                total_symbols,
-                filtered_symbols,
-                json.dumps(search_criteria),
-                status,
-                error_message
-            ))
-            
-            conn.commit()
+        now_kst = datetime.now(KST).isoformat()
+        data = {
+            "search_time": now_kst,
+            "total_symbols": total_symbols,
+            "filtered_symbols": filtered_symbols,
+            "search_criteria": json.dumps(search_criteria),
+            "status": status,
+            "error_message": error_message
+        }
+        return self._execute_query("INSERT", "symbol_search_logs", data=data)
     
     def get_token_logs(self, start_date: str = None, end_date: str = None,
                       event_type: str = None) -> List[Dict[str, Any]]:
         """토큰 로그 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = "SELECT * FROM token_logs"
-            params = []
-            where_clauses = []
-            
-            if start_date:
-                where_clauses.append("created_at >= ?")
-                params.append(start_date)
-            
-            if end_date:
-                where_clauses.append("created_at <= ?")
-                params.append(end_date)
-            
-            if event_type:
-                where_clauses.append("event_type = ?")
-                params.append(event_type)
-            
-            if where_clauses:
-                query += " WHERE " + " AND ".join(where_clauses)
-            
-            query += " ORDER BY created_at DESC"
-            
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        conditions = {}
+        if start_date:
+            conditions["created_at"] = (">=", start_date)
+        if end_date:
+            conditions["created_at"] = ("<=", end_date)
+        if event_type:
+            conditions["event_type"] = event_type
+        return self._execute_query("SELECT", "token_logs", conditions=conditions, order_by="-created_at")
     
     def get_latest_valid_token(self) -> Optional[Dict[str, Any]]:
         """현재 유효한 최신 API 토큰 조회"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # 현재 시간 기준으로 만료되지 않은 최신 토큰 조회
-                current_time = datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')
-                
-                cursor.execute("""
-                    SELECT id, token, event_type, issue_time, expire_time, status
-                    FROM token_logs 
-                    WHERE status = 'SUCCESS' AND event_type = 'ISSUE'
-                    AND expire_time > ?
-                    ORDER BY id DESC LIMIT 1
-                """, (current_time,))
-                
-                row = cursor.fetchone()
-                
-                if row:
-                    token_data = dict(row)
-                    logger.log_system(f"유효한 토큰 조회 성공 (ID: {token_data['id']}, 만료: {token_data['expire_time']})")
-                    return token_data
-                else:
-                    logger.log_system("DB에서 유효한 토큰을 찾을 수 없음")
-                    return None
-                
-        except Exception as e:
-            logger.log_error(e, "유효한 토큰 조회 중 DB 오류 발생")
-            return None
+        current_time = datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')
+        conditions = {"status": "SUCCESS", "event_type": "ISSUE", "expire_time": (">", current_time)}
+        return self._execute_query("SELECT", "token_logs", conditions=conditions, order_by="-id", single=True)
     
     def get_symbol_search_logs(self, start_date: str = None, 
                              end_date: str = None) -> List[Dict[str, Any]]:
         """종목 탐색 로그 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = "SELECT * FROM symbol_search_logs WHERE 1=1"
-            params = []
-            
-            if start_date:
-                query += " AND created_at >= ?"
-                params.append(start_date)
-            
-            if end_date:
-                query += " AND created_at <= ?"
-                params.append(end_date)
-            
-            query += " ORDER BY created_at DESC"
-            
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        conditions = {}
+        if start_date:
+            conditions["created_at"] = (">=", start_date)
+        if end_date:
+            conditions["created_at"] = ("<=", end_date)
+        return self._execute_query("SELECT", "symbol_search_logs", conditions=conditions, order_by="-created_at")
     
     def save_telegram_message(self, direction: str, chat_id: str, message_text: str,
                              message_id: str = None, update_id: int = None, 
@@ -701,126 +476,62 @@ class Database:
         Returns:
             새로운 메시지의 ID
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO telegram_messages (
-                    direction, chat_id, message_text, message_id, update_id,
-                    is_command, command, processed, status, error_message, reply_to
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                direction,
-                str(chat_id),
-                message_text,
-                message_id,
-                update_id,
-                1 if is_command else 0,
-                command,
-                1 if processed else 0,
-                status,
-                error_message,
-                reply_to
-            ))
-            
-            db_message_id = cursor.lastrowid
-            conn.commit()
-            return db_message_id
+        data = {
+            "direction": direction,
+            "chat_id": str(chat_id),
+            "message_text": message_text,
+            "message_id": message_id,
+            "update_id": update_id,
+            "is_command": 1 if is_command else 0,
+            "command": command,
+            "processed": 1 if processed else 0,
+            "status": status,
+            "error_message": error_message,
+            "reply_to": reply_to
+        }
+        return self._execute_query("INSERT", "telegram_messages", data=data)
     
     def update_telegram_message(self, db_message_id: int, message_id: str = None, 
                               status: str = None, error_message: str = None):
         """텔레그램 메시지 업데이트 (outgoing 메시지의 실제 전송 결과를 업데이트)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            set_parts = []
-            params = []
-            
-            if message_id is not None:
-                set_parts.append("message_id = ?")
-                params.append(message_id)
-                
-            if status is not None:
-                set_parts.append("status = ?")
-                params.append(status)
-                
-            if error_message is not None:
-                set_parts.append("error_message = ?")
-                params.append(error_message)
-                
-            if not set_parts:
-                return  # 업데이트할 내용이 없음
-                
-            params.append(db_message_id)
-            
-            query = f"UPDATE telegram_messages SET {', '.join(set_parts)} WHERE id = ?"
-            cursor.execute(query, params)
-            
-            conn.commit()
-            
+        data = {}
+        if message_id is not None:
+            data["message_id"] = message_id
+        if status is not None:
+            data["status"] = status
+        if error_message is not None:
+            data["error_message"] = error_message
+        if not data:
+            return
+        return self._execute_query("UPDATE", "telegram_messages", data=data, conditions={"id": db_message_id})
+    
     def update_telegram_message_status(self, message_id: str, processed: bool = True, 
                                      status: str = "SUCCESS", error_message: str = None):
         """텔레그램 메시지 상태 업데이트"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                UPDATE telegram_messages
-                SET processed = ?, status = ?, error_message = ?
-                WHERE message_id = ?
-            """, (
-                1 if processed else 0,
-                status,
-                error_message,
-                message_id
-            ))
-            
-            conn.commit()
+        data = {"processed": 1 if processed else 0, "status": status, "error_message": error_message}
+        return self._execute_query("UPDATE", "telegram_messages", data=data, conditions={"message_id": message_id})
     
     def get_telegram_messages(self, direction: str = None, chat_id: str = None,
                             is_command: bool = None, processed: bool = None,
                             start_date: str = None, end_date: str = None,
                             message_id: str = None, limit: int = 100) -> List[Dict[str, Any]]:
         """텔레그램 메시지 조회"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = "SELECT * FROM telegram_messages WHERE 1=1"
-            params = []
-            
-            if direction:
-                query += " AND direction = ?"
-                params.append(direction)
-            
-            if chat_id:
-                query += " AND chat_id = ?"
-                params.append(str(chat_id))
-            
-            if message_id:
-                query += " AND message_id = ?"
-                params.append(message_id)
-            
-            if is_command is not None:
-                query += " AND is_command = ?"
-                params.append(1 if is_command else 0)
-            
-            if processed is not None:
-                query += " AND processed = ?"
-                params.append(1 if processed else 0)
-            
-            if start_date:
-                query += " AND created_at >= ?"
-                params.append(start_date)
-            
-            if end_date:
-                query += " AND created_at <= ?"
-                params.append(end_date)
-            
-            query += " ORDER BY created_at DESC LIMIT ?"
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        conditions = {}
+        if direction:
+            conditions["direction"] = direction
+        if chat_id:
+            conditions["chat_id"] = str(chat_id)
+        if message_id:
+            conditions["message_id"] = message_id
+        if is_command is not None:
+            conditions["is_command"] = 1 if is_command else 0
+        if processed is not None:
+            conditions["processed"] = 1 if processed else 0
+        if start_date:
+            conditions["created_at"] = (">=", start_date)
+        if end_date:
+            conditions["created_at"] = ("<=", end_date)
+        return self._execute_query("SELECT", "telegram_messages", conditions=conditions, order_by="-created_at", limit=limit)
     
     def get_system_status(self) -> Dict[str, Any]:
         """현재 시스템 상태 조회"""
