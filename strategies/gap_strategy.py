@@ -515,10 +515,111 @@ class GapStrategy:
     
     def get_signal_direction(self, symbol: str) -> str:
         """신호 방향 반환"""
-        if symbol in self.gap_data:
-            return self.gap_data[symbol].get("signal_direction", "NEUTRAL")
+        if symbol in self.gap_data and self.gap_data[symbol].get('direction'):
+            direction = self.gap_data[symbol]['direction']
+            if direction == "UP":
+                return "SELL"  # 갭 업일 때는 매도 신호 (갭 채움 예상)
+            elif direction == "DOWN":
+                return "BUY"   # 갭 다운일 때는 매수 신호 (갭 채움 예상)
         return "NEUTRAL"
         
+    async def get_signal(self, symbol: str) -> Dict[str, Any]:
+        """전략 신호 반환 (combined_strategy에서 호출)"""
+        try:
+            logger.log_system(f"[DEBUG] {symbol} - 갭 전략 신호 계산 시작")
+            
+            # 갭 데이터 확인
+            if symbol not in self.gap_data or not self.gap_data[symbol].get('gap_identified'):
+                logger.log_system(f"[DEBUG] {symbol} - 갭 데이터 없음, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            gap_data = self.gap_data[symbol]
+            
+            # 현재가 확인
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            
+            # 현재가가 없으면 API에서 가져오기
+            if current_price <= 0:
+                try:
+                    symbol_info = await api_client.get_symbol_info(symbol)
+                    if symbol_info and "current_price" in symbol_info:
+                        current_price = float(symbol_info["current_price"])
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} - 갭 전략 현재가 조회 실패")
+                    return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 갭이 충분히 큰지 확인
+            gap_pct = gap_data.get('gap_pct', 0)
+            min_gap = self.params["min_gap_pct"]
+            max_gap = self.params["max_gap_pct"]
+            
+            if abs(gap_pct) < min_gap:
+                logger.log_system(f"[DEBUG] {symbol} - 갭이 너무 작음: {gap_pct:.2%}, 최소: {min_gap:.2%}")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            if abs(gap_pct) > max_gap:
+                logger.log_system(f"[DEBUG] {symbol} - 갭이 너무 큼: {gap_pct:.2%}, 최대: {max_gap:.2%}")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 방향과 신호 강도 계산
+            direction = "NEUTRAL"
+            signal_strength = 0
+            
+            # 갭 방향에 따른 트레이딩 방향
+            if gap_data['direction'] == "UP":
+                # 갭 업일 때는 매도 신호 (갭 채움 예상)
+                direction = "SELL"
+                
+                # 갭 채움 진행 정도에 따른 신호 강도 계산
+                if current_price < gap_data['today_open']:
+                    # 갭 채움이 진행 중
+                    progress = (gap_data['today_open'] - current_price) / gap_data['gap_size']
+                    
+                    # 진행 정도에 따라 신호 강도 조정 (0~10 범위)
+                    # 진행 정도가 0%일 때 강도 10, 100%일 때 강도 0
+                    signal_strength = 10 * (1 - min(1, progress))
+                else:
+                    # 아직 갭 채움이 시작되지 않음 - 강도는 갭 크기에 비례
+                    signal_strength = min(10, gap_pct * 200)  # 최대 5% 갭에서 10점
+            
+            elif gap_data['direction'] == "DOWN":
+                # 갭 다운일 때는 매수 신호 (갭 채움 예상)
+                direction = "BUY"
+                
+                # 갭 채움 진행 정도에 따른 신호 강도 계산
+                if current_price > gap_data['today_open']:
+                    # 갭 채움이 진행 중
+                    progress = (current_price - gap_data['today_open']) / gap_data['gap_size']
+                    
+                    # 진행 정도에 따라 신호 강도 조정 (0~10 범위)
+                    # 진행 정도가 0%일 때 강도 10, 100%일 때 강도 0
+                    signal_strength = 10 * (1 - min(1, progress))
+                else:
+                    # 아직 갭 채움이 시작되지 않음 - 강도는 갭 크기에 비례
+                    signal_strength = min(10, abs(gap_pct) * 200)  # 최대 5% 갭에서 10점
+            
+            # 거래량 요소 고려
+            vol_ratio = self.volume_data[symbol].get('volume_ratio', 0)
+            vol_threshold = self.params["volume_threshold"]
+            
+            # 거래량이 평균보다 높으면 신호 강화
+            if vol_ratio > vol_threshold:
+                # 거래량 비율에 따라 신호 강도 보너스 (최대 +2)
+                vol_bonus = min(2, (vol_ratio - vol_threshold))
+                signal_strength = min(10, signal_strength + vol_bonus)
+            
+            logger.log_system(f"[DEBUG] {symbol} - 갭 신호: 방향={direction}, 강도={signal_strength:.1f}, "
+                             f"갭={gap_pct:.2%}, 현재가={current_price}, 시가={gap_data['today_open']}, "
+                             f"거래량비율={vol_ratio:.1f}")
+            
+            return {"signal": signal_strength, "direction": direction}
+            
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - 갭 신호 계산 오류")
+            return {"signal": 0, "direction": "NEUTRAL"}
+    
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
         try:
