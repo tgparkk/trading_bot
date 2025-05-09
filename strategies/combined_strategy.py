@@ -62,6 +62,15 @@ class CombinedStrategy:
         self.signals = {}               # {symbol: {'score': float, 'direction': str, 'strategies': {}}}
         self.price_data = {}            # {symbol: deque of price data}
         
+        # 개별 전략 객체 초기화
+        self.strategies = {
+            'breakout': breakout_strategy,
+            'momentum': momentum_strategy,
+            'gap': gap_strategy,
+            'vwap': vwap_strategy,
+            'volume': volume_strategy
+        }
+        
         # 가중치 정규화
         self._normalize_weights()
         
@@ -209,61 +218,53 @@ class CombinedStrategy:
             logger.log_error(e, "Error handling price update in combined strategy")
     
     async def _update_signals(self, symbol: str):
-        """각 전략별 신호 업데이트"""
+        """개별 전략 신호 업데이트"""
         try:
-            # 각 전략별 신호 강도와 방향 가져오기
-            breakout_signal = breakout_strategy.get_signal_strength(symbol)
-            breakout_direction = breakout_strategy.get_signal_direction(symbol)
-            
-            momentum_signal = momentum_strategy.get_signal_strength(symbol)
-            momentum_direction = momentum_strategy.get_signal_direction(symbol)
-            
-            gap_signal = gap_strategy.get_signal_strength(symbol)
-            gap_direction = gap_strategy.get_signal_direction(symbol)
-            
-            vwap_signal = vwap_strategy.get_signal_strength(symbol)
-            vwap_direction = vwap_strategy.get_signal_direction(symbol)
-            
-            volume_signal = volume_strategy.get_signal_strength(symbol)
-            volume_direction = volume_strategy.get_signal_direction(symbol)
-            
-            # 신호 저장
-            self.signals[symbol]['strategies'] = {
-                'breakout': {'signal': breakout_signal, 'direction': breakout_direction},
-                'momentum': {'signal': momentum_signal, 'direction': momentum_direction},
-                'gap': {'signal': gap_signal, 'direction': gap_direction},
-                'vwap': {'signal': vwap_signal, 'direction': vwap_direction},
-                'volume': {'signal': volume_signal, 'direction': volume_direction}
-            }
-            
-            # 종합 점수 및 방향 계산
-            score, direction, agreements = self._calculate_combined_signal(symbol)
-            
-            self.signals[symbol]['score'] = score
-            self.signals[symbol]['direction'] = direction
-            self.signals[symbol]['agreements'] = agreements
-            
-            # 로그 (신호 강도가 충분히 강한 경우에만)
-            if score >= 3.0:
-                logger.log_system(
-                    f"Combined signal for {symbol}: {direction} (Score: {score:.2f}, "
-                    f"Agreements: {agreements['BUY']}/{agreements['SELL']})"
-                )
+            # 각 전략 신호 계산
+            for strategy_name, strategy in self.strategies.items():
+                if not strategy or not hasattr(strategy, "get_signal"):
+                    continue
                 
-                # trade.log에도 신호 기록
-                logger.log_trade(
-                    action="SIGNAL",
-                    symbol=symbol,
-                    price=0,
-                    quantity=0,
-                    reason=f"{direction} 신호 강도: {score:.1f}/10.0",
-                    score=f"{score:.1f}",
-                    direction=direction,
-                    buy_agreements=agreements['BUY'],
-                    sell_agreements=agreements['SELL'],
-                    time=datetime.now().strftime("%H:%M:%S")
-                )
+                signal = await strategy.get_signal(symbol)
+                
+                if signal is None:
+                    continue
+                
+                # 전략 신호 저장
+                if symbol not in self.signals:
+                    self.signals[symbol] = {
+                        "strategies": {},
+                        "combined_signal": 0,
+                        "direction": "NEUTRAL",
+                        "last_update": datetime.now(),
+                        "last_price": 0  # 마지막 가격 정보 초기화
+                    }
+                
+                # 신호, 방향, 가격 정보 저장
+                if "strategies" not in self.signals[symbol]:
+                    self.signals[symbol]["strategies"] = {}
+                
+                self.signals[symbol]["strategies"][strategy_name] = signal
+                
+                # 가격 데이터가 있으면 last_price 업데이트
+                if symbol in self.price_data and self.price_data[symbol]:
+                    current_price = self.price_data[symbol][-1]["price"]
+                    self.signals[symbol]["last_price"] = current_price
+                elif hasattr(strategy, "get_last_price"):
+                    price = strategy.get_last_price(symbol)
+                    if price and price > 0:
+                        self.signals[symbol]["last_price"] = price
+                
+                # 마지막 업데이트 시간 기록
+                self.signals[symbol]["last_update"] = datetime.now()
             
+            # 통합 신호 계산
+            if symbol in self.signals and "strategies" in self.signals[symbol]:
+                score, direction, agreements = self._calculate_combined_signal(symbol)
+                self.signals[symbol]["combined_signal"] = score
+                self.signals[symbol]["direction"] = direction
+                self.signals[symbol]["agreements"] = agreements
+        
         except Exception as e:
             logger.log_error(e, f"Error updating signals for {symbol}")
     
@@ -362,18 +363,28 @@ class CombinedStrategy:
         """전략 실행 루프"""
         while self.running:
             try:
-                # 장 시간 체크
+                # 장 시간 체크 - TEST_MODE가 True면 항상 실행
+                is_test_mode = os.environ.get('TEST_MODE', '').lower() in ('true', 't', '1', 'yes', 'y')
+                
                 current_time = datetime.now().time()
-                if not (time(9, 0) <= current_time <= time(15, 30)):
+                is_market_hours = time(9, 0) <= current_time <= time(15, 30)
+                
+                # 테스트 모드거나 장 시간일 때만 진행
+                if not (is_test_mode or is_market_hours):
+                    logger.log_system(f"장 시간이 아님 - 현재: {current_time}, 거래 평가 건너뜀")
                     await asyncio.sleep(60)  # 장 시간 아닌 경우 1분 대기
                     continue
+                
+                # 테스트 모드 설정 로그 기록
+                if is_test_mode and not is_market_hours:
+                    logger.log_system(f"테스트 모드 활성화: 현재 시간은 {current_time}이지만 장 시간으로 처리합니다.")
                 
                 # 전략이 일시 중지된 경우 스킵
                 if self.paused or order_manager.is_trading_paused():
                     await asyncio.sleep(1)
                     continue
                 
-                # 거래 신호 확인 및 실행
+                # 거래 신호 확인 및 실행 (평가 로그 생성)
                 for symbol in self.watched_symbols:
                     await self._check_and_trade(symbol)
                 
@@ -394,14 +405,38 @@ class CombinedStrategy:
             if len(symbol_positions) >= self.params["max_positions"]:
                 return
             
-            # 현재가
-            if not self.price_data[symbol]:
-                return
+            # 현재가 확인 - 가격 데이터가 없어도 로깅은 진행
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            elif symbol in self.signals and "last_price" in self.signals[symbol]:
+                current_price = self.signals[symbol]["last_price"]
+            
+            # 신호 계산 전 전략 신호 업데이트 (누락된 신호가 있을 수 있음)
+            if symbol not in self.signals or 'strategies' not in self.signals[symbol]:
+                # 기본 신호 구성
+                self.signals[symbol] = {
+                    'strategies': {
+                        'breakout': {'signal': 0, 'direction': "NEUTRAL"},
+                        'momentum': {'signal': 0, 'direction': "NEUTRAL"},
+                        'gap': {'signal': 0, 'direction': "NEUTRAL"},
+                        'vwap': {'signal': 0, 'direction': "NEUTRAL"},
+                        'volume': {'signal': 0, 'direction': "NEUTRAL"}
+                    },
+                    'score': 0,
+                    'direction': "NEUTRAL",
+                    'last_update': datetime.now()
+                }
                 
-            current_price = self.price_data[symbol][-1]["price"]
+                # 디버그 로그
+                logger.log_system(f"[DEBUG] 종목 {symbol}의 신호 초기화 완료")
             
             # 신호 계산
-            score, direction, agreements = self._calculate_combined_signal(symbol)
+            try:
+                score, direction, agreements = self._calculate_combined_signal(symbol)
+            except Exception as e:
+                logger.log_error(e, f"계산 오류: {symbol} - _calculate_combined_signal 실패")
+                score, direction, agreements = 0, "NEUTRAL", {"BUY": 0, "SELL": 0}
             
             # 매수/매도 기준값
             buy_threshold = self.params["buy_threshold"]
@@ -434,27 +469,36 @@ class CombinedStrategy:
                 failure_reason.append(f"방향성 불명확 (매수동의: {buy_count}, 매도동의: {sell_count}, 최소필요: {min_agreement})")
             
             # 매수/매도/중립/점수미달 등 모든 상태에 대해 상세 로깅
-            logger.log_trade(
-                action="TRADE_EVALUATION",
-                symbol=symbol,
-                price=current_price,
-                quantity=0,
-                reason=f"{evaluation_status} - 점수: {score:.1f}/10.0, 임계값(매수:{buy_threshold}/매도:{sell_threshold}), 방향: {direction}",
-                score=f"{score:.1f}",
-                buy_threshold=f"{buy_threshold}",
-                sell_threshold=f"{sell_threshold}",
-                direction=direction,
-                status=evaluation_status,
-                failure_reasons=", ".join(failure_reason) if failure_reason else "",
-                breakout=f"{strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']})",
-                momentum=f"{strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']})",
-                gap=f"{strategies['gap']['signal']:.1f}({strategies['gap']['direction']})",
-                vwap=f"{strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']})",
-                volume=f"{strategies['volume']['signal']:.1f}({strategies['volume']['direction']})",
-                buy_agreements=agreements.get('BUY', 0),
-                sell_agreements=agreements.get('SELL', 0),
-                time=datetime.now().strftime("%H:%M:%S")
-            )
+            try:
+                logger.log_trade(
+                    action="TRADE_EVALUATION",
+                    symbol=symbol,
+                    price=current_price,
+                    quantity=0,
+                    reason=f"{evaluation_status} - 점수: {score:.1f}/10.0, 임계값(매수:{buy_threshold}/매도:{sell_threshold}), 방향: {direction}",
+                    score=f"{score:.1f}",
+                    buy_threshold=f"{buy_threshold}",
+                    sell_threshold=f"{sell_threshold}",
+                    direction=direction,
+                    status=evaluation_status,
+                    failure_reasons=", ".join(failure_reason) if failure_reason else "",
+                    breakout=f"{strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']})",
+                    momentum=f"{strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']})",
+                    gap=f"{strategies['gap']['signal']:.1f}({strategies['gap']['direction']})",
+                    vwap=f"{strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']})",
+                    volume=f"{strategies['volume']['signal']:.1f}({strategies['volume']['direction']})",
+                    buy_agreements=agreements.get('BUY', 0),
+                    sell_agreements=agreements.get('SELL', 0),
+                    time=datetime.now().strftime("%H:%M:%S")
+                )
+                logger.log_system(f"[DEBUG] {symbol} - TRADE_EVALUATION 로그 기록 완료")
+            except Exception as e:
+                logger.log_error(e, f"로깅 오류: {symbol} - TRADE_EVALUATION 로깅 실패")
+            
+            # 실제 매매는 유효한 가격이 있을 때만 진행
+            if current_price <= 0:
+                logger.log_system(f"[TRADE_SKIP] {symbol} - 가격 데이터 없음, 매매 건너뜀. 로깅만 수행")
+                return
             
             # 매수 신호
             if direction == "BUY" and score >= buy_threshold:
