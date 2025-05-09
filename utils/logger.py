@@ -313,6 +313,12 @@ class TradingLogger:
                  f"Total Trades: {total_trades}"
         self.trade_logger.info(message)
     
+    def log_warning(self, message: str):
+        """경고 로그"""
+        # 현재 날짜의 로그 디렉토리 확인 및 생성
+        self._ensure_daily_log_dir()
+        self.system_logger.warning(message)
+    
     def _ensure_daily_log_dir(self):
         """현재 날짜의 로그 디렉토리가 있는지 확인하고 없으면 생성"""
         today = datetime.now().strftime("%Y-%m-%d")

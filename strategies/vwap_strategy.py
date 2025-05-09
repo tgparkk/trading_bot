@@ -499,10 +499,122 @@ class VWAPStrategy:
     
     def get_signal_direction(self, symbol: str) -> str:
         """신호 방향 반환"""
-        if symbol in self.vwap_data:
-            return self.vwap_data[symbol].get("signal_direction", "NEUTRAL")
+        if symbol not in self.price_data or not self.price_data[symbol]:
+            return "NEUTRAL"
+            
+        if symbol not in self.vwap_data or not self.vwap_data[symbol].get('vwap'):
+            return "NEUTRAL"
+            
+        current_price = self.price_data[symbol][-1]["price"]
+        vwap_data = self.vwap_data[symbol]
+        vwap = vwap_data['vwap']
+        upper_band = vwap_data['upper_band']
+        lower_band = vwap_data['lower_band']
+        
+        # 밴드 돌파로 신호 판단
+        if upper_band and current_price > upper_band:
+            return "SELL"  # 상단 밴드 돌파 시 매도
+        elif lower_band and current_price < lower_band:
+            return "BUY"   # 하단 밴드 돌파 시 매수
+        
+        # VWAP 돌파로 신호 판단
+        threshold = self.params["entry_threshold"]
+        price_diff_pct = (current_price - vwap) / vwap
+        
+        if abs(price_diff_pct) >= threshold:
+            return "SELL" if price_diff_pct > 0 else "BUY"
+            
         return "NEUTRAL"
         
+    async def get_signal(self, symbol: str) -> Dict[str, Any]:
+        """전략 신호 반환 (combined_strategy에서 호출)"""
+        try:
+            logger.log_system(f"[DEBUG] {symbol} - VWAP 신호 계산 시작")
+            
+            # 충분한 데이터가 있는지 확인
+            if symbol not in self.price_data or not self.price_data[symbol]:
+                logger.log_system(f"[DEBUG] {symbol} - VWAP 가격 데이터 없음, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # VWAP 데이터 확인
+            if symbol not in self.vwap_data or not self.vwap_data[symbol].get('vwap'):
+                logger.log_system(f"[DEBUG] {symbol} - VWAP 계산 안됨, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 현재가 확인
+            current_price = self.price_data[symbol][-1]["price"]
+            
+            # VWAP 데이터
+            vwap_data = self.vwap_data[symbol]
+            vwap = vwap_data['vwap']
+            upper_band = vwap_data['upper_band']
+            lower_band = vwap_data['lower_band']
+            
+            # 방향과 신호 강도 계산
+            direction = "NEUTRAL"
+            signal_strength = 0
+            
+            # 진입 임계값
+            threshold = self.params["entry_threshold"]
+            
+            # 밴드 돌파 확인
+            if upper_band and lower_band:
+                if current_price > upper_band:
+                    # 상단 밴드 돌파 - 매도 신호
+                    direction = "SELL"
+                    
+                    # 돌파 정도에 따른 신호 강도 계산
+                    band_diff_pct = (current_price - upper_band) / upper_band
+                    signal_strength = min(10, band_diff_pct * 100)  # 1% 돌파 시 신호 강도 10
+                    
+                elif current_price < lower_band:
+                    # 하단 밴드 돌파 - 매수 신호
+                    direction = "BUY"
+                    
+                    # 돌파 정도에 따른 신호 강도 계산
+                    band_diff_pct = (lower_band - current_price) / lower_band
+                    signal_strength = min(10, band_diff_pct * 100)  # 1% 돌파 시 신호 강도 10
+            
+            # VWAP 레벨 확인 (밴드 돌파가 없을 경우)
+            if direction == "NEUTRAL" and vwap:
+                price_diff_pct = (current_price - vwap) / vwap
+                
+                # 진입 임계값보다 높은 경우
+                if abs(price_diff_pct) >= threshold:
+                    if price_diff_pct > 0:
+                        # 가격이 VWAP보다 높을 때 - 과매수 구간, 매도 신호
+                        direction = "SELL"
+                    else:
+                        # 가격이 VWAP보다 낮을 때 - 과매도 구간, 매수 신호
+                        direction = "BUY"
+                    
+                    # 차이 정도에 따른 신호 강도 계산
+                    signal_strength = min(8, (abs(price_diff_pct) - threshold) * 100)  # 진입 임계값 초과 0.8% 시 신호 강도 8
+            
+            # 거래량 요소 고려 (추가적인 데이터가 있다면)
+            avg_volume = 0
+            current_volume = 0
+            
+            if len(self.price_data[symbol]) > 10:
+                current_volume = self.price_data[symbol][-1]["volume"]
+                avg_volume = np.mean([item["volume"] for item in list(self.price_data[symbol])[-10:]])
+            
+            if avg_volume > 0 and current_volume > avg_volume * 1.5:
+                # 거래량 증가 시 신호 강화 (최대 +2)
+                vol_ratio = current_volume / avg_volume
+                vol_bonus = min(2, (vol_ratio - 1.5) * 2)
+                signal_strength = min(10, signal_strength + vol_bonus)
+            
+            logger.log_system(f"[DEBUG] {symbol} - VWAP 신호: 방향={direction}, 강도={signal_strength:.1f}, "
+                             f"현재가={current_price}, VWAP={vwap:.2f}, "
+                             f"상단밴드={upper_band:.2f}, 하단밴드={lower_band:.2f}")
+            
+            return {"signal": signal_strength, "direction": direction}
+            
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - VWAP 신호 계산 오류")
+            return {"signal": 0, "direction": "NEUTRAL"}
+    
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
         try:

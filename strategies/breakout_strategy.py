@@ -402,11 +402,100 @@ class BreakoutStrategy:
             return 0
     
     def get_signal_direction(self, symbol: str) -> str:
-        """현재 신호 방향 반환"""
-        if symbol in self.breakout_levels:
-            return self.breakout_levels[symbol].get("signal_direction", "NEUTRAL")
-        return "NEUTRAL"
-        
+        """신호 방향 반환"""
+        try:
+            # 초기화가 완료되지 않았으면 중립 반환
+            if not self.initialization_complete.get(symbol, False):
+                return "NEUTRAL"
+            
+            # 현재가 확인
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            
+            # 브레이크아웃 레벨 확인
+            breakout_data = self.breakout_levels.get(symbol, {})
+            if not breakout_data or 'high_level' not in breakout_data or 'low_level' not in breakout_data:
+                return "NEUTRAL"
+            
+            high_level = breakout_data.get('high_level')
+            low_level = breakout_data.get('low_level')
+            
+            # 방향 판단
+            if current_price > high_level:  # 상향 돌파
+                return "BUY"
+            elif current_price < low_level:  # 하향 돌파
+                return "SELL"
+            else:
+                return "NEUTRAL"
+                
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - 브레이크아웃 방향 판단 오류")
+            return "NEUTRAL"
+    
+    async def get_signal(self, symbol: str) -> Dict[str, Any]:
+        """전략 신호 반환 (combined_strategy에서 호출)"""
+        try:
+            # 초기화가 완료되지 않았으면 중립 반환
+            if not self.initialization_complete.get(symbol, False):
+                logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 초기화 미완료, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 현재가 확인
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            
+            # 현재가가 없으면 API에서 가져오기
+            if current_price <= 0:
+                try:
+                    symbol_info = await api_client.get_symbol_info(symbol)
+                    if symbol_info and "current_price" in symbol_info:
+                        current_price = float(symbol_info["current_price"])
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} - 브레이크아웃 현재가 조회 실패")
+                    return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 브레이크아웃 레벨 확인
+            breakout_data = self.breakout_levels.get(symbol, {})
+            if not breakout_data or 'high_level' not in breakout_data or 'low_level' not in breakout_data:
+                logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 레벨 미설정, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            high_level = breakout_data.get('high_level')
+            low_level = breakout_data.get('low_level')
+            
+            # 방향과 신호 강도 계산
+            direction = "NEUTRAL"
+            signal_strength = 0
+            
+            if current_price > high_level:  # 상향 돌파
+                direction = "BUY"
+                # 돌파 정도에 따른 신호 강도 계산 (최대 10)
+                price_range = breakout_data.get('range', 0)
+                if price_range > 0:
+                    excess = current_price - high_level
+                    signal_strength = min(10, (excess / price_range) * 10)
+                else:
+                    signal_strength = 5  # 기본값
+            
+            elif current_price < low_level:  # 하향 돌파
+                direction = "SELL"
+                # 돌파 정도에 따른 신호 강도 계산 (최대 10)
+                price_range = breakout_data.get('range', 0)
+                if price_range > 0:
+                    excess = low_level - current_price
+                    signal_strength = min(10, (excess / price_range) * 10)
+                else:
+                    signal_strength = 5  # 기본값
+            
+            logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}")
+            return {"signal": signal_strength, "direction": direction}
+            
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - 브레이크아웃 신호 계산 오류")
+            return {"signal": 0, "direction": "NEUTRAL"}
+    
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
         try:

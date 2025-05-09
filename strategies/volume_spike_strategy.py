@@ -520,6 +520,114 @@ class VolumeStrategy:
             return self.signals[symbol].get("direction", "NEUTRAL")
         return "NEUTRAL"
         
+    async def get_signal(self, symbol: str) -> Dict[str, Any]:
+        """전략 신호 반환 (combined_strategy에서 호출)"""
+        try:
+            logger.log_system(f"[DEBUG] {symbol} - 볼륨 스파이크 신호 계산 시작")
+            
+            # 볼륨 데이터 확인
+            if symbol not in self.volume_data or not self.volume_data[symbol].get('avg_volume'):
+                logger.log_system(f"[DEBUG] {symbol} - 볼륨 데이터 없음, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 가격 데이터 확인
+            if symbol not in self.price_data or len(self.price_data[symbol]) < 3:
+                logger.log_system(f"[DEBUG] {symbol} - 가격 데이터 부족, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            volume_data = self.volume_data[symbol]
+            
+            # 볼륨 스파이크 감지 여부 확인
+            if not volume_data.get('spike_detected') or not volume_data.get('last_spike_time'):
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 스파이크 이후 경과 시간 계산
+            current_time = datetime.now()
+            time_since_spike = (current_time - volume_data['last_spike_time']).total_seconds() / 60  # 분 단위
+            
+            # 스파이크 이후 너무 오래된 경우 (30분 이상) 무시
+            if time_since_spike > 30:
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 현재가 확인
+            current_price = self.price_data[symbol][-1]["price"]
+            
+            # 스파이크 감지 시점 가격과 현재 가격 비교
+            spike_price = 0
+            spike_idx = None
+            
+            # 스파이크 시점 가격 데이터 찾기
+            for i in range(len(self.price_data[symbol])):
+                if self.price_data[symbol][i]["timestamp"] >= volume_data['last_spike_time']:
+                    spike_idx = i
+                    break
+            
+            if spike_idx is not None and spike_idx < len(self.price_data[symbol]):
+                spike_price = self.price_data[symbol][spike_idx]["price"]
+            else:
+                # 스파이크 시점 가격 데이터가 없는 경우
+                return {"signal": 0, "direction": "NEUTRAL"}
+            
+            # 가격 변화율 계산
+            price_change_pct = (current_price - spike_price) / spike_price
+            
+            # 방향과 신호 강도 계산
+            direction = "NEUTRAL"
+            signal_strength = 0
+            
+            # 최소 가격 변화 임계값
+            price_threshold = self.params["price_move_threshold"]
+            
+            # 볼륨 스파이크 이후 충분한 가격 움직임이 있는지 확인
+            if abs(price_change_pct) >= price_threshold:
+                # 가격 상승 시 매수 신호
+                if price_change_pct > 0:
+                    direction = "BUY"
+                    
+                    # 가격 상승률에 비례한 신호 강도 (최대 10)
+                    signal_strength = min(10, price_change_pct * 100)
+                    
+                # 가격 하락 시 매도 신호
+                else:
+                    direction = "SELL"
+                    
+                    # 가격 하락률에 비례한 신호 강도 (최대 10)
+                    signal_strength = min(10, abs(price_change_pct) * 100)
+            else:
+                # 가격 변화가 임계값 이하인 경우 (조정 중)
+                # 볼륨 스파이크 정도에 따라 신호 강도 약하게 설정
+                if volume_data.get('last_volume_ratio', 0) > self.params["volume_multiplier"]:
+                    # 방향은 가격 변화 방향으로
+                    if price_change_pct > 0:
+                        direction = "BUY"
+                    elif price_change_pct < 0:
+                        direction = "SELL"
+                        
+                    # 신호 강도는 볼륨 배수에 비례 (최대 5)
+                    signal_strength = min(5, (volume_data.get('last_volume_ratio', 0) - self.params["volume_multiplier"]))
+            
+            # 시간 경과에 따른 신호 감쇠 (최대 30분)
+            if time_since_spike > 5:  # 5분 이후부터 감쇠 시작
+                decay_factor = max(0, 1 - ((time_since_spike - 5) / 25))  # 30분에 0이 됨
+                signal_strength *= decay_factor
+            
+            # 신호 정보 저장
+            self.signals[symbol] = {
+                "strength": signal_strength,
+                "direction": direction,
+                "last_update": current_time
+            }
+            
+            logger.log_system(f"[DEBUG] {symbol} - 볼륨 신호: 방향={direction}, 강도={signal_strength:.1f}, "
+                             f"볼륨배수={volume_data.get('last_volume_ratio', 0):.1f}, 가격변화={price_change_pct:.2%}, "
+                             f"스파이크이후={time_since_spike:.1f}분")
+            
+            return {"signal": signal_strength, "direction": direction}
+            
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - 볼륨 신호 계산 오류")
+            return {"signal": 0, "direction": "NEUTRAL"}
+    
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
         try:

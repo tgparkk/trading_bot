@@ -625,27 +625,35 @@ class Database:
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
     
-    def get_latest_token(self) -> Optional[Dict[str, Any]]:
-        """가장 최근에 발급된 유효한 토큰 조회"""
+    def get_latest_valid_token(self) -> Optional[Dict[str, Any]]:
+        """현재 유효한 최신 API 토큰 조회"""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # 가장 최근에 성공적으로 발급된 토큰 조회
-                query = """
-                    SELECT * FROM token_logs 
-                    WHERE event_type = 'ISSUE' AND status = 'SUCCESS' AND token IS NOT NULL 
+                # 현재 시간 기준으로 만료되지 않은 최신 토큰 조회
+                current_time = datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor.execute("""
+                    SELECT id, token, event_type, issue_time, expire_time, status
+                    FROM token_logs 
+                    WHERE status = 'SUCCESS' AND event_type = 'ISSUE'
+                    AND expire_time > ?
                     ORDER BY id DESC LIMIT 1
-                """
+                """, (current_time,))
                 
-                cursor.execute(query)
-                token_data = cursor.fetchone()
+                row = cursor.fetchone()
                 
-                if token_data:
-                    return dict(token_data)
-                return None
+                if row:
+                    token_data = dict(row)
+                    logger.log_system(f"유효한 토큰 조회 성공 (ID: {token_data['id']}, 만료: {token_data['expire_time']})")
+                    return token_data
+                else:
+                    logger.log_system("DB에서 유효한 토큰을 찾을 수 없음")
+                    return None
+                
         except Exception as e:
-            logger.log_error(e, "최신 토큰 조회 실패")
+            logger.log_error(e, "유효한 토큰 조회 중 DB 오류 발생")
             return None
     
     def get_symbol_search_logs(self, start_date: str = None, 
@@ -887,6 +895,34 @@ class Database:
             # 오류 발생 시 현재 시간 반환
             logger.log_error(e, "시작 시간 조회 중 오류 발생, 현재 시간 사용")
             return datetime.now()
+
+    def get_latest_token(self) -> Optional[Dict[str, Any]]:
+        """가장 최근에 발급된 유효한 토큰 조회 (하위 호환용)"""
+        try:
+            # 우선 유효한 토큰 찾기
+            valid_token = self.get_latest_valid_token()
+            if valid_token:
+                return valid_token
+            
+            # 유효한 토큰이 없으면 가장 최근에 발급된 토큰 반환 (만료 여부 무관)
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                query = """
+                    SELECT * FROM token_logs 
+                    WHERE event_type = 'ISSUE' AND status = 'SUCCESS' AND token IS NOT NULL 
+                    ORDER BY id DESC LIMIT 1
+                """
+                
+                cursor.execute(query)
+                token_data = cursor.fetchone()
+                
+                if token_data:
+                    return dict(token_data)
+                return None
+        except Exception as e:
+            logger.log_error(e, "최신 토큰 조회 실패")
+            return None
 
 # 싱글톤 인스턴스 생성
 db = Database()

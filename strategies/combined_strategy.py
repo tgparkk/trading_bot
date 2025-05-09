@@ -8,6 +8,7 @@ from datetime import datetime, time, timedelta
 from collections import deque
 import numpy as np
 import os
+import random
 
 from config.settings import config
 from core.api_client import api_client
@@ -62,14 +63,66 @@ class CombinedStrategy:
         self.signals = {}               # {symbol: {'score': float, 'direction': str, 'strategies': {}}}
         self.price_data = {}            # {symbol: deque of price data}
         
-        # 개별 전략 객체 초기화
-        self.strategies = {
-            'breakout': breakout_strategy,
-            'momentum': momentum_strategy,
-            'gap': gap_strategy,
-            'vwap': vwap_strategy,
-            'volume': volume_strategy
-        }
+        # 전략 객체 초기화 - 명시적 모듈 로드 및 에러 처리 개선
+        self.strategies = {}
+        
+        # 전략 모듈 로드 및 초기화
+        try:
+            # breakout 전략 로드
+            from strategies.breakout_strategy import breakout_strategy
+            self.strategies['breakout'] = breakout_strategy
+            logger.log_system("브레이크아웃 전략 로드 성공")
+        except ImportError as e:
+            logger.log_error(e, "브레이크아웃 전략 로드 실패")
+            self.strategies['breakout'] = None
+        
+        try:
+            # momentum 전략 로드
+            from strategies.momentum_strategy import momentum_strategy
+            self.strategies['momentum'] = momentum_strategy
+            logger.log_system("모멘텀 전략 로드 성공")
+        except ImportError as e:
+            logger.log_error(e, "모멘텀 전략 로드 실패")
+            self.strategies['momentum'] = None
+        
+        try:
+            # gap 전략 로드
+            from strategies.gap_strategy import gap_strategy
+            self.strategies['gap'] = gap_strategy
+            logger.log_system("갭 전략 로드 성공")
+        except ImportError as e:
+            logger.log_error(e, "갭 전략 로드 실패")
+            self.strategies['gap'] = None
+        
+        try:
+            # vwap 전략 로드
+            from strategies.vwap_strategy import vwap_strategy
+            self.strategies['vwap'] = vwap_strategy
+            logger.log_system("VWAP 전략 로드 성공")
+        except ImportError as e:
+            logger.log_error(e, "VWAP 전략 로드 실패")
+            self.strategies['vwap'] = None
+        
+        try:
+            # volume 전략 로드
+            from strategies.volume_spike_strategy import volume_strategy
+            self.strategies['volume'] = volume_strategy
+            logger.log_system("볼륨 전략 로드 성공")
+        except ImportError as e:
+            logger.log_error(e, "볼륨 전략 로드 실패")
+            self.strategies['volume'] = None
+        
+        # 전략 객체 유효성 확인
+        valid_strategies = 0
+        for strategy_name, strategy in self.strategies.items():
+            if strategy is None:
+                logger.log_error(f"{strategy_name} 전략 객체가 None입니다. 초기화에 실패했을 수 있습니다.")
+            elif not hasattr(strategy, "get_signal"):
+                logger.log_error(f"{strategy_name} 전략에 get_signal 메서드가 없습니다.")
+            else:
+                valid_strategies += 1
+        
+        logger.log_system(f"전략 초기화 상태: 총 {len(self.strategies)}개 중 {valid_strategies}개 유효")
         
         # 가중치 정규화
         self._normalize_weights()
@@ -220,178 +273,379 @@ class CombinedStrategy:
     async def _update_signals(self, symbol: str):
         """개별 전략 신호 업데이트"""
         try:
-            # 각 전략 신호 계산
+            logger.log_system(f"[전략] {symbol} - 신호 업데이트 시작")
+            
+            # 현재가 정보 업데이트
+            try:
+                from core.api_client import api_client
+                
+                # API 호출 타임아웃 처리를 위한 Task 생성
+                get_symbol_task = asyncio.create_task(api_client.get_symbol_info(symbol))
+                try:
+                    # 2초 타임아웃 설정
+                    symbol_info = await asyncio.wait_for(get_symbol_task, timeout=2.0)
+                    
+                    if symbol_info and "current_price" in symbol_info:
+                        current_price = float(symbol_info["current_price"])
+                        is_test_data = symbol_info.get("is_test_data", False)
+                        
+                        if is_test_data:
+                            logger.log_system(f"[전략] {symbol} - 테스트 데이터 사용: {current_price:,}원")
+                        else:
+                            logger.log_system(f"[전략] {symbol} - API에서 가격 가져옴: {current_price:,}원")
+                        
+                        # 가격 데이터 업데이트
+                        if symbol not in self.price_data:
+                            self.price_data[symbol] = deque(maxlen=100)
+                        
+                        self.price_data[symbol].append({
+                            "price": current_price,
+                            "volume": symbol_info.get("volume", 0),
+                            "timestamp": datetime.now()
+                        })
+                        
+                        # signals에도 가격 정보 저장
+                        if symbol in self.signals:
+                            self.signals[symbol]["last_price"] = current_price
+                        else:
+                            self.signals[symbol] = {
+                                'score': 0,
+                                'direction': "NEUTRAL",
+                                'strategies': {},
+                                'last_update': None,
+                                'last_price': current_price
+                            }
+                    else:
+                        logger.log_system(f"[전략] {symbol} - API 응답에 가격 정보 없음")
+                        
+                except asyncio.TimeoutError:
+                    logger.log_system(f"[전략] {symbol} - API 가격 조회 타임아웃 (2초)")
+                    # 타임아웃 발생 시 이전 가격 사용 또는 테스트 데이터 생성
+                    await self._handle_price_fallback(symbol)
+                
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - API 가격 조회 실패")
+                # API 실패 시 이전 가격 사용 또는 대체 데이터 생성
+                await self._handle_price_fallback(symbol)
+            
+            # 각 전략별 신호 업데이트
             for strategy_name, strategy in self.strategies.items():
-                if not strategy or not hasattr(strategy, "get_signal"):
+                if strategy is None:
+                    logger.log_system(f"[전략] {symbol} - {strategy_name} 전략이 None이므로 건너뜀")
                     continue
                 
-                signal = await strategy.get_signal(symbol)
+                try:
+                    logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 요청 시작")
+                    
+                    # 전략별 신호 취득에도 타임아웃 설정
+                    get_signal_task = asyncio.create_task(strategy.get_signal(symbol))
+                    try:
+                        # 각 전략 호출에 2초 타임아웃 설정
+                        signal = await asyncio.wait_for(get_signal_task, timeout=2.0)
+                    except asyncio.TimeoutError:
+                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 호출 타임아웃 (2초)")
+                        signal = {'signal': 0, 'direction': 'NEUTRAL'}
+                    
+                    if signal is None:
+                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호가 None으로 반환됨")
+                        continue
+                    
+                    # 전략 신호 저장
+                    if symbol not in self.signals:
+                        current_price = 0
+                        if symbol in self.price_data and self.price_data[symbol]:
+                            current_price = self.price_data[symbol][-1]["price"]
+                            
+                        self.signals[symbol] = {
+                            "strategies": {},
+                            "combined_signal": 0,
+                            "direction": "NEUTRAL",
+                            "last_update": datetime.now(),
+                            "last_price": current_price
+                        }
+                    
+                    # 신호, 방향, 가격 정보 저장
+                    if "strategies" not in self.signals[symbol]:
+                        self.signals[symbol]["strategies"] = {}
+                    
+                    # 명시적으로 신호 저장 및 유효성 확인
+                    if isinstance(signal, dict) and 'signal' in signal and 'direction' in signal:
+                        # 숫자형으로 변환 확인
+                        signal_value = signal['signal']
+                        try:
+                            if isinstance(signal_value, str):
+                                signal_value = float(signal_value)
+                            elif not isinstance(signal_value, (int, float)):
+                                signal_value = 0
+                        except (ValueError, TypeError):
+                            signal_value = 0
+                            
+                        # 방향 문자열 확인
+                        direction_value = signal['direction']
+                        if direction_value not in ["BUY", "SELL", "NEUTRAL"]:
+                            direction_value = "NEUTRAL"
+                            
+                        self.signals[symbol]["strategies"][strategy_name] = {
+                            'signal': signal_value,
+                            'direction': direction_value
+                        }
+                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 저장: 점수={signal_value:.1f}, 방향={direction_value}")
+                    else:
+                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
+                        # 기본값 설정
+                        self.signals[symbol]["strategies"][strategy_name] = {'signal': 0, 'direction': 'NEUTRAL'}
+                    
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} - {strategy_name} 전략 신호 가져오기 실패")
+                    # 오류 발생 시 기본값 설정
+                    if symbol in self.signals and "strategies" in self.signals[symbol]:
+                        self.signals[symbol]["strategies"][strategy_name] = {'signal': 0, 'direction': 'NEUTRAL'}
                 
-                if signal is None:
-                    continue
-                
-                # 전략 신호 저장
-                if symbol not in self.signals:
-                    self.signals[symbol] = {
-                        "strategies": {},
-                        "combined_signal": 0,
-                        "direction": "NEUTRAL",
-                        "last_update": datetime.now(),
-                        "last_price": 0  # 마지막 가격 정보 초기화
-                    }
-                
-                # 신호, 방향, 가격 정보 저장
-                if "strategies" not in self.signals[symbol]:
-                    self.signals[symbol]["strategies"] = {}
-                
-                self.signals[symbol]["strategies"][strategy_name] = signal
-                
-                # 가격 데이터가 있으면 last_price 업데이트
-                if symbol in self.price_data and self.price_data[symbol]:
-                    current_price = self.price_data[symbol][-1]["price"]
-                    self.signals[symbol]["last_price"] = current_price
-                elif hasattr(strategy, "get_last_price"):
-                    price = strategy.get_last_price(symbol)
-                    if price and price > 0:
-                        self.signals[symbol]["last_price"] = price
-                
-                # 마지막 업데이트 시간 기록
-                self.signals[symbol]["last_update"] = datetime.now()
+                # 각 전략 호출 사이에 약간의 지연 추가
+                await asyncio.sleep(0.1)
             
             # 통합 신호 계산
             if symbol in self.signals and "strategies" in self.signals[symbol]:
+                # 필수 전략이 모두 있는지 확인
+                required_strategies = ['breakout', 'momentum', 'gap', 'vwap', 'volume']
+                for req_strategy in required_strategies:
+                    if req_strategy not in self.signals[symbol]['strategies']:
+                        logger.log_system(f"[전략] {symbol} - {req_strategy} 전략 신호 누락, 기본값으로 설정")
+                        self.signals[symbol]['strategies'][req_strategy] = {'signal': 0, 'direction': 'NEUTRAL'}
+                
+                # 디버그 로그: 계산 전 각 전략별 신호 출력
+                strategy_log = f"[신호계산] {symbol} 전략별 상태: "
+                for strat_name, strat_data in self.signals[symbol]['strategies'].items():
+                    strategy_log += f"{strat_name}={strat_data.get('signal', 0):.1f}({strat_data.get('direction', 'NEUTRAL')}), "
+                logger.log_system(strategy_log)
+                
+                # 통합 신호 계산
                 score, direction, agreements = self._calculate_combined_signal(symbol)
                 self.signals[symbol]["combined_signal"] = score
                 self.signals[symbol]["direction"] = direction
                 self.signals[symbol]["agreements"] = agreements
+                self.signals[symbol]["last_update"] = datetime.now()
+                logger.log_system(f"[전략] {symbol} - 통합 신호 계산 완료: 점수={score:.1f}, 방향={direction}, 동의={agreements}")
+            else:
+                logger.log_system(f"[전략] {symbol} - 통합 신호 계산을 위한 데이터 부족")
         
         except Exception as e:
             logger.log_error(e, f"Error updating signals for {symbol}")
     
+    async def _handle_price_fallback(self, symbol: str):
+        """API 가격 조회 실패 시 대체 가격 정보 생성"""
+        # 1. 이전 가격 데이터가 있으면 사용
+        if symbol in self.price_data and self.price_data[symbol]:
+            last_price_data = self.price_data[symbol][-1]
+            current_price = last_price_data["price"]
+            logger.log_system(f"[전략] {symbol} - 이전 가격 데이터 사용: {current_price:,}원")
+            
+            # signals에도 가격 정보 유지
+            if symbol in self.signals:
+                self.signals[symbol]["last_price"] = current_price
+            else:
+                self.signals[symbol] = {
+                    'score': 0,
+                    'direction': "NEUTRAL",
+                    'strategies': {},
+                    'last_update': None,
+                    'last_price': current_price
+                }
+            return
+        
+        # 2. 이전 가격이 없으면 테스트 데이터 생성 요청
+        try:
+            from core.api_client import api_client
+            test_data = api_client._generate_test_price_data(symbol)
+            if test_data and "current_price" in test_data:
+                current_price = float(test_data["current_price"])
+                logger.log_system(f"[전략] {symbol} - 테스트 가격 데이터 생성: {current_price:,}원")
+                
+                # 가격 데이터 업데이트
+                if symbol not in self.price_data:
+                    self.price_data[symbol] = deque(maxlen=100)
+                
+                self.price_data[symbol].append({
+                    "price": current_price,
+                    "volume": test_data.get("volume", 0),
+                    "timestamp": datetime.now()
+                })
+                
+                # signals에도 가격 정보 저장
+                if symbol in self.signals:
+                    self.signals[symbol]["last_price"] = current_price
+                else:
+                    self.signals[symbol] = {
+                        'score': 0,
+                        'direction': "NEUTRAL",
+                        'strategies': {},
+                        'last_update': None,
+                        'last_price': current_price
+                    }
+            else:
+                logger.log_system(f"[전략] {symbol} - 테스트 데이터 생성 실패")
+        except Exception as e:
+            logger.log_error(e, f"{symbol} - 대체 가격 데이터 생성 실패")
+    
     def _calculate_combined_signal(self, symbol: str) -> Tuple[float, str, Dict[str, int]]:
         """개별 신호를 종합하여 최종 신호 강도와 방향 계산"""
-        strategies = self.signals[symbol]['strategies']
-        
-        # 가중 점수 계산
-        breakout_score = strategies['breakout']['signal'] * self.params["breakout_weight"]
-        momentum_score = strategies['momentum']['signal'] * self.params["momentum_weight"]
-        gap_score = strategies['gap']['signal'] * self.params["gap_weight"]
-        vwap_score = strategies['vwap']['signal'] * self.params["vwap_weight"]
-        volume_score = strategies['volume']['signal'] * self.params["volume_weight"]
-        
-        # 종합 점수 (0-10)
-        total_score = breakout_score + momentum_score + gap_score + vwap_score + volume_score
-        
-        # 방향성 투표
-        buy_votes = 0
-        sell_votes = 0
-        
-        # 각 전략별로 매수/매도 의견 카운트
-        if strategies['breakout']['direction'] == "BUY":
-            buy_votes += 1
-        elif strategies['breakout']['direction'] == "SELL":
-            sell_votes += 1
-            
-        if strategies['momentum']['direction'] == "BUY":
-            buy_votes += 1
-        elif strategies['momentum']['direction'] == "SELL":
-            sell_votes += 1
-            
-        if strategies['gap']['direction'] == "BUY":
-            buy_votes += 1
-        elif strategies['gap']['direction'] == "SELL":
-            sell_votes += 1
-            
-        if strategies['vwap']['direction'] == "BUY":
-            buy_votes += 1
-        elif strategies['vwap']['direction'] == "SELL":
-            sell_votes += 1
-            
-        if strategies['volume']['direction'] == "BUY":
-            buy_votes += 1
-        elif strategies['volume']['direction'] == "SELL":
-            sell_votes += 1
-        
-        # 최종 신호 방향 결정
-        direction = "NEUTRAL"
-        if buy_votes >= self.params["min_agreement"] and buy_votes > sell_votes:
-            direction = "BUY"
-        elif sell_votes >= self.params["min_agreement"] and sell_votes > buy_votes:
-            direction = "SELL"
-        
-        # 매수/매도 의견 수가 같으면 신호 강도로 결정
-        if buy_votes == sell_votes and buy_votes >= self.params["min_agreement"]:
-            # 각 매수/매도 신호의 총 강도 계산
-            buy_strength = 0
-            sell_strength = 0
-            
-            if strategies['breakout']['direction'] == "BUY":
-                buy_strength += strategies['breakout']['signal'] * self.params["breakout_weight"]
-            elif strategies['breakout']['direction'] == "SELL":
-                sell_strength += strategies['breakout']['signal'] * self.params["breakout_weight"]
+        try:
+            # strategies가 없으면 초기화
+            if symbol not in self.signals or 'strategies' not in self.signals[symbol]:
+                return 0.0, "NEUTRAL", {"BUY": 0, "SELL": 0}
                 
-            if strategies['momentum']['direction'] == "BUY":
-                buy_strength += strategies['momentum']['signal'] * self.params["momentum_weight"]
-            elif strategies['momentum']['direction'] == "SELL":
-                sell_strength += strategies['momentum']['signal'] * self.params["momentum_weight"]
-                
-            if strategies['gap']['direction'] == "BUY":
-                buy_strength += strategies['gap']['signal'] * self.params["gap_weight"]
-            elif strategies['gap']['direction'] == "SELL":
-                sell_strength += strategies['gap']['signal'] * self.params["gap_weight"]
-                
-            if strategies['vwap']['direction'] == "BUY":
-                buy_strength += strategies['vwap']['signal'] * self.params["vwap_weight"]
-            elif strategies['vwap']['direction'] == "SELL":
-                sell_strength += strategies['vwap']['signal'] * self.params["vwap_weight"]
-                
-            if strategies['volume']['direction'] == "BUY":
-                buy_strength += strategies['volume']['signal'] * self.params["volume_weight"]
-            elif strategies['volume']['direction'] == "SELL":
-                sell_strength += strategies['volume']['signal'] * self.params["volume_weight"]
+            strategies = self.signals[symbol]['strategies']
             
-            # 강도가 더 높은 쪽으로 결정
-            if buy_strength > sell_strength:
+            # 모든 전략이 기본값인지 확인 (실제 신호가 있는지)
+            has_real_signals = False
+            for strat_name, strat_data in strategies.items():
+                if strat_data.get('signal', 0) > 0 or strat_data.get('direction', 'NEUTRAL') != 'NEUTRAL':
+                    has_real_signals = True
+                    break
+                    
+            # 실제 신호가 없으면 기본값 반환
+            if not has_real_signals:
+                logger.log_system(f"[DEBUG] {symbol} - 모든 전략이 기본값이므로 계산 건너뜀")
+                return 0.0, "NEUTRAL", {"BUY": 0, "SELL": 0}
+            
+            # 가중 점수 계산 (안전한 변환 추가)
+            breakout_score = self._safe_float(strategies['breakout']['signal']) * self.params["breakout_weight"]
+            momentum_score = self._safe_float(strategies['momentum']['signal']) * self.params["momentum_weight"]
+            gap_score = self._safe_float(strategies['gap']['signal']) * self.params["gap_weight"]
+            vwap_score = self._safe_float(strategies['vwap']['signal']) * self.params["vwap_weight"]
+            volume_score = self._safe_float(strategies['volume']['signal']) * self.params["volume_weight"]
+            
+            # 개별 점수 로그
+            logger.log_system(f"[DEBUG] {symbol} - 가중치 계산: "
+                             f"breakout={breakout_score:.2f} (원래값={strategies['breakout']['signal']}), "
+                             f"momentum={momentum_score:.2f} (원래값={strategies['momentum']['signal']}), "
+                             f"gap={gap_score:.2f} (원래값={strategies['gap']['signal']}), "
+                             f"vwap={vwap_score:.2f} (원래값={strategies['vwap']['signal']}), "
+                             f"volume={volume_score:.2f} (원래값={strategies['volume']['signal']})")
+            
+            # 종합 점수 (0-10)
+            total_score = breakout_score + momentum_score + gap_score + vwap_score + volume_score
+            
+            # 방향성 투표
+            buy_votes = 0
+            sell_votes = 0
+            
+            # 각 전략별로 매수/매도 의견 카운트
+            for strat_name, strat_data in strategies.items():
+                direction = strat_data.get('direction', 'NEUTRAL')
+                if direction == "BUY":
+                    buy_votes += 1
+                elif direction == "SELL":
+                    sell_votes += 1
+            
+            # 최종 신호 방향 결정
+            direction = "NEUTRAL"
+            if buy_votes >= self.params["min_agreement"] and buy_votes > sell_votes:
                 direction = "BUY"
-            elif sell_strength > buy_strength:
+            elif sell_votes >= self.params["min_agreement"] and sell_votes > buy_votes:
                 direction = "SELL"
-        
-        agreements = {"BUY": buy_votes, "SELL": sell_votes}
-        return total_score, direction, agreements
+            
+            # 매수/매도 의견 수가 같으면 신호 강도로 결정
+            if buy_votes == sell_votes and buy_votes >= self.params["min_agreement"]:
+                # 각 매수/매도 신호의 총 강도 계산
+                buy_strength = 0
+                sell_strength = 0
+                
+                for strat_name, strat_data in strategies.items():
+                    strat_direction = strat_data.get('direction', 'NEUTRAL')
+                    strat_signal = self._safe_float(strat_data.get('signal', 0))
+                    
+                    # 해당 전략의 가중치 가져오기
+                    weight_param = f"{strat_name}_weight"
+                    weight = self.params.get(weight_param, 0.2)  # 기본값 0.2
+                    
+                    if strat_direction == "BUY":
+                        buy_strength += strat_signal * weight
+                    elif strat_direction == "SELL":
+                        sell_strength += strat_signal * weight
+                
+                # 강도가 더 높은 쪽으로 결정
+                if buy_strength > sell_strength:
+                    direction = "BUY"
+                elif sell_strength > buy_strength:
+                    direction = "SELL"
+            
+            agreements = {"BUY": buy_votes, "SELL": sell_votes}
+            return total_score, direction, agreements
+            
+        except Exception as e:
+            logger.log_error(e, f"Error in _calculate_combined_signal for {symbol}")
+            return 0.0, "NEUTRAL", {"BUY": 0, "SELL": 0}
+    
+    def _safe_float(self, value) -> float:
+        """안전하게 float로 변환"""
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            elif isinstance(value, str):
+                return float(value)
+            else:
+                return 0.0
+        except (ValueError, TypeError):
+            return 0.0
     
     async def _strategy_loop(self):
         """전략 실행 루프"""
         while self.running:
             try:
-                # 장 시간 체크 - TEST_MODE가 True면 항상 실행
-                is_test_mode = os.environ.get('TEST_MODE', '').lower() in ('true', 't', '1', 'yes', 'y')
-                
+                # 장 시간 체크
                 current_time = datetime.now().time()
                 is_market_hours = time(9, 0) <= current_time <= time(15, 30)
                 
-                # 테스트 모드거나 장 시간일 때만 진행
-                if not (is_test_mode or is_market_hours):
-                    logger.log_system(f"장 시간이 아님 - 현재: {current_time}, 거래 평가 건너뜀")
+                # 장 시간일 때만 진행
+                if not is_market_hours:
+                    # 매시간 정각에만 로그 출력 (불필요한 로그 감소)
+                    if current_time.minute == 0 and current_time.second < 10:
+                        logger.log_system(f"장 시간이 아님 - 현재: {current_time}, 거래 평가 건너뜀 (09:00-15:30)")
                     await asyncio.sleep(60)  # 장 시간 아닌 경우 1분 대기
                     continue
                 
-                # 테스트 모드 설정 로그 기록
-                if is_test_mode and not is_market_hours:
-                    logger.log_system(f"테스트 모드 활성화: 현재 시간은 {current_time}이지만 장 시간으로 처리합니다.")
-                
                 # 전략이 일시 중지된 경우 스킵
-                if self.paused or order_manager.is_trading_paused():
+                if self.paused:
                     await asyncio.sleep(1)
                     continue
                 
+                # 트레이딩 일시 중지 확인
+                try:
+                    is_paused_task = asyncio.create_task(order_manager.is_trading_paused())
+                    is_paused = await asyncio.wait_for(is_paused_task, timeout=2.0)
+                    if is_paused:
+                        await asyncio.sleep(1)
+                        continue
+                except asyncio.TimeoutError:
+                    logger.log_system("is_trading_paused 호출 타임아웃, 기본값으로 진행")
+                except Exception as e:
+                    logger.log_error(e, "is_trading_paused 호출 실패")
+                
                 # 거래 신호 확인 및 실행 (평가 로그 생성)
                 for symbol in self.watched_symbols:
-                    await self._check_and_trade(symbol)
+                    try:
+                        check_task = asyncio.create_task(self._check_and_trade(symbol))
+                        await asyncio.wait_for(check_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.log_system(f"{symbol} - _check_and_trade 처리 타임아웃 (5초)")
+                    except Exception as e:
+                        logger.log_error(e, f"{symbol} - _check_and_trade 호출 실패")
                 
-                # 포지션 모니터링
-                await self._monitor_positions()
+                    # 각 종목 처리 사이에 약간의 딜레이 (0.1초)
+                    await asyncio.sleep(0.1)
                 
-                await asyncio.sleep(1)  # 1초 대기
+                # 10초마다 한 번씩 포지션 모니터링
+                try:
+                    monitor_task = asyncio.create_task(self._monitor_positions())
+                    await asyncio.wait_for(monitor_task, timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.log_system("포지션 모니터링 타임아웃 (3초)")
+                except Exception as e:
+                    logger.log_error(e, "포지션 모니터링 실패")
+                
+                # 다음 주기까지 대기
+                await asyncio.sleep(1)
                 
             except Exception as e:
                 logger.log_error(e, "Combined strategy loop error")
@@ -407,33 +661,86 @@ class CombinedStrategy:
             
             # 현재가 확인 - 가격 데이터가 없어도 로깅은 진행
             current_price = 0
+            price_source = "없음"
+            
+            # 1. 먼저 price_data에서 가격 확인
             if symbol in self.price_data and self.price_data[symbol]:
                 current_price = self.price_data[symbol][-1]["price"]
+                price_source = "price_data"
+                logger.log_system(f"[거래] {symbol} - price_data에서 가격 확인: {current_price:,}원")
+            # 2. signals에서 last_price 확인
             elif symbol in self.signals and "last_price" in self.signals[symbol]:
                 current_price = self.signals[symbol]["last_price"]
+                price_source = "signals"
+                logger.log_system(f"[거래] {symbol} - signals의 last_price에서 가격 확인: {current_price:,}원")
+            # 3. API에서 직접 조회
+            else:
+                try:
+                    from core.api_client import api_client
+                    
+                    # 타임아웃 설정
+                    symbol_info_task = asyncio.create_task(api_client.get_symbol_info(symbol))
+                    try:
+                        symbol_info = await asyncio.wait_for(symbol_info_task, timeout=2.0)
+                        if symbol_info and "current_price" in symbol_info:
+                            current_price = float(symbol_info["current_price"])
+                            price_source = "api_direct"
+                            
+                            # 테스트 데이터 여부 확인
+                            if symbol_info.get("is_test_data", False):
+                                logger.log_system(f"[거래] {symbol} - API에서 테스트 데이터 가격 확인: {current_price:,}원")
+                            else:
+                                logger.log_system(f"[거래] {symbol} - API에서 직접 가격 확인: {current_price:,}원")
+                            
+                            # 가격 데이터 캐싱
+                            if symbol not in self.price_data:
+                                self.price_data[symbol] = deque(maxlen=100)
+                            
+                            self.price_data[symbol].append({
+                                "price": current_price,
+                                "volume": symbol_info.get("volume", 0),
+                                "timestamp": datetime.now()
+                            })
+                            
+                            # signals에도 캐싱
+                            if symbol in self.signals:
+                                self.signals[symbol]["last_price"] = current_price
+                            else:
+                                self.signals[symbol] = {
+                                    'score': 0, 
+                                    'direction': "NEUTRAL",
+                                    'strategies': {},
+                                    'last_update': None,
+                                    'last_price': current_price
+                                }
+                        else:
+                            logger.log_system(f"[거래] {symbol} - API 응답에 가격 정보가 없음")
+                    except asyncio.TimeoutError:
+                        logger.log_system(f"[거래] {symbol} - API 가격 조회 타임아웃 (2초)")
+                        
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} - API에서 직접 가격 확인 실패")
             
-            # 신호 계산 전 전략 신호 업데이트 (누락된 신호가 있을 수 있음)
-            if symbol not in self.signals or 'strategies' not in self.signals[symbol]:
-                # 기본 신호 구성
-                self.signals[symbol] = {
-                    'strategies': {
-                        'breakout': {'signal': 0, 'direction': "NEUTRAL"},
-                        'momentum': {'signal': 0, 'direction': "NEUTRAL"},
-                        'gap': {'signal': 0, 'direction': "NEUTRAL"},
-                        'vwap': {'signal': 0, 'direction': "NEUTRAL"},
-                        'volume': {'signal': 0, 'direction': "NEUTRAL"}
-                    },
-                    'score': 0,
-                    'direction': "NEUTRAL",
-                    'last_update': datetime.now()
-                }
-                
-                # 디버그 로그
-                logger.log_system(f"[DEBUG] 종목 {symbol}의 신호 초기화 완료")
+            # 가격 정보 로깅
+            if current_price > 0:
+                logger.log_system(f"[거래] {symbol} - 현재가: {current_price:,}원 (출처: {price_source})")
+            else:
+                logger.log_system(f"[거래] {symbol} - 현재가를 확인할 수 없음 (출처: {price_source})")
+                # 가격이 없으면 거래 판단 중단
+                return
+            
+            # 전략 신호 강제 업데이트
+            await self._update_signals(symbol)
+            logger.log_system(f"[거래] {symbol} - 신호 강제 업데이트 완료")
             
             # 신호 계산
             try:
+                if symbol not in self.signals or 'strategies' not in self.signals[symbol]:
+                    logger.log_system(f"[거래] {symbol} - 신호 데이터 없음, 계산 건너뜀")
+                    return
+                    
                 score, direction, agreements = self._calculate_combined_signal(symbol)
+                logger.log_system(f"[거래] {symbol} - 신호 계산 결과: 점수={score:.1f}, 방향={direction}, 매수동의={agreements.get('BUY', 0)}, 매도동의={agreements.get('SELL', 0)}")
             except Exception as e:
                 logger.log_error(e, f"계산 오류: {symbol} - _calculate_combined_signal 실패")
                 score, direction, agreements = 0, "NEUTRAL", {"BUY": 0, "SELL": 0}
@@ -446,111 +753,95 @@ class CombinedStrategy:
             # 매수/매도 판단 정보 trade.log에 자세히 기록
             strategies = self.signals[symbol]['strategies']
             
+            # 디버그: 각 전략별 점수와 방향 로그 기록
+            strategy_log = f"[거래판단] {symbol} - 전략별 점수: "
+            for strat_name, strat_data in strategies.items():
+                strategy_log += f"{strat_name}={strat_data.get('signal', 0):.1f}({strat_data.get('direction', 'NEUTRAL')}), "
+            logger.log_system(strategy_log)
+            
             # 평가 상태 결정
             evaluation_status = "NEUTRAL"
             failure_reason = []
             
-            if direction == "BUY":
-                if score >= buy_threshold:
-                    evaluation_status = "BUY_SIGNAL"
-                else:
-                    evaluation_status = "BUY_THRESHOLD_FAIL"
-                    failure_reason.append(f"매수점수 미달 (목표: {buy_threshold:.1f}, 실제: {score:.1f})")
-            elif direction == "SELL":
-                if score >= sell_threshold:
-                    evaluation_status = "SELL_SIGNAL"
-                else:
-                    evaluation_status = "SELL_THRESHOLD_FAIL"
-                    failure_reason.append(f"매도점수 미달 (목표: {sell_threshold:.1f}, 실제: {score:.1f})")
-            else:  # NEUTRAL
-                evaluation_status = "NEUTRAL"
-                buy_count = agreements.get("BUY", 0)
-                sell_count = agreements.get("SELL", 0)
-                failure_reason.append(f"방향성 불명확 (매수동의: {buy_count}, 매도동의: {sell_count}, 최소필요: {min_agreement})")
-            
-            # 매수/매도/중립/점수미달 등 모든 상태에 대해 상세 로깅
-            try:
-                logger.log_trade(
-                    action="TRADE_EVALUATION",
-                    symbol=symbol,
-                    price=current_price,
-                    quantity=0,
-                    reason=f"{evaluation_status} - 점수: {score:.1f}/10.0, 임계값(매수:{buy_threshold}/매도:{sell_threshold}), 방향: {direction}",
-                    score=f"{score:.1f}",
-                    buy_threshold=f"{buy_threshold}",
-                    sell_threshold=f"{sell_threshold}",
-                    direction=direction,
-                    status=evaluation_status,
-                    failure_reasons=", ".join(failure_reason) if failure_reason else "",
-                    breakout=f"{strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']})",
-                    momentum=f"{strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']})",
-                    gap=f"{strategies['gap']['signal']:.1f}({strategies['gap']['direction']})",
-                    vwap=f"{strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']})",
-                    volume=f"{strategies['volume']['signal']:.1f}({strategies['volume']['direction']})",
-                    buy_agreements=agreements.get('BUY', 0),
-                    sell_agreements=agreements.get('SELL', 0),
-                    time=datetime.now().strftime("%H:%M:%S")
-                )
-                logger.log_system(f"[DEBUG] {symbol} - TRADE_EVALUATION 로그 기록 완료")
-            except Exception as e:
-                logger.log_error(e, f"로깅 오류: {symbol} - TRADE_EVALUATION 로깅 실패")
-            
-            # 실제 매매는 유효한 가격이 있을 때만 진행
+            # 가격 0 체크
             if current_price <= 0:
-                logger.log_system(f"[TRADE_SKIP] {symbol} - 가격 데이터 없음, 매매 건너뜀. 로깅만 수행")
+                evaluation_status = "PRICE_ERROR"
+                failure_reason.append(f"가격 오류 (price={current_price})")
+                logger.log_system(f"[거래판단] {symbol} - 가격이 0 이하여서 거래 불가")
                 return
+                
+            # 매수 조건 평가
+            if direction == "BUY":
+                # 스코어 검증
+                if score < buy_threshold:
+                    failure_reason.append(f"점수 부족 (score={score:.1f} < threshold={buy_threshold})")
+                    evaluation_status = "WEAK_BUY"
+                
+                # 동의 개수 검증 
+                if agreements["BUY"] < min_agreement:
+                    failure_reason.append(f"동의 부족 (agree={agreements['BUY']} < min={min_agreement})")
+                    evaluation_status = "FEW_BUY"
+                
+                # 두 조건 모두 통과하면 매수
+                if score >= buy_threshold and agreements["BUY"] >= min_agreement:
+                    evaluation_status = "STRONG_BUY"
+                    
+                    # 매수 조건 충족
+                    logger.log_system(f"[거래판단] {symbol} - 매수 시그널 발생: 점수={score:.1f}, 동의수={agreements['BUY']}, 현재가={current_price:,}원")
+                    await self._enter_position(symbol, "BUY", current_price, score, agreements)
+                else:
+                    # 매수 조건 미충족
+                    reason_txt = ", ".join(failure_reason)
+                    logger.log_system(f"[거래판단] {symbol} - 매수 검토 중 취소: {reason_txt}")
+                    
+            # 매도 조건 평가
+            elif direction == "SELL":
+                # 포지션 현황 체크
+                current_position = 0
+                for pos in symbol_positions:
+                    current_position += pos.get("quantity", 0)
+                
+                # 포지션이 없으면 매도 무시
+                if current_position <= 0:
+                    evaluation_status = "NO_POSITION"
+                    logger.log_system(f"[거래판단] {symbol} - 매도 신호이나 포지션 없음")
+                else:
+                    # 스코어 검증
+                    if score < sell_threshold:
+                        failure_reason.append(f"점수 부족 (score={score:.1f} < threshold={sell_threshold})")
+                        evaluation_status = "WEAK_SELL"
+                    
+                    # 동의 개수 검증
+                    if agreements["SELL"] < min_agreement:
+                        failure_reason.append(f"동의 부족 (agree={agreements['SELL']} < min={min_agreement})")
+                        evaluation_status = "FEW_SELL"
+                    
+                    # 두 조건 모두 통과하면 매도
+                    if score >= sell_threshold and agreements["SELL"] >= min_agreement:
+                        evaluation_status = "STRONG_SELL"
+                        
+                        # 매도 조건 충족
+                        logger.log_system(f"[거래판단] {symbol} - 매도 시그널 발생: 점수={score:.1f}, 동의수={agreements['SELL']}, 현재가={current_price:,}원")
+                        await self._exit_position(symbol, "SELL", current_position, current_price, score)
+                    else:
+                        # 매도 조건 미충족
+                        reason_txt = ", ".join(failure_reason)
+                        logger.log_system(f"[거래판단] {symbol} - 매도 검토 중 취소: {reason_txt}")
             
-            # 매수 신호
-            if direction == "BUY" and score >= buy_threshold:
-                logger.log_system(f"[BUY_SIGNAL] {symbol} - 점수 {score:.1f} >= 임계값 {buy_threshold} - 매수 신호 감지!")
-                await self._enter_position(symbol, "BUY", current_price, score, agreements)
-            
-            # 매도 신호
-            elif direction == "SELL" and score >= sell_threshold:
-                logger.log_system(f"[SELL_SIGNAL] {symbol} - 점수 {score:.1f} >= 임계값 {sell_threshold} - 매도 신호 감지!")
-                await self._enter_position(symbol, "SELL", current_price, score, agreements)
-            
-            # 매수/매도 조건 미충족 이유 로그 기록
+            # 중립 신호인 경우
             else:
-                failure_reason = []
-                
-                # 점수 미달 여부 체크
-                if direction == "BUY" and score < buy_threshold:
-                    failure_reason.append(f"매수점수 미달 (목표: {buy_threshold:.1f}, 실제: {score:.1f})")
-                elif direction == "SELL" and score < sell_threshold:
-                    failure_reason.append(f"매도점수 미달 (목표: {sell_threshold:.1f}, 실제: {score:.1f})")
-                
-                # 방향성 중립 체크
-                if direction == "NEUTRAL":
-                    buy_count = agreements.get("BUY", 0)
-                    sell_count = agreements.get("SELL", 0)
-                    failure_reason.append(f"방향성 불명확 (매수동의: {buy_count}, 매도동의: {sell_count}, 최소필요: {min_agreement})")
-                
-                # 상세 로그를 system.log에 남김
-                if failure_reason:
-                    strategies = self.signals[symbol]['strategies']
-                    strategy_details = (
-                        f"전략별 점수: "
-                        f"브레이크아웃={strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']}), "
-                        f"모멘텀={strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']}), "
-                        f"갭={strategies['gap']['signal']:.1f}({strategies['gap']['direction']}), "
-                        f"VWAP={strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']}), "
-                        f"볼륨={strategies['volume']['signal']:.1f}({strategies['volume']['direction']})"
-                    )
-                    
-                    # 매수 조건 미달 정보를 system.log에 명확하게 기록
-                    detail_msg = f"[TRADE_ANALYSIS] {symbol} - {direction} 방향 - 종합점수: {score:.1f}, " + ", ".join(failure_reason)
-                    detail_msg += f" | 전략별 점수: BR={strategies['breakout']['signal']:.1f}({strategies['breakout']['direction']}), "
-                    detail_msg += f"MM={strategies['momentum']['signal']:.1f}({strategies['momentum']['direction']}), "
-                    detail_msg += f"GAP={strategies['gap']['signal']:.1f}({strategies['gap']['direction']}), "
-                    detail_msg += f"VWAP={strategies['vwap']['signal']:.1f}({strategies['vwap']['direction']}), "
-                    detail_msg += f"VOL={strategies['volume']['signal']:.1f}({strategies['volume']['direction']})"
-                    
-                    # 시스템 로그에 직접 기록
-                    logger.log_system(detail_msg)
-                
+                logger.log_system(f"[거래판단] {symbol} - 중립 신호: 점수={score:.1f}, 방향={direction}")
+                evaluation_status = "NEUTRAL"
+            
+            # 거래 판단 결과 저장
+            self.signals[symbol]["evaluation"] = {
+                "status": evaluation_status,
+                "reason": failure_reason,
+                "timestamp": datetime.now()
+            }
+            
         except Exception as e:
-            logger.log_error(e, f"Error checking trade signals for {symbol}")
+            logger.log_error(e, f"Error checking and trading for {symbol}")
     
     def _get_symbol_positions(self, symbol: str) -> List[str]:
         """특정 종목의 포지션 ID 목록 반환"""
@@ -563,24 +854,121 @@ class CombinedStrategy:
                            score: float, agreements: Dict[str, int]):
         """포지션 진입"""
         try:
+            # 포지션 수 확인
+            current_positions = self._get_symbol_positions(symbol)
+            if len(current_positions) >= self.params["max_positions"]:
+                logger.log_system(f"[TRADE_SKIP] {symbol} - 이미 최대 포지션({self.params['max_positions']}개) 도달, 추가 매수 건너뜀")
+                logger.log_trade(
+                    action=f"{side}_SKIPPED",
+                    symbol=symbol,
+                    price=price,
+                    quantity=0,
+                    reason=f"최대 포지션 수 도달 ({len(current_positions)}/{self.params['max_positions']}개)",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="SKIP"
+                )
+                return
+            
+            # 가격 유효성 재확인
+            if price <= 0:
+                logger.log_system(f"[TRADE_ERROR] {symbol} - 가격이 0 이하 ({price}), 매매 불가")
+                logger.log_trade(
+                    action=f"{side}_ERROR",
+                    symbol=symbol,
+                    price=price,
+                    quantity=0,
+                    reason=f"유효하지 않은 가격: {price}",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="ERROR"
+                )
+                return
+            
             # 주문 수량 계산
             position_size = self.params["position_size"]  # 100만원
             quantity = int(position_size / price)
             
             if quantity <= 0:
+                logger.log_system(f"[TRADE_SKIP] {symbol} - 수량이 0 이하 ({quantity}), 매매 건너뜀")
+                logger.log_trade(
+                    action=f"{side}_SKIPPED",
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason=f"주문 수량이 0 이하 ({quantity})",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="SKIP"
+                )
                 return
             
-            # 주문 실행
-            result = await order_manager.place_order(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                order_type="MARKET",
-                strategy="combined",
-                reason=f"combined_signal_{score:.1f}"
-            )
+            # 주문 실행 시도 로그
+            logger.log_system(f"[TRADE_TRY] {symbol} - {side} 주문 시도: 가격={price}, 수량={quantity}, 점수={score:.1f}")
             
-            if result["status"] == "success":
+            # 실제 주문 실행
+            try:
+                logger.log_system(f"[DEBUG] {symbol} - order_manager.place_order 호출 시작")
+                
+                # 주문 실행 시 타임아웃 설정
+                order_task = asyncio.create_task(
+                    order_manager.place_order(
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity,
+                        order_type="MARKET",
+                        strategy="combined",
+                        reason=f"combined_signal_{score:.1f}"
+                    )
+                )
+                
+                # 2초 타임아웃 설정
+                result = await asyncio.wait_for(order_task, timeout=5.0)
+                logger.log_system(f"[DEBUG] {symbol} - order_manager.place_order 결과: {result}")
+                
+            except asyncio.TimeoutError:
+                logger.log_system(f"[TRADE_ERROR] {symbol} - order_manager.place_order 호출 타임아웃 (5초)")
+                logger.log_trade(
+                    action=f"{side}_TIMEOUT",
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason="주문 API 타임아웃 (5초)",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="ERROR"
+                )
+                return
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - order_manager.place_order 호출 실패")
+                logger.log_trade(
+                    action=f"{side}_FAILED",
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason=f"API 호출 오류: {str(e)}",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="ERROR"
+                )
+                return
+            
+            # 주문 결과 확인
+            if not result:
+                logger.log_system(f"[TRADE_FAIL] {symbol} - {side} 주문 결과가 None입니다. order_manager가 제대로 초기화되지 않았을 수 있습니다.")
+                logger.log_trade(
+                    action=f"{side}_FAILED",
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason="order_manager 응답 없음",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="ERROR"
+                )
+                return
+            
+            if result.get("status") == "success":
                 # 손절/익절 가격 계산
                 stop_loss_pct = self.params["stop_loss_pct"]
                 take_profit_pct = self.params["take_profit_pct"]
@@ -611,9 +999,15 @@ class CombinedStrategy:
                 
                 # 시스템 로그에 매매 성공 기록
                 logger.log_system(
+                    f"※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※"
+                )
+                logger.log_system(
                     f"[{side}_SUCCESS] {symbol} - {quantity}주 {price}원에 성공, "
                     f"점수: {score:.1f}, 합의수: {sum(agreements.values())}, "
                     f"손절가: {stop_price:.0f}, 익절가: {target_price:.0f}"
+                )
+                logger.log_system(
+                    f"※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※※"
                 )
                 
                 # trade.log에도 매매 성공 기록
@@ -630,9 +1024,33 @@ class CombinedStrategy:
                     time=datetime.now().strftime("%H:%M:%S"),
                     status="SUCCESS"
                 )
+            else:
+                # 주문 실패 로그
+                error_msg = result.get("message", "알 수 없는 오류")
+                logger.log_system(f"[{side}_FAIL] {symbol} - 주문 실패: {error_msg}")
+                logger.log_trade(
+                    action=f"{side}_FAILED",
+                    symbol=symbol,
+                    price=price,
+                    quantity=quantity,
+                    reason=f"주문 실패: {error_msg}",
+                    score=f"{score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="FAIL"
+                )
                 
         except Exception as e:
             logger.log_error(e, f"Combined strategy entry error for {symbol}")
+            logger.log_trade(
+                action=f"{side}_ERROR",
+                symbol=symbol,
+                price=price,
+                quantity=0,
+                reason=f"처리 중 오류 발생: {str(e)}",
+                score=f"{score:.1f}",
+                time=datetime.now().strftime("%H:%M:%S"),
+                status="ERROR"
+            )
     
     async def _monitor_positions(self):
         """포지션 모니터링"""
