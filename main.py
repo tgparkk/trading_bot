@@ -53,12 +53,8 @@ print("Loaded KIS_ACCOUNT_NO:", dotenv_helper.get_value("KIS_ACCOUNT_NO", "NOT_S
 # 설정 로드 후 로거 초기화
 logger.initialize_with_config()
 
-# 테스트 모드 설정 (True: 항상 장 시간으로 간주, False: 실제 장 시간만 작동)
-TEST_MODE = True
-logger.log_system(f"시스템 시작: 테스트 모드 = {TEST_MODE} (True: 항상 장 시간으로 간주)")
-
 # 플라스크 앱 초기화 (API 서버용)
-app = Flask(__name__)
+# app = Flask(__name__)
 
 class TradingBot:
     """자동매매 봇"""
@@ -66,6 +62,7 @@ class TradingBot:
     def __init__(self):
         self.running = False
         self.trading_config = config["trading"]
+        self.max_retries = self.trading_config.get("max_websocket_retries", 3)
         
     async def initialize(self):
         """초기화"""
@@ -81,21 +78,20 @@ class TradingBot:
             # 웹소켓 연결 - 재시도 추가
             websocket_connected = False
             retry_count = 0
-            max_retries = 3
             
-            while not websocket_connected and retry_count < max_retries:
+            while not websocket_connected and retry_count < self.max_retries:
                 retry_count += 1
                 try:
-                    logger.log_system(f"웹소켓 연결 시도... ({retry_count}/{max_retries})")
+                    logger.log_system(f"웹소켓 연결 시도... ({retry_count}/{self.max_retries})")
                     await ws_client.connect()
                     websocket_connected = ws_client.is_connected()
                     if websocket_connected:
                         logger.log_system("웹소켓 연결 성공!")
                         break
                 except Exception as e:
-                    logger.log_error(e, f"웹소켓 연결 실패 ({retry_count}/{max_retries})")
+                    logger.log_error(e, f"웹소켓 연결 실패 ({retry_count}/{self.max_retries})")
                 
-                if retry_count < max_retries:
+                if retry_count < self.max_retries:
                     await asyncio.sleep(2)  # 재시도 전 2초 대기
             
             # 시스템 상태 업데이트

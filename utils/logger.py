@@ -80,9 +80,22 @@ class SafeStreamHandler(logging.StreamHandler):
             self.handleError(record)
 
 class TradingLogger:
-    """트레이딩 전용 로거"""
+    """트레이딩 전용 로가 (싱글톤 패턴)"""
+    
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized_instance = False
+        return cls._instance
     
     def __init__(self):
+        # 이미 초기화된 경우 재초기화 방지
+        if getattr(self, '_initialized_instance', False):
+            return
+            
         self._initialized = False
         # 기본 설정값
         self.log_dir = "logs"
@@ -95,6 +108,9 @@ class TradingLogger:
         # 기본 디렉토리와 로거 설정
         self._setup_directories()
         self._setup_loggers()
+        
+        # 싱글톤 초기화 완료 표시
+        self._initialized_instance = True
     
     def initialize_with_config(self):
         """설정 파일로부터 로거 초기화"""
@@ -321,17 +337,65 @@ class TradingLogger:
     
     def _ensure_daily_log_dir(self):
         """현재 날짜의 로그 디렉토리가 있는지 확인하고 없으면 생성"""
+        # 현재 날짜 가져오기
         today = datetime.now().strftime("%Y-%m-%d")
         current_daily_log_dir = os.path.join(self.log_dir, today)
         
-        # 날짜가 바뀌었으면 로거 재설정
-        if hasattr(self, 'daily_log_dir') and self.daily_log_dir != current_daily_log_dir:
+        # 기본 로그 디렉토리가 없으면 생성
+        if not os.path.exists(self.log_dir):
+            try:
+                os.makedirs(self.log_dir)
+                print(f"Created main log directory: {self.log_dir}")
+            except Exception as e:
+                print(f"Error creating log directory: {e}")
+                return
+        
+        # 날짜별 로그 디렉토리가 없으면 생성
+        if not os.path.exists(current_daily_log_dir):
+            try:
+                os.makedirs(current_daily_log_dir)
+                print(f"Created daily log directory: {current_daily_log_dir}")
+            except Exception as e:
+                print(f"Error creating daily log directory: {e}")
+                return
+        
+        # 날짜가 바뀌었는지 확인
+        date_changed = False
+        if not hasattr(self, 'daily_log_dir') or self.daily_log_dir != current_daily_log_dir:
+            # 이전 날짜 기록
+            old_date = getattr(self, 'daily_log_dir', '').split(os.sep)[-1] if hasattr(self, 'daily_log_dir') else None
+            
+            # 날짜 변경 상태 업데이트
             self.daily_log_dir = current_daily_log_dir
-            if not os.path.exists(self.daily_log_dir):
-                os.makedirs(self.daily_log_dir)
+            date_changed = True
+            
+            # 시스템 로그에 날짜 변경 기록 - 시스템 로거가 있는 경우만
+            if hasattr(self, 'system_logger') and self.system_logger:
+                try:
+                    self.system_logger.info(f"Date changed from {old_date} to {today}. Logs will be saved in: {current_daily_log_dir}")
+                except Exception:
+                    # 예외 무시 - 로그 설정 중에 예외가 발생할 수 있음
+                    pass
+            else:
+                # 시스템 로거가 없는 경우 콘솔에 출력
+                print(f"Date changed to {today}. Logs will be saved in: {current_daily_log_dir}")
             
             # 로거 재설정
             self._setup_loggers()
+            
+            # 재설정 후 다시 한번 로그 기록
+            if hasattr(self, 'system_logger') and self.system_logger:
+                try:
+                    self.system_logger.info(f"Loggers have been reconfigured for new date: {today}")
+                except Exception:
+                    pass
+        
+        return date_changed
 
-# 싱글톤 인스턴스
-logger = TradingLogger()
+# 싱글톤 인스턴스 접근 함수
+def get_logger() -> TradingLogger:
+    """로거 싱글톤 인스턴스를 반환하는 함수"""
+    return TradingLogger()
+
+# 기본 싱글톤 인스턴스 (역호환성 유지)
+logger = get_logger()
