@@ -122,7 +122,26 @@ class TradingBot:
                     # 스캔 결과 로그
                     logger.log_system(f"[OK] 강제 자동 종목 스캔 완료: 총 {len(force_symbols)}개 종목 발견")
                     logger.log_system(f"상위 종목 10개: {', '.join(force_symbols[:10])}")
+                    
+                    # 종목 업데이트 및 전략 시작
                     await combined_strategy.update_symbols(force_symbols[:50])
+                    
+                    # 전략 시작 (이미 시작된 경우 무시됨)
+                    if not combined_strategy.running:
+                        logger.log_system("=== 통합 전략 시작 ===")
+                        await combined_strategy.start(force_symbols[:50])
+                        logger.log_system("=== 통합 전략 시작 완료 ===")
+                        logger.log_trade(
+                            action="STRATEGY_START",
+                            symbol="SYSTEM",
+                            price=0,
+                            quantity=len(force_symbols[:50]),
+                            reason=f"통합 전략 시작 완료",
+                            watched_symbols=len(force_symbols[:50]),
+                            time=datetime.now().strftime("%H:%M:%S"),
+                            status="SUCCESS"
+                        )
+                    
                     last_symbol_search = datetime.now()  # 마지막 스캔 시간 업데이트
                     
                     logger.log_trade(
