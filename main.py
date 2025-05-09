@@ -140,7 +140,7 @@ class TradingBot:
                 if force_symbols:
                     # 스캔 결과 로그
                     logger.log_system(f"[OK] 강제 자동 종목 스캔 완료: 총 {len(force_symbols)}개 종목 발견")
-                    logger.log_system(f"상위 종목 10개: {', '.join(force_symbols[:10])}")
+                    logger.log_system(f"상위 종목 50개: {', '.join(force_symbols[:50])}")
                     
                     # 종목 업데이트 및 전략 시작
                     await combined_strategy.update_symbols(force_symbols[:50])
@@ -219,7 +219,7 @@ class TradingBot:
                 try:
                     # 장 시간 체크 - 명확한 로그 추가
                     market_open = self._is_market_open(current_time)
-                    logger.log_system(f"메인 루프 체크 - 현재 시간: {current_time}, 장 시간 여부: {market_open}, 테스트 모드: {TEST_MODE}, 첫 루프: {first_loop_run}")
+                    logger.log_system(f"메인 루프 체크 - 현재 시간: {current_time}, 장 시간 여부: {market_open}, 첫 루프: {first_loop_run}")
                     
                     if market_open:
                         # 장 오픈 시간 기록
@@ -265,92 +265,51 @@ class TradingBot:
                             try:
                                 new_symbols = await self._get_tradable_symbols()
                                 if new_symbols:
-                                    # combined_strategy에 업데이트된 종목 목록 전달
-                                    logger.log_system(f"[OK] 자동 종목 스캔 성공 - {len(new_symbols)}개 종목이 발견되었습니다.")
-                                    logger.log_system(f"상위 종목 10개: {', '.join(new_symbols[:10])}")
-                                    await combined_strategy.update_symbols(new_symbols[:50])
-                                    last_symbol_search = current_datetime
-                                    
-                                    # 확실하게 로그 추가
-                                    logger.log_system(f"=======================================")
-                                    logger.log_system(f"[OK] 자동 종목 스캔 완료 - 총 {len(new_symbols)}개 종목, 상위 50개 선택")
-                                    logger.log_system(f"=======================================")
-                                    
-                                    # 기록 강화 - trade.log에 스캔 결과 자세히 기록
-                                    top_symbols = ", ".join(new_symbols[:10]) if new_symbols else ""
-                                    logger.log_trade(
-                                        action="AUTO_SCAN_COMPLETE",
-                                        symbol="SYSTEM",
-                                        price=0,
-                                        quantity=len(new_symbols[:50]),
-                                        reason=f"자동 종목 스캔 완료",
-                                        scan_interval=f"{search_interval}초",
-                                        market_phase=market_open_elapsed < 120 and "장 초반" or "장 중",
-                                        top_symbols=top_symbols,
-                                        time=current_datetime.strftime("%H:%M:%S"),
-                                        status="SUCCESS"
+                                    # 성공 처리
+                                    await self._handle_scan_success(
+                                        new_symbols, 
+                                        current_datetime, 
+                                        search_interval, 
+                                        market_open_elapsed
                                     )
-                                    
-                                    # 재시도 카운터 초기화
+                                    last_symbol_search = current_datetime
                                     retry_count = 0
                                 else:
+                                    # 실패 처리
                                     logger.log_system(f"❌ 자동 종목 스캔 실패 - 거래 가능 종목이 없습니다.")
-                                    # 다음 스캔 시간 설정 (실패 시 빨리 재시도)
                                     last_symbol_search = current_datetime - timedelta(seconds=search_interval - 30)
                                     logger.log_system(f"종목 스캔 실패로 30초 후 재시도 예정")
                                     
                                     # 거래 로그에 실패 기록
-                                    logger.log_trade(
-                                        action="AUTO_SCAN_FAILED",
-                                        symbol="SYSTEM",
-                                        price=0,
-                                        quantity=0,
-                                        reason="거래 가능 종목 없음",
-                                        time=current_datetime.strftime("%H:%M:%S"),
-                                        status="FAILED"
-                                    )
+                                    self._log_scan_failure("거래 가능 종목 없음", current_datetime)
                                     
                                     # 실패 카운터 증가
                                     retry_count += 1
                                     if retry_count >= max_retries:
-                                        logger.log_warning(f"종목 스캔 {max_retries}회 연속 실패, API 연결 문제가 의심됩니다.")
-                                        # 토큰 강제 갱신 시도
-                                        try:
-                                            logger.log_system("API 토큰 강제 갱신 시도...")
-                                            refresh_result = api_client.force_token_refresh()
-                                            logger.log_system(f"토큰 갱신 결과: {refresh_result.get('status')} - {refresh_result.get('message')}")
-                                            retry_count = 0  # 토큰 갱신 후 카운터 초기화
-                                        except Exception as token_error:
-                                            logger.log_error(token_error, "토큰 갱신 중 오류 발생")
+                                        retry_count = await self._handle_consecutive_failures(
+                                            retry_count, 
+                                            max_retries, 
+                                            "종목 스캔 연속 실패"
+                                        )
                             except Exception as e:
+                                # 예외 처리
                                 logger.log_error(e, "자동 종목 스캔 중 오류 발생")
-                                # 다음 스캔 시간 설정 (오류 시 빨리 재시도)
                                 last_symbol_search = current_datetime - timedelta(seconds=search_interval - 30)
                                 logger.log_system(f"종목 스캔 오류로 30초 후 재시도 예정")
                                 
                                 # 거래 로그에 오류 기록
-                                logger.log_trade(
-                                    action="AUTO_SCAN_ERROR",
-                                    symbol="SYSTEM",
-                                    price=0,
-                                    quantity=0,
-                                    reason=f"종목 스캔 오류: {str(e)}",
-                                    time=current_datetime.strftime("%H:%M:%S"),
-                                    status="ERROR"
-                                )
+                                self._log_scan_failure(f"종목 스캔 오류: {str(e)}", current_datetime, status="ERROR")
                                 
                                 # 오류 카운터 증가
                                 retry_count += 1
                                 if retry_count >= max_retries:
-                                    logger.log_warning(f"종목 스캔 {max_retries}회 연속 오류, API 연결 문제가 의심됩니다.")
-                                    # 토큰 강제 갱신 시도
-                                    try:
-                                        logger.log_system("API 토큰 강제 갱신 시도...")
-                                        refresh_result = api_client.force_token_refresh()
-                                        logger.log_system(f"토큰 갱신 결과: {refresh_result.get('status')} - {refresh_result.get('message')}")
-                                        retry_count = 0  # 토큰 갱신 후 카운터 초기화
-                                    except Exception as token_error:
-                                        logger.log_error(token_error, "토큰 갱신 중 오류 발생")
+                                    retry_count = await self._handle_consecutive_failures(
+                                        retry_count, 
+                                        max_retries, 
+                                        "종목 스캔 연속 오류"
+                                    )
+
+                            # 아래에 필요한 헬퍼 메서드들 추가 (TradingBot 클래스 내부에 정의)
                         
                         # 포지션 체크 (예외 처리 추가)
                         try:
@@ -392,6 +351,62 @@ class TradingBot:
         except Exception as e:
             logger.log_error(e, "Trading bot error")
             await self.shutdown(error=str(e))
+
+    async def _handle_scan_success(self, symbols, current_datetime, search_interval, market_open_elapsed):
+        """종목 스캔 성공 처리 - 로깅 및 종목 업데이트"""
+        # 로그 출력
+        logger.log_system(f"[OK] 자동 종목 스캔 성공 - {len(symbols)}개 종목이 발견되었습니다.")
+        logger.log_system(f"상위 종목 10개: {', '.join(symbols[:10])}")
+        
+        # 종목 업데이트
+        await combined_strategy.update_symbols(symbols[:50])
+        
+        # 추가 로그
+        logger.log_system(f"=======================================")
+        logger.log_system(f"[OK] 자동 종목 스캔 완료 - 총 {len(symbols)}개 종목, 상위 50개 선택")
+        logger.log_system(f"=======================================")
+        
+        # 거래 로그 기록
+        top_symbols = ", ".join(symbols[:10]) if symbols else ""
+        logger.log_trade(
+            action="AUTO_SCAN_COMPLETE",
+            symbol="SYSTEM",
+            price=0,
+            quantity=len(symbols[:50]),
+            reason=f"자동 종목 스캔 완료",
+            scan_interval=f"{search_interval}초",
+            market_phase=market_open_elapsed < 120 and "장 초반" or "장 중",
+            top_symbols=top_symbols,
+            time=current_datetime.strftime("%H:%M:%S"),
+            status="SUCCESS"
+        )
+
+    def _log_scan_failure(self, reason, current_datetime, status="FAILED"):
+        """스캔 실패 로그 기록"""
+        action = "AUTO_SCAN_ERROR" if status == "ERROR" else "AUTO_SCAN_FAILED"
+        logger.log_trade(
+            action=action,
+            symbol="SYSTEM",
+            price=0,
+            quantity=0,
+            reason=reason,
+            time=current_datetime.strftime("%H:%M:%S"),
+            status=status
+        )
+
+    async def _handle_consecutive_failures(self, retry_count, max_retries, failure_type):
+        """연속 실패 처리 - 토큰 갱신 시도"""
+        logger.log_warning(f"{failure_type}, {max_retries}회 연속 발생, API 연결 문제가 의심됩니다.")
+        
+        # 토큰 강제 갱신 시도
+        try:
+            logger.log_system("API 토큰 강제 갱신 시도...")
+            refresh_result = api_client.force_token_refresh()
+            logger.log_system(f"토큰 갱신 결과: {refresh_result.get('status')} - {refresh_result.get('message')}")
+            return 0  # 토큰 갱신 후 카운터 초기화
+        except Exception as token_error:
+            logger.log_error(token_error, "토큰 갱신 중 오류 발생")
+            return retry_count  # 기존 카운터 유지
     
     async def _get_tradable_symbols(self) -> List[str]:
         """거래 가능 종목 조회 (필터링 포함)"""
@@ -491,21 +506,14 @@ class TradingBot:
     
     def _is_market_open(self, current_time: datetime_time) -> bool:
         """장 시간 확인"""
-        # 테스트 모드: 항상 장 시간으로 인식 (개발 및 디버깅용)
-        test_mode = TEST_MODE
-        
-        # 중요: 로그 추가하여 테스트 모드 확인
-        if test_mode:
-            logger.log_system(f"테스트 모드 활성화: 현재 시간은 {current_time}이지만 장 시간으로 처리합니다. - 항상 True 반환")
-            return True
-        
+    
         # 실제 장 시간 체크
         is_market_time = (
             self.trading_config.market_open <= current_time <= 
             self.trading_config.market_close
         )
         
-        logger.log_system(f"시장 시간 체크: {current_time}, 장 시간 여부: {is_market_time}, 테스트 모드: {test_mode}")
+        logger.log_system(f"시장 시간 체크: {current_time}, 장 시간 여부: {is_market_time}")
         return is_market_time
     
     async def _handle_market_close(self):
@@ -615,188 +623,252 @@ def is_important_message(message: str) -> bool:
 
 async def main(force_update=False):
     """메인 함수"""
+    # 초기 설정
     bot = TradingBot()
     telegram_task = None
+    heartbeat_task = None
     exit_code = 0
     
-    # 워치독 타이머 설정 (30분)
+    # 워치독 타이머 설정
     last_heartbeat = datetime.now()
     watchdog_interval = 30 * 60  # 30분 (초 단위)
     logger.log_system(f"워치독 타이머 설정: {watchdog_interval/60}분")
 
     try:
-        # 프로그램 시작 시 기본 로깅 테스트
-        logger.log_system("프로그램 시작: 로깅 시스템 초기화 확인")
-        logger.log_trade(
-            action="STARTUP",
-            symbol="SYSTEM",
-            price=0,
-            quantity=0,
-            reason=f"프로그램 시작 - {datetime.now().strftime('%H:%M:%S')}"
-        )
+        # 1. 기본 로깅 테스트
+        _log_startup_info()
         
-        # 텔레그램 봇 핸들러 설정 및 시작 (별도 태스크로)
-        telegram_task = asyncio.create_task(telegram_bot_handler.start_polling())
-        logger.log_system("텔레그램 봇 핸들러 시작됨 (백그라운드)")
-
-        # 텔레그램 봇 핸들러가 준비될 때까지 대기 (타임아웃 확장)
-        try:
-            logger.log_system("텔레그램 봇 핸들러 준비 대기 시작...")
-            await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=30)  # 30초로 확장
-            logger.log_system("텔레그램 봇 핸들러 준비 완료!")
-            
-            # 프로그램 시작 알림 보내기
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            start_message = f"""
-            *주식 자동매매 프로그램 시작*
-            시작 시간: {current_time}
-    
-            자동매매 프로그램이 시작되었습니다.
-            이제부터 거래 및 주요 이벤트에 대한 알림을 받게 됩니다.
-            """
-    
-            try:
-                # alert_system 호출 제거 확인!
-                logger.log_system("프로그램 시작 알림 전송 시도...")
-                await telegram_bot_handler._send_message(start_message)
-                logger.log_system("프로그램 시작 알림 전송 완료")
-            except Exception as e:
-                logger.log_error(e, "Failed to send start notification")
-                
-        except asyncio.TimeoutError:
-            logger.log_error(Exception("텔레그램 봇 준비 시간 초과"), "텔레그램 봇 준비 타임아웃, 그래도 프로그램 계속 실행")
-            # 텔레그램 초기화 실패해도 메인 로직은 계속 실행
-        except Exception as e:
-            logger.log_error(e, "텔레그램 봇 초기화 오류, 그래도 프로그램 계속 실행")
-            # 텔레그램 초기화 실패해도 메인 로직은 계속 실행
-
-        # 워치독 타이머를 위한 하트비트 태스크 시작
-        heartbeat_task = asyncio.create_task(
-            _heartbeat_monitor(last_heartbeat, watchdog_interval)
-        )
-
-        # 메인 봇 실행 (API 초기화 시도)
-        logger.log_system("Starting main bot execution...")
-        try:
-            # API 접속 시도 (initialize 메소드 호출)
-            await bot.initialize()
-            last_heartbeat = datetime.now()  # 성공적인 초기화 후 하트비트 업데이트
-            logger.log_system("API 초기화 성공!")
-            
-            # API 접속 성공 알림 (텔레그램 사용 가능한 경우에만)
-            if telegram_bot_handler.is_ready():
-                kis_success_message = f"""
-                *KIS API 접속 성공* [OK]
-                접속 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                
-                한국투자증권 API 서버에 성공적으로 접속했습니다.
-                """
-                await telegram_bot_handler._send_message(kis_success_message)
-                logger.log_system("KIS API 접속 성공 알림 전송 완료")
-            
-            # 봇 실행 계속
-            await bot.run()
-            last_heartbeat = datetime.now()  # 봇 실행 완료 후 하트비트 업데이트
-            
-        except Exception as e:
-            logger.log_error(e, "메인 봇 실행 오류")
-            
-            # API 접속 실패 알림 (텔레그램 사용 가능한 경우에만)
-            if telegram_bot_handler.is_ready():
-                kis_fail_message = f"""
-                *KIS API 접속 실패* ❌
-                시도 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                
-                한국투자증권 API 서버 접속에 실패했습니다.
-                오류: {str(e)}
-                """
-                await telegram_bot_handler._send_message(kis_fail_message)
-                logger.log_system("KIS API 접속 실패 알림 전송 완료")
-            
-            # 오류 발생해도 정상 종료 과정 진행
-            
-        logger.log_system("Main bot execution finished or failed.")
-        # 종료 처리
-        logger.log_system("Initiating shutdown...")
-        try:
-            await bot.shutdown()
-        except Exception as e:
-            logger.log_error(e, "봇 종료 중 오류 발생")
-            
-        # 하트비트 태스크 정리
-        if 'heartbeat_task' in locals() and heartbeat_task and not heartbeat_task.done():
-            logger.log_system("하트비트 모니터링 태스크 정리 중...")
-            heartbeat_task.cancel()
-            try:
-                await asyncio.wait_for(heartbeat_task, timeout=3)
-                logger.log_system("하트비트 모니터링 태스크 정리 완료")
-            except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError) as ce:
-                logger.log_system(f"하트비트 태스크 취소 중 예외 발생 (무시됨): {ce}")
-            
+        # 2. 텔레그램 봇 설정 및 시작
+        telegram_task = await _setup_telegram_bot()
+        
+        # 3. 워치독 모니터링 설정
+        heartbeat_task = _setup_watchdog_monitor(last_heartbeat, watchdog_interval)
+        
+        # 4. 메인 봇 실행
+        await _run_trading_bot(bot, force_update)
+        last_heartbeat = datetime.now()  # 하트비트 갱신
+        
     except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt received. Initiating shutdown...")
-        if bot:
-            await bot.shutdown() # 여기서 shutdown 완료까지 기다림
-            # 종료 메시지가 확실히 전송될 수 있도록 대기 추가
-            await asyncio.sleep(2)
+        logger.log_warning("KeyboardInterrupt received. Initiating shutdown...")
+        await _graceful_shutdown(bot)
         exit_code = 0
     except Exception as e:
         logger.log_error(e, "Unexpected error in main loop")
-        if bot:
-            logger.log_system("Attempting shutdown due to unexpected error...")
-            await bot.shutdown(error=str(e)) # 여기서 shutdown 완료까지 기다림
-            # 종료 메시지가 확실히 전송될 수 있도록 대기 추가
-            await asyncio.sleep(2)
+        await _emergency_shutdown(bot, error=str(e))
         exit_code = 1
     finally:
-        logger.log_system("Main function finally block entered.")
-        # 텔레그램 종료 처리
-        try:
-            # 먼저 텔레그램 메시지 전송이 완료될 수 있도록 충분한 대기 시간 제공
-            logger.log_system("텔레그램 메시지 전송 완료 대기 중...")
-            await asyncio.sleep(5)
-            
-            # 봇 세션을 명시적으로 닫기 시도
-            logger.log_system("텔레그램 봇 세션 닫기 시도...")
-            try:
-                # 이벤트 루프가 아직 살아있다면 세션을 명시적으로 닫기
-                await telegram_bot_handler.close_session()
-                # 세션이 완전히 닫힐 시간을 주기 위해 잠시 대기
-                await asyncio.sleep(1)
-            except Exception as session_error:
-                if "Event loop is closed" in str(session_error):
-                    logger.log_system("이벤트 루프가 이미 닫혔습니다. 계속 진행합니다.")
-                else:
-                    logger.log_error(session_error, "텔레그램 봇 세션 종료 중 오류")
-                
-            # 텔레그램 태스크 정리 (최대 5초 대기)
-            if telegram_task and not telegram_task.done():
-                # 중요: 텔레그램 태스크를 취소하기 전에 마지막 메시지가 전송될 수 있도록 충분한 시간 제공
-                logger.log_system("텔레그램 태스크 취소 전 마지막 메시지 전송을 위해 대기 중...")
-                # 종료 메시지가 전송될 수 있도록 더 긴 시간 대기
-                await asyncio.sleep(3)
-                
-                logger.log_system("Cancelling Telegram polling task...")
-                telegram_task.cancel()
-                
-                # 종료될 때까지 최대 5초 대기
-                try:
-                    await asyncio.wait_for(telegram_task, timeout=5)
-                    logger.log_system("Telegram polling task successfully cancelled.")
-                except (asyncio.CancelledError, RuntimeError):
-                    logger.log_system("Telegram polling task cancellation confirmed.")
-                except asyncio.TimeoutError:
-                    logger.log_warning("Telegram polling task cancellation timed out, but proceeding anyway.")
-                except Exception as e:
-                    logger.log_error(e, "Error during Telegram task cancellation")
-        except Exception as e:
-            if "Event loop is closed" in str(e):
-                logger.log_system("이벤트 루프가 이미 닫혔습니다. 정리 작업을 건너뜁니다.")
-            else:
-                logger.log_error(e, "Error cleaning up Telegram resources")
-        
+        # 5. 정리 작업
+        await _cleanup_resources(telegram_task, heartbeat_task)
         logger.log_system(f"Main function exiting with code {exit_code}.")
         return exit_code
+
+
+# --- 헬퍼 함수 ---
+
+def _log_startup_info():
+    """프로그램 시작 로깅"""
+    logger.log_system("프로그램 시작: 로깅 시스템 초기화 확인")
+    logger.log_trade(
+        action="STARTUP",
+        symbol="SYSTEM",
+        price=0,
+        quantity=0,
+        reason=f"프로그램 시작 - {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+async def _setup_telegram_bot():
+    """텔레그램 봇 설정 및 시작"""
+    # 텔레그램 봇 태스크 생성
+    telegram_task = asyncio.create_task(telegram_bot_handler.start_polling())
+    logger.log_system("텔레그램 봇 핸들러 시작됨 (백그라운드)")
+    
+    # 텔레그램 봇 준비 대기
+    try:
+        logger.log_system("텔레그램 봇 핸들러 준비 대기 시작...")
+        await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=30)
+        logger.log_system("텔레그램 봇 핸들러 준비 완료!")
+        
+        # 프로그램 시작 알림 전송
+        await _send_startup_notification()
+    except asyncio.TimeoutError:
+        logger.log_error(Exception("텔레그램 봇 준비 시간 초과"), "텔레그램 봇 준비 타임아웃, 그래도 프로그램 계속 실행")
+    except Exception as e:
+        logger.log_error(e, "텔레그램 봇 초기화 오류, 그래도 프로그램 계속 실행")
+        
+    return telegram_task
+
+
+async def _send_startup_notification():
+    """프로그램 시작 알림 전송"""
+    try:
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start_message = f"""
+        *주식 자동매매 프로그램 시작*
+        시작 시간: {current_time}
+
+        자동매매 프로그램이 시작되었습니다.
+        이제부터 거래 및 주요 이벤트에 대한 알림을 받게 됩니다.
+        """
+
+        logger.log_system("프로그램 시작 알림 전송 시도...")
+        await telegram_bot_handler._send_message(start_message)
+        logger.log_system("프로그램 시작 알림 전송 완료")
+    except Exception as e:
+        logger.log_error(e, "Failed to send start notification")
+
+
+def _setup_watchdog_monitor(last_heartbeat, watchdog_interval):
+    """워치독 모니터링 태스크 설정"""
+    return asyncio.create_task(
+        _heartbeat_monitor(last_heartbeat, watchdog_interval)
+    )
+
+
+async def _run_trading_bot(bot, force_update=False):
+    """메인 봇 실행"""
+    # API 초기화 시도
+    logger.log_system("Starting main bot execution...")
+    try:
+        # 봇 초기화
+        await bot.initialize()
+        logger.log_system("API 초기화 성공!")
+        
+        # API 접속 성공 알림
+        await _send_api_success_notification()
+        
+        # 봇 실행
+        await bot.run()
+    except Exception as e:
+        logger.log_error(e, "메인 봇 실행 오류")
+        
+        # API 접속 실패 알림
+        await _send_api_failure_notification(str(e))
+        raise  # 상위 핸들러로 예외 전달
+
+
+async def _send_api_success_notification():
+    """API 접속 성공 알림 전송"""
+    if telegram_bot_handler.is_ready():
+        try:
+            kis_success_message = f"""
+            *KIS API 접속 성공* [OK]
+            접속 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            
+            한국투자증권 API 서버에 성공적으로 접속했습니다.
+            """
+            await telegram_bot_handler._send_message(kis_success_message)
+            logger.log_system("KIS API 접속 성공 알림 전송 완료")
+        except Exception as e:
+            logger.log_error(e, "API 접속 성공 알림 전송 실패")
+
+
+async def _send_api_failure_notification(error_message):
+    """API 접속 실패 알림 전송"""
+    if telegram_bot_handler.is_ready():
+        try:
+            kis_fail_message = f"""
+            *KIS API 접속 실패* ❌
+            시도 시간: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            
+            한국투자증권 API 서버 접속에 실패했습니다.
+            오류: {error_message}
+            """
+            await telegram_bot_handler._send_message(kis_fail_message)
+            logger.log_system("KIS API 접속 실패 알림 전송 완료")
+        except Exception as e:
+            logger.log_error(e, "API 접속 실패 알림 전송 실패")
+
+
+async def _graceful_shutdown(bot):
+    """정상 종료 처리"""
+    if bot:
+        await bot.shutdown()
+        # 종료 메시지가 확실히 전송될 수 있도록 대기
+        await asyncio.sleep(2)
+
+
+async def _emergency_shutdown(bot, error=None):
+    """오류 발생 시 종료 처리"""
+    if bot:
+        logger.log_system("Attempting shutdown due to unexpected error...")
+        await bot.shutdown(error=error)
+        # 종료 메시지가 확실히 전송될 수 있도록 대기
+        await asyncio.sleep(2)
+
+
+async def _cleanup_resources(telegram_task=None, heartbeat_task=None):
+    """자원 정리 작업"""
+    logger.log_system("Main function finally block entered.")
+    
+    # 1. 텔레그램 정리
+    await _cleanup_telegram(telegram_task)
+    
+    # 2. 워치독 정리
+    await _cleanup_heartbeat_task(heartbeat_task)
+
+
+async def _cleanup_telegram(telegram_task):
+    """텔레그램 자원 정리"""
+    if telegram_task is None:
+        return
+        
+    try:
+        # 메시지 전송 완료 대기
+        logger.log_system("텔레그램 메시지 전송 완료 대기 중...")
+        await asyncio.sleep(5)
+        
+        # 봇 세션 명시적 종료
+        try:
+            logger.log_system("텔레그램 봇 세션 닫기 시도...")
+            await telegram_bot_handler.close_session()
+            await asyncio.sleep(1)
+        except Exception as session_error:
+            if "Event loop is closed" in str(session_error):
+                logger.log_system("이벤트 루프가 이미 닫혔습니다. 계속 진행합니다.")
+            else:
+                logger.log_error(session_error, "텔레그램 봇 세션 종료 중 오류")
+            
+        # 텔레그램 태스크 정리
+        if not telegram_task.done():
+            # 중요: 텔레그램 태스크를 취소하기 전에 마지막 메시지가 전송될 수 있도록 충분한 시간 제공
+            logger.log_system("텔레그램 태스크 취소 전 마지막 메시지 전송을 위해 대기 중...")
+            await asyncio.sleep(3)
+            
+            logger.log_system("Cancelling Telegram polling task...")
+            telegram_task.cancel()
+            
+            # 종료될 때까지 최대 5초 대기
+            try:
+                await asyncio.wait_for(telegram_task, timeout=5)
+                logger.log_system("Telegram polling task successfully cancelled.")
+            except (asyncio.CancelledError, RuntimeError):
+                logger.log_system("Telegram polling task cancellation confirmed.")
+            except asyncio.TimeoutError:
+                logger.log_warning("Telegram polling task cancellation timed out, but proceeding anyway.")
+            except Exception as e:
+                logger.log_error(e, "Error during Telegram task cancellation")
+    except Exception as e:
+        if "Event loop is closed" in str(e):
+            logger.log_system("이벤트 루프가 이미 닫혔습니다. 정리 작업을 건너뜁니다.")
+        else:
+            logger.log_error(e, "Error cleaning up Telegram resources")
+
+
+async def _cleanup_heartbeat_task(heartbeat_task):
+    """워치독 모니터링 태스크 정리"""
+    if heartbeat_task is None:
+        return
+        
+    # 하트비트 태스크 정리
+    if not heartbeat_task.done():
+        logger.log_system("하트비트 모니터링 태스크 정리 중...")
+        heartbeat_task.cancel()
+        try:
+            await asyncio.wait_for(heartbeat_task, timeout=3)
+            logger.log_system("하트비트 모니터링 태스크 정리 완료")
+        except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError) as ce:
+            logger.log_system(f"하트비트 태스크 취소 중 예외 발생 (무시됨): {ce}")
 
 # 하트비트 모니터링을 위한 비동기 함수
 async def _heartbeat_monitor(last_heartbeat, interval):
@@ -856,378 +928,22 @@ async def _heartbeat_monitor(last_heartbeat, interval):
     except Exception as e:
         logger.log_error(e, "하트비트 모니터링 중 오류 발생")
 
-# 매수 조건 테스트 기능
-async def test_buy_condition(symbol=None):
-    """매수 조건 테스트 함수"""
-    from strategies.combined_strategy import CombinedStrategy
-    from core.api_client import api_client
-    import os
-    
-    # 토큰 존재 여부 확인
-    if not await api_client.ensure_token():
-        print("토큰 발급에 실패했습니다.")
-        return
-    
-    # 통합 전략 초기화
-    strategy = CombinedStrategy()
-    
-    # 매수 기준 표시
-    buy_threshold = strategy.params["buy_threshold"]
-    min_agreement = strategy.params["min_agreement"]
-    
-    print("\n===== 매수 조건 테스트 =====")
-    print(f"매수 기준 점수: {buy_threshold}")
-    print(f"최소 동의 전략 수: {min_agreement}")
-    print("===========================\n")
-    
-    # 테스트할 종목 리스트 가져오기
-    if symbol:
-        symbols = [symbol]
-    else:
-        # KOSPI 상위 10개 종목 가져오기
-        kospi_top_symbols = await api_client.get_top_trading_volume_symbols(market="KOSPI", limit=10)
-        # KOSDAQ 상위 10개 종목 가져오기
-        kosdaq_top_symbols = await api_client.get_top_trading_volume_symbols(market="KOSDAQ", limit=10)
-        
-        symbols = kospi_top_symbols + kosdaq_top_symbols
-        
-    # 각 종목별 매수 조건 테스트
-    for symbol in symbols[:10]:  # 최대 10개 종목만 테스트
-        try:
-            # 종목 기본 정보 가져오기
-            symbol_info = await api_client.get_symbol_info(symbol)
-            print(f"\n종목코드: {symbol} - {symbol_info.get('name', '알 수 없음')}")
-            
-            # 1일 가격 데이터 가져오기
-            price_data = await api_client.get_daily_price_data(symbol, 20)  # 20일 데이터
-            if not price_data:
-                print("  가격 데이터를 가져오지 못했습니다.")
-                continue
-                
-            # 가격 데이터 전략에 설정
-            strategy.price_data[symbol] = price_data
-            
-            # 전략 신호 업데이트
-            await strategy._update_signals(symbol)
-                
-            # 신호 계산
-            score, direction, agreements = strategy._calculate_combined_signal(symbol)
-            
-            # 결과 출력
-            print(f"  방향: {direction}, 점수: {score:.1f}/10.0")
-            print(f"  동의 전략: 매수={agreements.get('BUY', 0)}, 매도={agreements.get('SELL', 0)}")
-            
-            # 매수 가능 여부
-            buy_possible = direction == "BUY" and score >= buy_threshold
-            if buy_possible:
-                print(f"  매수 가능: 예 (기준점수 {buy_threshold} 이상)")
-            else:
-                if direction != "BUY":
-                    print(f"  매수 가능: 아니오 (방향이 매수가 아님)")
-                else:
-                    print(f"  매수 가능: 아니오 (점수 {score:.1f} < 기준점수 {buy_threshold})")
-            
-            # 각 전략별 점수 상세 출력
-            strategies = strategy.signals[symbol]['strategies']
-            print("\n  전략별 점수:")
-            print(f"  브레이크아웃: {strategies['breakout']['signal']:.1f} ({strategies['breakout']['direction']})")
-            print(f"  모멘텀: {strategies['momentum']['signal']:.1f} ({strategies['momentum']['direction']})")
-            print(f"  갭 전략: {strategies['gap']['signal']:.1f} ({strategies['gap']['direction']})")
-            print(f"  VWAP: {strategies['vwap']['signal']:.1f} ({strategies['vwap']['direction']})")
-            print(f"  거래량: {strategies['volume']['signal']:.1f} ({strategies['volume']['direction']})")
-            
-        except Exception as e:
-            print(f"  오류 발생: {str(e)}")
-            
-    print("\n===== 테스트 완료 =====\n")
 
-# 매수 점수 기준 동적 조정
-async def set_buy_threshold(threshold):
-    """매수 점수 기준 동적 조정"""
-    from strategies.combined_strategy import CombinedStrategy
-    
-    # 통합 전략 인스턴스 가져오기
-    strategy = CombinedStrategy()
-    
-    # 기존 값 저장
-    old_threshold = strategy.params["buy_threshold"]
-    
-    # 새 값 설정
-    strategy.params["buy_threshold"] = float(threshold)
-    
-    print(f"\n매수 점수 기준이 {old_threshold}에서 {threshold}로 변경되었습니다.\n")
-    
-    # 변경된 설정으로 매수 조건 테스트 실행
-    await test_buy_condition()
-
-# 토큰 파일 테스트 및 상태 확인
-async def test_token():
-    """토큰 파일 테스트 및 상태 확인"""
-    try:
-        print("===== 토큰 파일 테스트 시작 =====")
-        
-        # 토큰 파일 경로
-        token_file_path = os.path.join(os.path.abspath(os.getcwd()), "token_info.json")
-        token_exists = False
-        
-        # 토큰 파일 존재 여부 확인
-        if os.path.exists(token_file_path):
-            token_exists = True
-            print(f"토큰 파일 발견: {token_file_path}")
-            
-            # 파일 정보 확인
-            file_stats = os.stat(token_file_path)
-            file_size = file_stats.st_size
-            modified_time = datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-            
-            print(f"파일 크기: {file_size} 바이트")
-            print(f"마지막 수정 시간: {modified_time}")
-            
-            # 파일 내용 확인
-            try:
-                with open(token_file_path, 'r') as f:
-                    token_info = json.load(f)
-                
-                # 현재 토큰 정보
-                if 'current' in token_info and token_info['current']:
-                    current_token = token_info['current']
-                    print("\n현재 토큰 정보:")
-                    print(f"  토큰 상태: {current_token.get('status', 'N/A')}")
-                    
-                    # 토큰이 있으면 만료 시간 계산
-                    if 'token' in current_token and current_token['token']:
-                        token_prefix = current_token['token'][:8] + "..." if len(current_token['token']) > 8 else "N/A"
-                        print(f"  토큰: {token_prefix}")
-                        
-                        if 'expire_time' in current_token:
-                            expire_time = current_token['expire_time']
-                            expire_time_str = current_token.get('expire_time_str', 'N/A')
-                            print(f"  만료 시간: {expire_time_str}")
-                            
-                            # 남은 시간 계산
-                            current_time = datetime.now().timestamp()
-                            if expire_time > current_time:
-                                remaining_hours = (expire_time - current_time) / 3600
-                                print(f"  남은 시간: {remaining_hours:.1f}시간 (만료까지)")
-                            else:
-                                print(f"  상태: 만료됨")
-                        
-                        if 'issue_time' in current_token:
-                            issue_time_str = current_token.get('issue_time_str', 'N/A')
-                            print(f"  발급 시간: {issue_time_str}")
-                    else:
-                        print("  토큰 정보가 없습니다.")
-                else:
-                    print("현재 토큰 정보가 없습니다.")
-                
-                # 히스토리 정보
-                if 'history' in token_info and token_info['history']:
-                    print("\n토큰 히스토리 (최근 5개):")
-                    for i, history in enumerate(token_info['history'][-5:]):
-                        print(f"  {i+1}. 시간: {history.get('recorded_at', 'N/A')}, 상태: {history.get('status', 'N/A')}")
-                        if history.get('error_message'):
-                            print(f"     오류: {history.get('error_message')}")
-                else:
-                    print("\n토큰 히스토리가 없습니다.")
-            
-            except json.JSONDecodeError:
-                print("토큰 파일이 유효한 JSON 형식이 아닙니다.")
-            except Exception as e:
-                print(f"토큰 파일 읽기 오류: {str(e)}")
-        
-        else:
-            print(f"토큰 파일이 존재하지 않습니다: {token_file_path}")
-            print("토큰 파일은 api_client.py가 처음 실행될 때 생성됩니다.")
-        
-        # API 클라이언트에서 토큰 상태 확인
-        print("\nAPI 클라이언트에서 토큰 상태 확인:")
-        token_status = api_client.check_token_status()
-        print(f"  상태: {token_status.get('status', 'N/A')}")
-        print(f"  메시지: {token_status.get('message', 'N/A')}")
-        
-        if 'expires_in_hours' in token_status:
-            print(f"  만료까지 남은 시간: {token_status['expires_in_hours']:.1f}시간")
-        
-        if 'expire_time' in token_status:
-            print(f"  만료 시간: {token_status.get('expire_time', 'N/A')}")
-        
-        if 'issue_time' in token_status:
-            print(f"  발급 시간: {token_status.get('issue_time', 'N/A')}")
-        
-        # 토큰 파일 상세 정보
-        file_info = api_client.get_token_file_info()
-        if file_info:
-            print("\n토큰 파일 상세 정보:")
-            for key, value in file_info.items():
-                print(f"  {key}: {value}")
-        
-        print("\n===== 토큰 테스트 완료 =====")
-        
-        # 강제 토큰 갱신 옵션 (파일이 없는 경우 자동으로 제안)
-        if not token_exists:
-            print("\n토큰 파일이 없습니다. 토큰을 생성하시겠습니까? (y/n): ", end="")
-        else:
-            print("\n토큰을 강제로 갱신하시겠습니까? (y/n): ", end="")
-        
-        user_input = input().strip().lower()
-        force_refresh = user_input in ['y', 'yes', '예', 'ㅇ', 'ㅛ', 'ㅛㄷㄴ', 'yes']
-        
-        if force_refresh:
-            print("\n토큰 강제 갱신 시작...")
-            refresh_result = api_client.force_token_refresh()
-            print(f"갱신 결과: {refresh_result.get('status', 'N/A')}")
-            print(f"메시지: {refresh_result.get('message', 'N/A')}")
-            
-            # 갱신 후 상태 확인
-            if 'token_status' in refresh_result:
-                token_status = refresh_result['token_status']
-                print(f"갱신 후 상태: {token_status.get('status', 'N/A')}")
-                print(f"갱신 후 메시지: {token_status.get('message', 'N/A')}")
-            
-            print("토큰 강제 갱신 완료")
-            
-            # 파일 체크
-            if os.path.exists(token_file_path):
-                print(f"\n토큰 파일이 성공적으로 생성되었습니다: {token_file_path}")
-                file_stats = os.stat(token_file_path)
-                print(f"파일 크기: {file_stats.st_size} 바이트")
-                print(f"생성 시간: {datetime.fromtimestamp(file_stats.st_ctime).strftime('%Y-%m-%d %H:%M:%S')}")
-            else:
-                print(f"\n에러: 토큰 파일이 생성되지 않았습니다.")
-        
-    except Exception as e:
-        print(f"토큰 테스트 중 오류 발생: {str(e)}")
-        import traceback
-        traceback.print_exc()
-
-# 로그 확인 함수
-async def check_log():
-    """최근 로그 확인"""
-    log_path = os.path.join(os.path.abspath(os.getcwd()), "logs")
-    
-    # 로그 디렉토리 확인
-    if not os.path.exists(log_path):
-        print(f"로그 디렉토리가 존재하지 않습니다: {log_path}")
-        return
-        
-    # 로그 파일 목록 가져오기
-    log_files = [f for f in os.listdir(log_path) if f.endswith('.log')]
-    
-    if not log_files:
-        print("로그 파일이 없습니다.")
-        return
-        
-    # 최신 로그 파일 찾기
-    latest_log = max(log_files, key=lambda x: os.path.getmtime(os.path.join(log_path, x)))
-    
-    # 최신 로그 내용 표시
-    log_file_path = os.path.join(log_path, latest_log)
-    print(f"\n=== 최신 로그 파일: {latest_log} ===\n")
-    
-    # 마지막 100줄만 표시
-    try:
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            
-        if lines:
-            num_lines = len(lines)
-            start_line = max(0, num_lines - 100)
-            
-            print(f"최근 100줄 표시 (전체 {num_lines}줄 중 {start_line+1}~{num_lines}줄)\n")
-            for i, line in enumerate(lines[start_line:], start=start_line+1):
-                print(f"{i}: {line.strip()}")
-        else:
-            print("로그 파일이 비어 있습니다.")
-    except Exception as e:
-        print(f"로그 파일 읽기 오류: {str(e)}")
-    
-    print("\n=== 로그 확인 완료 ===\n")
-
-# --test 옵션 추가
+# 메인 실행 진입점
 if __name__ == "__main__":
-    # 환경 변수 체크
-    required_env_vars = [
-        "KIS_BASE_URL",
-        "KIS_APP_KEY",
-        "KIS_APP_SECRET",
-        "KIS_ACCOUNT_NO"
-    ]
-    
-    # dotenv_helper를 사용해 필수 환경 변수 체크
-    missing_vars = dotenv_helper.check_required_keys(required_env_vars)
-    
-    if missing_vars:
-        print(f"Missing required environment variables: {', '.join(missing_vars)}")
-        print("Please set these environment variables in .env file before running the bot.")
-        
-        # .env 파일이 없으면 생성 제안
-        if not Path('.env').exists():
-            create_env = input("Create sample .env file? (y/n): ")
-            if create_env.lower() == 'y':
-                dotenv_helper.create_sample_env()
-                print("Sample .env file created. Please fill in the required values and run again.")
-        
+    # 필수 환경 변수 체크
+    required_vars = ["KIS_BASE_URL", "KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"]
+    if any(var not in os.environ for var in required_vars):
+        print("필수 환경 변수가 없습니다. .env 파일 확인 후 다시 실행하세요.")
         sys.exit(1)
     
-    # 명령행 인자 파싱
-    import argparse
-    parser = argparse.ArgumentParser(description="주식 자동매매 프로그램")
-    parser.add_argument("--update", action="store_true", help="종목 데이터 업데이트")
-    parser.add_argument("--checklog", action="store_true", help="최근 로그 확인")
-    parser.add_argument("--test", action="store_true", help="매수 조건 임시 테스트")
-    parser.add_argument("--test_token", action="store_true", help="토큰 파일 테스트 및 상태 확인")
-    parser.add_argument("--symbol", type=str, help="특정 종목 테스트용 (ex: 005930)")
-    parser.add_argument("--threshold", type=float, help="매수 임계값 설정 (ex: 5.0)")
-    parser.add_argument("--restart", action="store_true", help="프로그램 충돌 시 자동 재시작 활성화")
-    
-    args = parser.parse_args()
-    
     try:
-        if args.test_token:
-            asyncio.run(test_token())
-        elif args.threshold is not None:
-            asyncio.run(set_buy_threshold(args.threshold))
-        elif args.test:
-            asyncio.run(test_buy_condition(args.symbol))
-        elif args.checklog:
-            asyncio.run(check_log())
-        elif args.update:
-            asyncio.run(main(force_update=True))
-        else:
-            # 자동 재시작 기능이 활성화된 경우
-            if args.restart:
-                print("자동 재시작 기능이 활성화되었습니다. 프로그램이 충돌하면 자동으로 재시작됩니다.")
-                restart_count = 0
-                max_restarts = 5
-                
-                while restart_count < max_restarts:
-                    try:
-                        exit_code = asyncio.run(main())
-                        
-                        if exit_code == 0:  # 정상 종료
-                            print("프로그램이 정상적으로 종료되었습니다.")
-                            break
-                        else:
-                            print(f"프로그램이 오류 코드 {exit_code}로 종료되었습니다. 재시작합니다...")
-                            restart_count += 1
-                            print(f"재시작 시도 {restart_count}/{max_restarts}")
-                            time.sleep(30)  # 30초 후 재시작
-                    except Exception as e:
-                        print(f"치명적인 오류 발생: {str(e)}. 재시작합니다...")
-                        restart_count += 1
-                        print(f"재시작 시도 {restart_count}/{max_restarts}")
-                        time.sleep(30)  # 30초 후 재시작
-                
-                if restart_count >= max_restarts:
-                    print(f"최대 재시작 횟수({max_restarts}회)를 초과했습니다. 프로그램을 종료합니다.")
-            else:
-                # 일반 실행
-                asyncio.run(main())
+        # 메인 함수 실행
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("프로그램 종료 (Ctrl+C)")
-        sys.exit(0)
     except Exception as e:
-        print(f"프로그램 실행 중 예상치 못한 오류 발생: {str(e)}")
+        print(f"오류 발생: {str(e)}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
