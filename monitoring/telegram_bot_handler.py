@@ -20,7 +20,7 @@ from core.stock_explorer import stock_explorer
 from strategies.combined_strategy import combined_strategy
 from monitoring.alert_system import alert_system
 from utils.logger import logger
-from utils.database import db
+from utils.database import database_manager
 from utils.dotenv_helper import dotenv_helper
 
 # API 클라이언트 인스턴스 생성
@@ -294,7 +294,7 @@ class TelegramBotHandler:
         
         # DB에 상태 업데이트
         try:
-            db.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
+            database_manager.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
             logger.log_system("시스템 상태를 '종료됨'으로 업데이트", level="INFO")
         except Exception as e:
             logger.log_error(e, "상태 업데이트 중 오류")
@@ -476,7 +476,7 @@ class TelegramBotHandler:
         # order_manager에도 거래 일시 중지 상태 설정
         order_manager.pause_trading()
             
-        db.update_system_status("PAUSED", "텔레그램 명령으로 거래 일시 중지됨")
+        database_manager.update_system_status("PAUSED", "텔레그램 명령으로 거래 일시 중지됨")
         return "⚠️ <b>거래가 일시 중지되었습니다.</b>\n\n자동 매매가 중지되었지만, 수동 매매는 가능합니다.\n거래를 재개하려면 <code>/resume</code>을 입력하세요."
     
     async def resume_trading(self, args: List[str]) -> str:
@@ -493,7 +493,7 @@ class TelegramBotHandler:
         # order_manager에도 거래 재개 상태 설정
         order_manager.resume_trading()
             
-        db.update_system_status("RUNNING", "텔레그램 명령으로 거래 재개됨")
+        database_manager.update_system_status("RUNNING", "텔레그램 명령으로 거래 재개됨")
         return "✅ <b>거래가 재개되었습니다.</b>"
     
     async def close_all_positions(self, args: List[str]) -> str:
@@ -591,7 +591,7 @@ class TelegramBotHandler:
         today = datetime.now().strftime('%Y-%m-%d')
         one_week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
         
-        trades = db.get_trades(symbol=symbol, start_date=one_week_ago, end_date=f"{today} 23:59:59")
+        trades = database_manager.get_trades(symbol=symbol, start_date=one_week_ago, end_date=f"{today} 23:59:59")
         
         if not trades:
             return f"<b>📊 최근 거래 내역</b>\n\n최근 거래 내역이 없습니다." + (f"\n종목: {symbol}" if symbol else "")
@@ -760,7 +760,7 @@ class TelegramBotHandler:
             end_date = datetime.now().strftime('%Y-%m-%d')
             
             # 거래 내역 조회
-            trades = db.get_trades(start_date=start_date, end_date=f"{end_date} 23:59:59")
+            trades = database_manager.get_trades(start_date=start_date, end_date=f"{end_date} 23:59:59")
             
             if not trades:
                 return f"📊 <b>성과 지표</b>\n\n최근 {days}일간 거래 내역이 없습니다."
@@ -910,7 +910,7 @@ class TelegramBotHandler:
         
         # 시스템 상태 업데이트
         try:
-            db.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
+            database_manager.update_system_status("STOPPED", "텔레그램 명령으로 시스템 종료됨")
             logger.log_system("시스템 상태를 '종료됨'으로 업데이트", level="INFO")
         except Exception as e:
             logger.log_error(e, "상태 업데이트 중 오류")
@@ -951,7 +951,7 @@ class TelegramBotHandler:
             strategy_status = combined_strategy.get_strategy_status()
             
             # 시스템 상태
-            system_status = db.get_system_status()
+            system_status = database_manager.get_system_status()
             status = system_status.get("status", "UNKNOWN")
             status_emoji = {
                 "RUNNING": "✅",
@@ -987,7 +987,7 @@ class TelegramBotHandler:
             ws_status = "🟢 연결됨" if ws_client.is_connected() else "🔴 끊김"
             
             # 실행 시간
-            uptime = datetime.now() - db.get_start_time()
+            uptime = datetime.now() - database_manager.get_start_time()
             hours, remainder = divmod(uptime.total_seconds(), 3600)
             minutes, seconds = divmod(remainder, 60)
             uptime_str = f"{int(hours)}시간 {int(minutes)}분"

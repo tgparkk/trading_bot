@@ -3,6 +3,7 @@
 장 시작 시 전일 종가와 당일 시가의 차이(갭)를 활용하는 전략
 """
 import asyncio
+import threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime, time, timedelta
 from collections import deque
@@ -18,9 +19,22 @@ from monitoring.alert_system import alert_system
 class GapStrategy:
     """갭 트레이딩 전략 클래스"""
     
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+    
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
             "min_gap_pct": 0.007,        # 최소 갭 비율 (0.7%)
             "max_gap_pct": 0.05,         # 최대 갭 비율 (5%)
             "gap_fill_pct": 0.75,        # 갭 채움 목표 비율 (75%)
@@ -32,17 +46,18 @@ class GapStrategy:
             "hold_time_minutes": 120     # 최대 보유 시간 (분)
         }
         
-        # 설정에 gap_params가 있으면 업데이트
-        if hasattr(config["trading"], "gap_params"):
-            self.params.update(config["trading"].gap_params)
-            
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.price_data = {}           # {symbol: deque of price data}
-        self.gap_data = {}             # {symbol: {'gap_pct': float, 'direction': str, 'prev_close': float}}
-        self.positions = {}            # {position_id: position_data}
-        self.volume_data = {}          # {symbol: {'avg_volume': float, 'volume_ratio': float}}
+            # 설정에 gap_params가 있으면 업데이트
+            if hasattr(config["trading"], "gap_params"):
+                self.params.update(config["trading"].gap_params)
+                
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.price_data = {}           # {symbol: deque of price data}
+            self.gap_data = {}             # {symbol: {'gap_pct': float, 'direction': str, 'prev_close': float}}
+            self.positions = {}            # {position_id: position_data}
+            self.volume_data = {}          # {symbol: {'avg_volume': float, 'volume_ratio': float}}
+            self._initialized = True
         
     async def start(self, symbols: List[str]):
         """전략 시작"""

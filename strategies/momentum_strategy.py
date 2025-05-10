@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Deque
 from datetime import datetime, time, timedelta
 from collections import deque
 import numpy as np
+import threading
 
 from config.settings import config
 from core.api_client import api_client
@@ -17,33 +18,41 @@ from monitoring.alert_system import alert_system
 
 class MomentumStrategy:
     """모멘텀 전략 클래스"""
-    
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
-            "rsi_period": 14,           # RSI 계산 기간
-            "rsi_buy_threshold": 30,    # RSI 매수 임계값
-            "rsi_sell_threshold": 70,   # RSI 매도 임계값
-            "ma_short_period": 5,       # 단기 이동평균 기간
-            "ma_long_period": 20,       # 장기 이동평균 기간
-            "stop_loss_pct": 0.02,      # 손절 비율 (2%)
-            "take_profit_pct": 0.04,    # 익절 비율 (4%)
-            "max_positions": 3,         # 최대 포지션 개수
-            "position_size": 1000000    # 기본 포지션 크기 (100만원)
-        }
-        
-        # 설정에 momentum_params가 있으면 업데이트
-        if hasattr(config["trading"], "momentum_params"):
-            self.params.update(config["trading"].momentum_params)
-            
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.price_data = {}            # {symbol: deque of price data}
-        self.positions = {}             # {position_id: position_data}
-        self.indicators = {}            # {symbol: {'rsi': value, 'ma_short': value, 'ma_long': value}}
-        self.signals = {}               # {symbol: {'strength': value, 'direction': str, 'last_update': datetime}}
-        
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
+                "rsi_period": 14,           # RSI 계산 기간
+                "rsi_buy_threshold": 30,    # RSI 매수 임계값
+                "rsi_sell_threshold": 70,   # RSI 매도 임계값
+                "ma_short_period": 5,       # 단기 이동평균 기간
+                "ma_long_period": 20,       # 장기 이동평균 기간
+                "stop_loss_pct": 0.02,      # 손절 비율 (2%)
+                "take_profit_pct": 0.04,    # 익절 비율 (4%)
+                "max_positions": 3,         # 최대 포지션 개수
+                "position_size": 1000000    # 기본 포지션 크기 (100만원)
+            }
+            if hasattr(config["trading"], "momentum_params"):
+                self.params.update(config["trading"].momentum_params)
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.price_data = {}
+            self.positions = {}
+            self.indicators = {}
+            self.signals = {}
+            self._initialized = True
+    
     async def start(self, symbols: List[str]):
         """전략 시작"""
         try:

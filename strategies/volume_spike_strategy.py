@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Deque
 from datetime import datetime, time, timedelta
 from collections import deque
 import numpy as np
+import threading
 
 from config.settings import config
 from core.api_client import api_client
@@ -17,33 +18,44 @@ from monitoring.alert_system import alert_system
 
 class VolumeStrategy:
     """볼륨 스파이크 전략 클래스"""
-    
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
-            "volume_multiplier": 2.3,      # 평균 거래량 대비 배수
-            "look_back_periods": 20,       # 평균 계산 기간 (일)
-            "consolidation_minutes": 15,   # 가격 조정 대기 시간 (분)
-            "price_move_threshold": 0.01,  # 가격 변동 임계값 (1%)
-            "stop_loss_pct": 0.02,         # 손절 비율 (2%)
-            "take_profit_pct": 0.03,       # 익절 비율 (3%)
-            "max_positions": 3,            # 최대 포지션 개수
-            "position_size": 1000000,      # 기본 포지션 크기 (100만원)
-            "breakout_confirmation": True  # 추세 방향 확인 필요 여부
-        }
-        
-        # 설정에 volume_params가 있으면 업데이트
-        if hasattr(config["trading"], "volume_params"):
-            self.params.update(config["trading"].volume_params)
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
+                "volume_multiplier": 2.3,      # 평균 거래량 대비 배수
+                "look_back_periods": 20,       # 평균 계산 기간 (일)
+                "consolidation_minutes": 15,   # 가격 조정 대기 시간 (분)
+                "price_move_threshold": 0.01,  # 가격 변동 임계값 (1%)
+                "stop_loss_pct": 0.02,         # 손절 비율 (2%)
+                "take_profit_pct": 0.03,       # 익절 비율 (3%)
+                "max_positions": 3,            # 최대 포지션 개수
+                "position_size": 1000000,      # 기본 포지션 크기 (100만원)
+                "breakout_confirmation": True  # 추세 방향 확인 필요 여부
+            }
             
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.price_data = {}              # {symbol: deque of price data}
-        self.volume_data = {}             # {symbol: {'avg_volume': float, 'spike_detected': bool}}
-        self.positions = {}               # {position_id: position_data}
-        self.pending_entry = {}           # {symbol: {'side': str, 'detection_time': datetime, 'detection_price': float}}
-        self.signals = {}                  # {symbol: {'strength': float, 'direction': str, 'last_update': datetime}}
+            # 설정에 volume_params가 있으면 업데이트
+            if hasattr(config["trading"], "volume_params"):
+                self.params.update(config["trading"].volume_params)
+            
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.price_data = {}              # {symbol: deque of price data}
+            self.volume_data = {}             # {symbol: {'avg_volume': float, 'spike_detected': bool}}
+            self.positions = {}               # {position_id: position_data}
+            self.pending_entry = {}           # {symbol: {'side': str, 'detection_time': datetime, 'detection_price': float}}
+            self.signals = {}                  # {symbol: {'strength': float, 'direction': str, 'last_update': datetime}}
+            self._initialized = True
         
     async def start(self, symbols: List[str]):
         """전략 시작"""

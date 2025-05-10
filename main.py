@@ -9,7 +9,7 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime, time as datetime_time, timedelta
-from typing import List
+from typing import List, Optional, Dict, Any
 
 # Windows에서 asyncio 관련 경고 해결을 위한 패치
 if sys.platform.startswith('win'):
@@ -39,7 +39,7 @@ from core.order_manager import order_manager
 from core.stock_explorer import stock_explorer
 from strategies.combined_strategy import combined_strategy
 from utils.logger import logger
-from utils.database import db
+from utils.database import database_manager
 from monitoring.alert_system import alert_system
 from monitoring.telegram_bot_handler import telegram_bot_handler
 from flask import Flask, render_template, jsonify
@@ -56,24 +56,48 @@ logger.initialize_with_config()
 # 플라스크 앱 초기화 (API 서버용)
 # app = Flask(__name__)
 
+# 전역 변수로 모니터링 종목 관리
+MONITORED_SYMBOLS: List[str] = []
+LAST_SYMBOL_UPDATE: Optional[datetime] = None
+
 class TradingBot:
     """자동매매 봇"""
     
-    def __init__(self):
-        self.running = False
+    def __init__(self) -> None:
+        self.running: bool = False
         self.trading_config = config["trading"]
-        self.max_retries = self.trading_config.get("max_websocket_retries", 3)
+        # max_websocket_retries 속성을 안전하게 가져오기
+        try:
+            self.max_retries: int = self.trading_config.max_websocket_retries
+        except AttributeError:
+            self.max_retries: int = 3  # 기본값 설정
+            logger.log_warning("max_websocket_retries not found in config, using default value 3")
         
-    async def initialize(self):
+    async def initialize(self) -> None:
         """초기화"""
         try:
             logger.log_system("Initializing trading bot...")
             
             # DB 초기화
-            db.update_system_status("INITIALIZING")
+            database_manager.update_system_status("INITIALIZING")
             
             # 주문 관리자 초기화
             await order_manager.initialize()
+            
+            # 전략들이 제대로 로드되었는지 확인
+            logger.log_system("전략 확인 시작...")
+            strategies = combined_strategy.strategies
+            logger.log_system(f"전략 갯수: {len(strategies)}")
+            
+            for name, strategy in strategies.items():
+                if strategy:
+                    logger.log_system(f"전략 {name}: OK")
+                    if hasattr(strategy, 'get_signal'):
+                        logger.log_system(f"전략 {name}: get_signal 메서드 존재")
+                    else:
+                        logger.log_warning(f"전략 {name}: get_signal 메서드 부재")
+                else:
+                    logger.log_warning(f"전략 {name}: None")
             
             # 웹소켓 연결 - 재시도 추가
             websocket_connected = False
@@ -95,7 +119,7 @@ class TradingBot:
                     await asyncio.sleep(2)  # 재시도 전 2초 대기
             
             # 시스템 상태 업데이트
-            db.update_system_status("RUNNING")
+            database_manager.update_system_status("RUNNING")
             
             # 시작 알림
             await alert_system.notify_system_status(
@@ -110,411 +134,454 @@ class TradingBot:
             await self.shutdown(error=str(e))
             raise
     
-    async def run(self):
-        """실행"""
+    async def run(self) -> None:
+        """실행 - 리팩토링된 버전"""
         try:
-            self.running = True
-            await self.initialize()
+            global MONITORED_SYMBOLS, LAST_SYMBOL_UPDATE
             
-            # 백엔드 서버 준비 완료 로그
+            self.running = True
+            
             logger.log_system("=== 백엔드 서버 준비 완료 - 트레이딩 프로세스 시작 ===")
             
-            # 메인 루프
-            logger.log_system("메인 루프 시작 - 10초마다 상태 확인, 주기적 종목 스캔 실행")
-
-            # 강제로 자동 종목 스캔 실행 (루프 시작 전)
-            logger.log_system("=== 최초 자동 종목 스캔 강제 실행 ===")
-            logger.log_trade(
-                action="FORCE_AUTO_SCAN_START",
-                symbol="SYSTEM",
-                price=0,
-                quantity=0,
-                reason=f"루프 시작 전 최초 자동 종목 스캔 강제 실행",
-                time=datetime.now().strftime("%H:%M:%S"),
-                status="RUNNING"
-            )
-
-            try:
-                # 종목 스캔 실행
-                force_symbols = await self._get_tradable_symbols()
-                if force_symbols:
-                    # 스캔 결과 로그
-                    logger.log_system(f"[OK] 강제 자동 종목 스캔 완료: 총 {len(force_symbols)}개 종목 발견")
-                    logger.log_system(f"상위 종목 50개: {', '.join(force_symbols[:50])}")
-                    
-                    # 종목 업데이트 및 전략 시작
-                    await combined_strategy.update_symbols(force_symbols[:50])
-                    
-                    # 전략 시작 (이미 시작된 경우 무시됨)
-                    if not combined_strategy.running:
-                        logger.log_system("=== 통합 전략 시작 ===")
-                        try:
-                            await combined_strategy.start(force_symbols[:50])
-                            logger.log_system("=== 통합 전략 시작 완료 ===")
-                            logger.log_trade(
-                                action="STRATEGY_START",
-                                symbol="SYSTEM",
-                                price=0,
-                                quantity=len(force_symbols[:50]),
-                                reason=f"통합 전략 시작 완료",
-                                watched_symbols=len(force_symbols[:50]),
-                                time=datetime.now().strftime("%H:%M:%S"),
-                                status="SUCCESS"
-                            )
-                        except Exception as strategy_start_error:
-                            logger.log_error(strategy_start_error, "통합 전략 시작 중 오류 발생")
-                            logger.log_trade(
-                                action="STRATEGY_START_FAILED",
-                                symbol="SYSTEM",
-                                price=0,
-                                quantity=0,
-                                reason=f"통합 전략 시작 실패: {str(strategy_start_error)}",
-                                time=datetime.now().strftime("%H:%M:%S"),
-                                status="ERROR"
-                            )
-                    
-                    last_symbol_search = datetime.now()  # 마지막 스캔 시간 업데이트
-                    
-                    logger.log_trade(
-                        action="FORCE_AUTO_SCAN_COMPLETE",
-                        symbol="SYSTEM",
-                        price=0,
-                        quantity=len(force_symbols[:50]),
-                        reason=f"루프 시작 전 강제 자동 종목 스캔 완료",
-                        top_symbols=", ".join(force_symbols[:10]) if force_symbols else "",
-                        time=datetime.now().strftime("%H:%M:%S"),
-                        status="SUCCESS"
-                    )
-                else:
-                    logger.log_system(f"❌ 강제 자동 종목 스캔 실패 - 거래 가능 종목이 없습니다.")
-                    # 초기 스캔 실패 시 기본값 설정
-                    last_symbol_search = datetime.now() - timedelta(minutes=5)  # 5분 전으로 설정하여 빠른 재시도 유도
-            except Exception as e:
-                logger.log_error(e, "강제 자동 종목 스캔 중 오류 발생")
-                # 예외 발생 시 기본값 설정
-                last_symbol_search = datetime.now() - timedelta(minutes=5)
-            logger.log_system("=== 강제 자동 종목 스캔 작업 종료 ===")
+            # 1. 초기 종목 스캔 - 5개 전략 사용하여 상위 100개 선정
+            await self._initial_symbol_scan()
             
-            # 장 시작 후 경과 시간 체크용
-            market_open_time = None
+            # 2. 메인 루프 시작
+            logger.log_system("메인 루프 시작 - 주기적 종목 모니터링 실행")
             
-            # 첫 번째 루프 실행 여부를 추적하는 플래그
-            first_loop_run = True
-            
-            # 메인 루프 시작 시간 기록
-            main_loop_start_time = datetime.now()
-            retry_count = 0
-            max_retries = 3
-            
-            # 메인 루프
             while self.running:
-                current_time = datetime.now().time()
-                current_datetime = datetime.now()
-                
-                # 안정성을 위한 메인 루프 모니터링
-                loop_uptime = (current_datetime - main_loop_start_time).total_seconds() / 60  # 분 단위
-                if current_datetime.minute % 5 == 0 and current_datetime.second < 10:  # 5분마다 로깅
-                    logger.log_system(f"메인 루프 안정성 체크: 업타임 {loop_uptime:.1f}분, 상태: 정상")
-                
                 try:
-                    # 장 시간 체크 - 명확한 로그 추가
-                    market_open = self._is_market_open(current_time)
-                    logger.log_system(f"메인 루프 체크 - 현재 시간: {current_time}, 장 시간 여부: {market_open}, 첫 루프: {first_loop_run}")
+                    current_time = datetime.now().time()
                     
-                    if market_open:
-                        # 장 오픈 시간 기록
-                        if market_open_time is None:
-                            market_open_time = current_datetime
-                            logger.log_system("장이 열렸습니다. 초기 장 오픈 시간을 설정합니다.")
+                    # 3. 장 시작 30분 전 (8:30) 또는 오래된 데이터일 경우 종목 재스캔
+                    if self._should_rescan_symbols(current_time):
+                        await self._rescan_symbols()
+                    
+                    # 4. 장 시간 체크 및 거래 실행
+                    if self._is_market_open(current_time):
+                        # 포지션 체크
+                        await order_manager.check_positions()
                         
-                        # 장 시작 직후 2분 동안은 더 자주 업데이트
-                        market_open_elapsed = (current_datetime - market_open_time).total_seconds()
-                        is_market_opening_period = market_open_elapsed < 120  # 장 시작 2분 이내
-                        
-                        # 장 시작 직후 1분 간격, 이후 2분 간격으로 종목 재탐색 (주기 단축)
-                        time_since_last_search = (current_datetime - last_symbol_search).total_seconds()
-                        search_interval = 60 if is_market_opening_period else 120  # 1분 또는 2분
-                        
-                        # 매 루프마다 더 명확한 디버깅 로그 추가
-                        logger.log_system(f"자동 종목 스캔 체크 - 마지막 스캔 이후 {int(time_since_last_search)}초 경과, 스캔 간격: {search_interval}초, 남은 시간: {max(0, search_interval-time_since_last_search)}초")
-                        
-                        # 첫 번째 루프이거나 주기적인 스캔 시간이 되었을 때 종목 스캔 실행
-                        if first_loop_run or time_since_last_search >= search_interval:
-                            # 확실하게 로그 추가
-                            logger.log_system(f"=======================================")
-                            if first_loop_run:
-                                logger.log_system(f"🔄 첫 번째 루프에서 자동 종목 스캔 강제 실행 - 현재 시간: {current_time}")
-                            else:
-                                logger.log_system(f"🔄 자동 종목 스캔 실행 시작 - 간격: {search_interval}초, 현재 시간: {current_time}")
-                            logger.log_system(f"=======================================")
-                            
-                            # 거래 로그에도 스캔 시작 기록
-                            logger.log_trade(
-                                action="AUTO_SCAN_START",
-                                symbol="SYSTEM",
-                                price=0,
-                                quantity=0,
-                                reason=f"자동 종목 스캔 시작 ({first_loop_run and '첫 번째 루프 강제 실행' or f'간격: {search_interval}초'})",
-                                time=current_datetime.strftime("%H:%M:%S"),
-                                status="RUNNING"
-                            )
-                            
-                            # 첫 번째 루프 실행 후 flag 해제
-                            first_loop_run = False
-                            
-                            try:
-                                new_symbols = await self._get_tradable_symbols()
-                                if new_symbols:
-                                    # 성공 처리
-                                    await self._handle_scan_success(
-                                        new_symbols, 
-                                        current_datetime, 
-                                        search_interval, 
-                                        market_open_elapsed
-                                    )
-                                    last_symbol_search = current_datetime
-                                    retry_count = 0
-                                else:
-                                    # 실패 처리
-                                    logger.log_system(f"❌ 자동 종목 스캔 실패 - 거래 가능 종목이 없습니다.")
-                                    last_symbol_search = current_datetime - timedelta(seconds=search_interval - 30)
-                                    logger.log_system(f"종목 스캔 실패로 30초 후 재시도 예정")
-                                    
-                                    # 거래 로그에 실패 기록
-                                    self._log_scan_failure("거래 가능 종목 없음", current_datetime)
-                                    
-                                    # 실패 카운터 증가
-                                    retry_count += 1
-                                    if retry_count >= max_retries:
-                                        retry_count = await self._handle_consecutive_failures(
-                                            retry_count, 
-                                            max_retries, 
-                                            "종목 스캔 연속 실패"
-                                        )
-                            except Exception as e:
-                                # 예외 처리
-                                logger.log_error(e, "자동 종목 스캔 중 오류 발생")
-                                last_symbol_search = current_datetime - timedelta(seconds=search_interval - 30)
-                                logger.log_system(f"종목 스캔 오류로 30초 후 재시도 예정")
+                        # 매수 신호 체크 및 주문 실행 로직 추가
+                        if len(MONITORED_SYMBOLS) > 0:
+                            # 2분마다 신호 체크
+                            now = datetime.now()
+                            if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
+                                logger.log_system("======== 매수 신호 체크 시작 ========")
                                 
-                                # 거래 로그에 오류 기록
-                                self._log_scan_failure(f"종목 스캔 오류: {str(e)}", current_datetime, status="ERROR")
+                                # 모니터링 중인 종목 중 상위 50개만 체크
+                                symbols_to_check = MONITORED_SYMBOLS[:50]
+                                logger.log_system(f"체크할 종목 수: {len(symbols_to_check)}개")
                                 
-                                # 오류 카운터 증가
-                                retry_count += 1
-                                if retry_count >= max_retries:
-                                    retry_count = await self._handle_consecutive_failures(
-                                        retry_count, 
-                                        max_retries, 
-                                        "종목 스캔 연속 오류"
-                                    )
-
-                            # 아래에 필요한 헬퍼 메서드들 추가 (TradingBot 클래스 내부에 정의)
-                        
-                        # 포지션 체크 (예외 처리 추가)
-                        try:
-                            await order_manager.check_positions()
-                        except Exception as position_error:
-                            logger.log_error(position_error, "포지션 체크 중 오류 발생")
+                                # 계좌 잔고 조회로 주문 금액 계산
+                                try:
+                                    account_balance = await order_manager.get_account_balance()
+                                    balance_data = account_balance.get("output1", {})
+                                    
+                                    # 예수금 총액 가져오기
+                                    deposit_balance = float(balance_data.get("dnca_tot_amt", "0"))
+                                    
+                                    # 주문 금액은 예수금의 50%
+                                    order_amount = deposit_balance * 0.5
+                                    
+                                    if order_amount <= 0:
+                                        logger.log_system(f"계좌 잔고 부족으로 매수 신호 체크 중단: {deposit_balance:,.0f}원")
+                                        continue
+                                    
+                                    logger.log_system(f"계좌 잔고: {deposit_balance:,.0f}원, 주문 금액: {order_amount:,.0f}원 (50%)")
+                                    
+                                except Exception as balance_error:
+                                    logger.log_error(balance_error, "계좌 잔고 조회 실패")
+                                    # 기본값으로 계속 진행
+                                    order_amount = 1000000  # 100만원 기본값
+                                    logger.log_system(f"계좌 잔고 조회 실패로 기본값 사용: {order_amount:,.0f}원")
+                                
+                                # 종목별 매수 신호 확인
+                                buy_signals_found = 0
+                                orders_placed = 0
+                                
+                                for symbol in symbols_to_check:
+                                    try:
+                                        # 동시에 너무 많은 API 호출 방지를 위한 딜레이
+                                        await asyncio.sleep(0.2)
+                                        
+                                        # 통합 전략에서 신호 얻기
+                                        strategy_status = combined_strategy.get_strategy_status(symbol)
+                                        
+                                        # 신호 정보 유효성 확인
+                                        if (symbol not in strategy_status.get("signals", {}) or 
+                                            "direction" not in strategy_status["signals"][symbol]):
+                                            continue
+                                        
+                                        # 매수 신호 및 점수 확인
+                                        signal_info = strategy_status["signals"][symbol]
+                                        signal_direction = signal_info["direction"]
+                                        signal_score = signal_info.get("score", 0)
+                                        
+                                        # 매수 신호 및 최소 점수(6.0) 확인
+                                        if signal_direction == "BUY" and signal_score >= 6.0:
+                                            buy_signals_found += 1
+                                            logger.log_system(f"[{buy_signals_found}] 매수 신호 발견: {symbol}, 점수={signal_score:.1f}")
+                                            
+                                            # 현재가 조회
+                                            try:
+                                                symbol_info = await asyncio.wait_for(
+                                                    api_client.get_symbol_info(symbol),
+                                                    timeout=2.0
+                                                )
+                                                
+                                                if symbol_info and "current_price" in symbol_info:
+                                                    current_price = symbol_info["current_price"]
+                                                    
+                                                    # 주문 수량 계산 (계좌 잔고의 50%를 사용)
+                                                    quantity = max(1, int(order_amount / current_price))
+                                                    
+                                                    # 주문 금액이 너무 큰 경우 실수 방지를 위한 안전장치
+                                                    max_order_value = 5000000  # 최대 500만원
+                                                    if quantity * current_price > max_order_value:
+                                                        old_quantity = quantity
+                                                        quantity = int(max_order_value / current_price)
+                                                        logger.log_system(f"안전장치 작동: 주문 수량 제한 {old_quantity}→{quantity}주 (최대 {max_order_value:,.0f}원)")
+                                                    
+                                                    # 주문 실행
+                                                    logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={current_price * quantity:,.0f}원")
+                                                    
+                                                    try:
+                                                        order_result = await asyncio.wait_for(
+                                                            order_manager.place_order(
+                                                                symbol=symbol,
+                                                                side="BUY",
+                                                                quantity=quantity,
+                                                                price=current_price,
+                                                                order_type="MARKET",
+                                                                strategy="main_bot",
+                                                                reason="strategy_signal"
+                                                            ),
+                                                            timeout=5.0
+                                                        )
+                                                        
+                                                        if order_result and order_result.get("status") == "success":
+                                                            orders_placed += 1
+                                                            logger.log_system(f"✅ 매수 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
+                                                            
+                                                            # 주문 정보 로깅
+                                                            logger.log_trade(
+                                                                action="BUY",
+                                                                symbol=symbol,
+                                                                price=current_price,
+                                                                quantity=quantity,
+                                                                reason="전략 신호에 따른 자동 매수",
+                                                                strategy="main_bot",
+                                                                score=f"{signal_score:.1f}",
+                                                                time=datetime.now().strftime("%H:%M:%S"),
+                                                                status="SUCCESS"
+                                                            )
+                                                            
+                                                            # 한 번에 너무 많은 주문 방지
+                                                            if orders_placed >= 3:
+                                                                logger.log_system("최대 주문 수 도달 (3개), 추가 주문 중단")
+                                                                break
+                                                        else:
+                                                            logger.log_system(f"❌ 매수 주문 실패: {symbol}, 사유={order_result.get('reason')}")
+                                                    except asyncio.TimeoutError:
+                                                        logger.log_system(f"⏱️ 매수 주문 타임아웃: {symbol}")
+                                                    except Exception as order_error:
+                                                        logger.log_error(order_error, f"{symbol} 매수 주문 처리 중 오류")
+                                            except asyncio.TimeoutError:
+                                                logger.log_system(f"현재가 조회 타임아웃: {symbol}")
+                                            except Exception as price_error:
+                                                logger.log_error(price_error, f"{symbol} 현재가 조회 중 오류")
+                                        
+                                    except Exception as signal_error:
+                                        logger.log_error(signal_error, f"{symbol} 매수 신호 처리 중 오류")
+                                
+                                # 종목 신호 체크 결과 요약
+                                logger.log_system(f"매수 신호 체크 완료: 발견={buy_signals_found}개, 주문 실행={orders_placed}개")
+                                logger.log_system("======== 매수 신호 체크 종료 ========")
                         
                         # 시스템 상태 업데이트
-                        try:
-                            db.update_system_status("RUNNING")
-                        except Exception as db_error:
-                            logger.log_error(db_error, "시스템 상태 업데이트 중 오류 발생")
+                        database_manager.update_system_status("RUNNING")
                         
                         # 주기적 상태 로깅 (1분마다)
-                        if current_datetime.second < 10:  # 매 분 처음 10초 이내에만 실행
-                            logger.log_system(f"시스템 실행 중 - 현재 시간: {current_time}, 장 시간: {self._is_market_open(current_time)}")
-                    
+                        if datetime.now().second < 5:
+                            logger.log_system(f"시스템 실행 중 - 현재 시간: {current_time}, 모니터링 종목 수: {len(MONITORED_SYMBOLS)}")
                     else:
                         # 장 마감 처리
                         if current_time > self.trading_config.market_close:
                             await self._handle_market_close()
-                        # 장이 닫히면 market_open_time 초기화
-                        market_open_time = None
+                    
+                    # 5초 대기
+                    await asyncio.sleep(5)
                     
                 except Exception as loop_error:
-                    # 메인 루프 내부 오류 처리
-                    logger.log_error(loop_error, "메인 루프 내부 처리 중 오류 발생, 계속 진행합니다.")
-                    # 안전한 대기 시간 추가
+                    logger.log_error(loop_error, "메인 루프 내부 처리 중 오류 발생")
                     await asyncio.sleep(5)
-                
-                # 안전한 대기 - 예외 처리 추가
-                try:
-                    await asyncio.sleep(10)  # 10초 대기
-                except Exception as sleep_error:
-                    logger.log_error(sleep_error, "대기 중 오류 발생")
-                    # 짧은 대기로 다시 시도
-                    await asyncio.sleep(1)
                 
         except Exception as e:
             logger.log_error(e, "Trading bot error")
             await self.shutdown(error=str(e))
-
-    async def _handle_scan_success(self, symbols, current_datetime, search_interval, market_open_elapsed):
-        """종목 스캔 성공 처리 - 로깅 및 종목 업데이트"""
-        # 로그 출력
-        logger.log_system(f"[OK] 자동 종목 스캔 성공 - {len(symbols)}개 종목이 발견되었습니다.")
-        logger.log_system(f"상위 종목 10개: {', '.join(symbols[:10])}")
-        
-        # 종목 업데이트
-        await combined_strategy.update_symbols(symbols[:50])
-        
-        # 추가 로그
-        logger.log_system(f"=======================================")
-        logger.log_system(f"[OK] 자동 종목 스캔 완료 - 총 {len(symbols)}개 종목, 상위 50개 선택")
-        logger.log_system(f"=======================================")
-        
-        # 거래 로그 기록
-        top_symbols = ", ".join(symbols[:10]) if symbols else ""
-        logger.log_trade(
-            action="AUTO_SCAN_COMPLETE",
-            symbol="SYSTEM",
-            price=0,
-            quantity=len(symbols[:50]),
-            reason=f"자동 종목 스캔 완료",
-            scan_interval=f"{search_interval}초",
-            market_phase=market_open_elapsed < 120 and "장 초반" or "장 중",
-            top_symbols=top_symbols,
-            time=current_datetime.strftime("%H:%M:%S"),
-            status="SUCCESS"
-        )
-
-    def _log_scan_failure(self, reason, current_datetime, status="FAILED"):
-        """스캔 실패 로그 기록"""
-        action = "AUTO_SCAN_ERROR" if status == "ERROR" else "AUTO_SCAN_FAILED"
-        logger.log_trade(
-            action=action,
-            symbol="SYSTEM",
-            price=0,
-            quantity=0,
-            reason=reason,
-            time=current_datetime.strftime("%H:%M:%S"),
-            status=status
-        )
-
-    async def _handle_consecutive_failures(self, retry_count, max_retries, failure_type):
-        """연속 실패 처리 - 토큰 갱신 시도"""
-        logger.log_warning(f"{failure_type}, {max_retries}회 연속 발생, API 연결 문제가 의심됩니다.")
-        
-        # 토큰 강제 갱신 시도
-        try:
-            logger.log_system("API 토큰 강제 갱신 시도...")
-            refresh_result = api_client.force_token_refresh()
-            logger.log_system(f"토큰 갱신 결과: {refresh_result.get('status')} - {refresh_result.get('message')}")
-            return 0  # 토큰 갱신 후 카운터 초기화
-        except Exception as token_error:
-            logger.log_error(token_error, "토큰 갱신 중 오류 발생")
-            return retry_count  # 기존 카운터 유지
     
-    async def _get_tradable_symbols(self) -> List[str]:
-        """거래 가능 종목 조회 (필터링 포함)"""
+    async def _initial_symbol_scan(self) -> None:
+        """초기 종목 스캔 - 5개 전략 사용하여 상위 100개 선정"""
+        global MONITORED_SYMBOLS, LAST_SYMBOL_UPDATE
+        
         try:
-            current_minute = datetime.now().minute
+            logger.log_system("=== 초기 종목 스캔 시작 (5개 전략 사용) ===")
             
-            # 스캔 시작 로그 추가
-            logger.log_system("종목 스캔 시작 - 거래 가능 종목 조회")
+            # 전략들이 준비될 때까지 잠시 대기
+            logger.log_system("전략 초기화 대기 중...")
+            await asyncio.sleep(3)
             
-            # 홀수 분에는 코스피, 짝수 분에는 코스닥에서 종목 가져오기
-            if current_minute % 2 == 0:
-                market_type = "KOSDAQ"
-            else:
-                market_type = "KOSPI"
+            # 1. 5개 전략으로 종목 분석
+            top_symbols = await self._analyze_symbols_with_strategies()
+            
+            if not top_symbols:
+                logger.log_warning("초기 종목 스캔 결과가 없습니다. 대안으로 거래량 상위 종목 사용")
+                # 대안: 거래량 상위 100개 종목 사용
+                top_symbols = await stock_explorer.get_tradable_symbols(market_type="ALL")
+                top_symbols = top_symbols[:100]
                 
-            logger.log_system(f"Searching tradable symbols from {market_type}")
+                # 거래량 상위 종목도 없는 경우
+                if not top_symbols:
+                    logger.log_error("거래량 상위 종목도 찾을 수 없습니다.")
+                    return
+            
+            # 2. 전역 변수에 저장
+            MONITORED_SYMBOLS = top_symbols[:100]  # 상위 100개만
+            LAST_SYMBOL_UPDATE = datetime.now()
+            
+            logger.log_system(f"초기 종목 스캔 완료: {len(MONITORED_SYMBOLS)}개 종목 선정")
+            logger.log_system(f"상위 10개 종목: {', '.join(MONITORED_SYMBOLS[:10])}")
+            
+            # 3. 통합 전략에 종목 업데이트 (50개만 사용)
+            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:50])
+            
+            # 4. 전략 시작 (이미 시작된 경우 무시됨)
+            if not combined_strategy.running:
+                await combined_strategy.start(MONITORED_SYMBOLS[:50])
+                logger.log_system("통합 전략 시작 완료")
+            else:
+                logger.log_system("통합 전략이 이미 실행 중입니다")
+            
+            # 5. 스캔 결과 로그
             logger.log_trade(
-                action="SYMBOL_SEARCH_START",
+                action="INITIAL_SCAN_COMPLETE",
                 symbol="SYSTEM",
                 price=0,
-                quantity=0,
-                reason=f"종목 검색 시작 - {market_type}",
-                market_type=market_type,
-                time=datetime.now().strftime("%H:%M:%S")
+                quantity=len(MONITORED_SYMBOLS),
+                reason=f"초기 종목 스캔 완료",
+                top_symbols=", ".join(MONITORED_SYMBOLS[:10]),
+                time=datetime.now().strftime("%H:%M:%S"),
+                status="SUCCESS"
             )
             
-            # 지정된 시장에서 종목 가져오기 (최대 3회 재시도)
-            symbols = []
-            retry_count = 0
-            max_retries = 3
-            
-            while not symbols and retry_count < max_retries:
-                retry_count += 1
-                try:
-                    symbols = await stock_explorer.get_tradable_symbols(market_type=market_type)
-                    if symbols:
-                        logger.log_system(f"{market_type}에서 {len(symbols)}개 종목을 찾았습니다.")
-                        break
-                    else:
-                        logger.log_system(f"{market_type}에서 종목을 찾지 못했습니다. 재시도... ({retry_count}/{max_retries})")
-                except Exception as e:
-                    logger.log_error(e, f"종목 검색 오류 발생. 재시도... ({retry_count}/{max_retries})")
+        except Exception as e:
+            logger.log_error(e, "초기 종목 스캔 중 오류 발생")
+            # 오류 발생 시 기본 거래량 상위 종목 사용
+            try:
+                MONITORED_SYMBOLS = await stock_explorer.get_tradable_symbols(market_type="ALL")
+                MONITORED_SYMBOLS = MONITORED_SYMBOLS[:100] if MONITORED_SYMBOLS else []
+                LAST_SYMBOL_UPDATE = datetime.now()
                 
-                if retry_count < max_retries:
-                    await asyncio.sleep(2)  # 재시도 전 2초 대기
+                if MONITORED_SYMBOLS:
+                    logger.log_system(f"대안으로 거래량 상위 {len(MONITORED_SYMBOLS)}개 종목 사용")
+                else:
+                    logger.log_error("대안 종목도 찾을 수 없습니다")
+            except Exception as fallback_error:
+                logger.log_error(fallback_error, "대안 종목 탐색 중 오류 발생")
+                MONITORED_SYMBOLS = []
+                LAST_SYMBOL_UPDATE = datetime.now()
+    
+    async def _analyze_symbols_with_strategies(self) -> List[str]:
+        """5개 전략을 사용하여 종목 분석 및 점수 계산"""
+        try:
+            # 1. 거래 가능한 모든 종목 가져오기
+            all_symbols = await stock_explorer.get_tradable_symbols(market_type="ALL")
             
-            # 종목이 충분히 많지 않으면 다른 시장에서도 가져오기
-            if len(symbols) < 20:
-                other_market = "KOSPI" if market_type == "KOSDAQ" else "KOSDAQ"
-                logger.log_system(f"Not enough symbols ({len(symbols)}), adding from {other_market}")
-                logger.log_trade(
-                    action="SYMBOL_SEARCH_EXTEND",
-                    symbol="SYSTEM",
-                    price=0,
-                    quantity=len(symbols),
-                    reason=f"종목수 부족({len(symbols)}개), {other_market}에서 추가 검색",
-                    current_market=market_type,
-                    additional_market=other_market
-                )
+            if not all_symbols:
+                logger.log_warning("거래 가능한 종목이 없습니다")
+                return []
+            
+            logger.log_system(f"분석 대상 종목 수: {len(all_symbols)}개")
+            
+            # 2. 각 종목에 대해 5개 전략으로 신호 계산
+            symbol_scores = {}
+            
+            # 각 전략 준비
+            strategies = {
+                'breakout': combined_strategy.strategies.get('breakout'),
+                'momentum': combined_strategy.strategies.get('momentum'),
+                'gap': combined_strategy.strategies.get('gap'),
+                'vwap': combined_strategy.strategies.get('vwap'),
+                'volume': combined_strategy.strategies.get('volume')
+            }
+            
+            # 전략 유효성 확인
+            valid_strategies = {}
+            for name, strategy in strategies.items():
+                if strategy and hasattr(strategy, 'get_signal'):
+                    valid_strategies[name] = strategy
+                    logger.log_system(f"전략 확인: {name} - OK")
+                else:
+                    logger.log_warning(f"전략 확인: {name} - 사용 불가")
+            
+            if not valid_strategies:
+                logger.log_warning("사용 가능한 전략이 없습니다")
+                return []
+            
+            # 분석 시간 고려하여 상위 200개만 분석
+            analysis_symbols = all_symbols[:200]
+            
+            for idx, symbol in enumerate(analysis_symbols):
                 try:
-                    additional_symbols = await stock_explorer.get_tradable_symbols(market_type=other_market)
-                    if additional_symbols:
-                        logger.log_system(f"{other_market}에서 추가로 {len(additional_symbols)}개 종목을 찾았습니다.")
-                        symbols = list(set(symbols + additional_symbols))  # 중복 제거
+                    # 진행률 로깅 (20개마다)
+                    if idx % 20 == 0:
+                        logger.log_system(f"종목 분석 진행률: {idx}/{len(analysis_symbols)}")
+                    
+                    total_score = 0
+                    buy_votes = 0
+                    strategy_signals = {}
+                    
+                    # 각 전략에서 신호 가져오기
+                    for strategy_name, strategy in valid_strategies.items():
+                        try:
+                            # 타임아웃 설정 (2초)
+                            signal_task = asyncio.create_task(strategy.get_signal(symbol))
+                            signal = await asyncio.wait_for(signal_task, timeout=2.0)
+                            
+                            if signal and isinstance(signal, dict):
+                                # 신호 저장
+                                strategy_signals[strategy_name] = signal
+                                
+                                # 신호 강도 누적
+                                signal_value = float(signal.get('signal', 0))
+                                total_score += signal_value
+                                
+                                # BUY 신호인 경우 투표
+                                if signal.get('direction') == 'BUY':
+                                    buy_votes += 1
+                                
+                                logger.log_system(f"{symbol} - {strategy_name}: signal={signal_value:.1f}, direction={signal.get('direction')}")
+                            else:
+                                logger.log_system(f"{symbol} - {strategy_name}: 신호 없음")
+                                
+                        except asyncio.TimeoutError:
+                            logger.log_warning(f"{symbol} - {strategy_name} 전략 타임아웃")
+                        except Exception as strategy_error:
+                            logger.log_error(strategy_error, f"{symbol} - {strategy_name} 전략 오류")
+                    
+                    # 종합 점수 저장 (BUY 투표 수와 신호 강도 모두 고려)
+                    if buy_votes >= 2:  # 최소 2개 전략이 BUY 신호
+                        symbol_scores[symbol] = {
+                            'total_score': total_score,
+                            'buy_votes': buy_votes,
+                            'signals': strategy_signals
+                        }
+                        logger.log_system(f"{symbol} - 종합: BUY={buy_votes}, 점수={total_score:.1f}")
+                    
                 except Exception as e:
-                    logger.log_error(e, f"{other_market}에서 추가 종목 검색 중 오류 발생")
+                    logger.log_error(e, f"종목 {symbol} 분석 중 오류")
+                    continue
             
-            # 결과 로그 추가
-            if symbols:
-                logger.log_system(f"종목 스캔 완료: 총 {len(symbols)}개 거래 가능 종목 발견")
-                logger.log_trade(
-                    action="SYMBOL_SEARCH_RESULT",
-                    symbol="SYSTEM",
-                    price=0,
-                    quantity=len(symbols),
-                    reason=f"거래 가능 종목 스캔 완료",
-                    markets=f"{market_type}+{other_market if len(symbols) < 20 else ''}",
-                    top_symbols=", ".join(symbols[:5]) if symbols else "",
-                    time=datetime.now().strftime("%H:%M:%S")
-                )
-            else:
-                logger.log_system("거래 가능 종목을 찾지 못했습니다.")
-                logger.log_trade(
-                    action="SYMBOL_SEARCH_FAILED",
-                    symbol="SYSTEM",
-                    price=0,
-                    quantity=0,
-                    reason="거래 가능 종목 없음",
-                    time=datetime.now().strftime("%H:%M:%S")
-                )
+            # 3. 점수 기준으로 정렬 (buy_votes 우선, total_score 차선)
+            sorted_symbols = sorted(
+                symbol_scores.items(),
+                key=lambda x: (x[1]['buy_votes'], x[1]['total_score']),
+                reverse=True
+            )
             
-            return symbols
+            # 4. 상위 100개 종목만 반환
+            top_symbols = [item[0] for item in sorted_symbols[:100]]
+            
+            logger.log_system(f"전략 분석 완료: {len(top_symbols)}개 종목 선정")
+            logger.log_system(f"상위 5개 종목 상세:")
+            for i, (symbol, score_data) in enumerate(sorted_symbols[:5]):
+                logger.log_system(f"{i+1}. {symbol}: BUY={score_data['buy_votes']}, 점수={score_data['total_score']:.1f}")
+            
+            return top_symbols
             
         except Exception as e:
-            logger.log_error(e, "Error in _get_tradable_symbols")
+            logger.log_error(e, "전략 기반 종목 분석 중 오류")
             return []
+    
+    def _should_rescan_symbols(self, current_time: datetime_time) -> bool:
+        """종목 재스캔이 필요한지 확인"""
+        global LAST_SYMBOL_UPDATE
+        
+        # 마지막 업데이트가 없으면 스캔 필요
+        if LAST_SYMBOL_UPDATE is None:
+            return True
+        
+        # 현재 시간이 8:30 ~ 8:40 사이이고, 오늘 아직 스캔하지 않았다면
+        if datetime_time(8, 30) <= current_time <= datetime_time(8, 40):
+            last_update_date = LAST_SYMBOL_UPDATE.date()
+            current_date = datetime.now().date()
+            
+            if last_update_date < current_date:
+                return True
+        
+        # 마지막 업데이트로부터 6시간 이상 경과했다면
+        if (datetime.now() - LAST_SYMBOL_UPDATE).total_seconds() > 6 * 60 * 60:
+            return True
+        
+        return False
+    
+    async def _rescan_symbols(self) -> None:
+        """종목 재스캔"""
+        global MONITORED_SYMBOLS, LAST_SYMBOL_UPDATE
+        
+        try:
+            logger.log_system("=== 종목 재스캔 시작 (장 시작 전 또는 정기 업데이트) ===")
+            
+            # 기존 전략 중지
+            await combined_strategy.stop()
+            
+            # 새로운 종목 분석
+            new_symbols = await self._analyze_symbols_with_strategies()
+            
+            if not new_symbols:
+                logger.log_warning("재스캔 결과가 없습니다. 기존 종목 유지")
+                return
+            
+            # 전역 변수 업데이트
+            old_symbols = MONITORED_SYMBOLS.copy()
+            MONITORED_SYMBOLS = new_symbols[:100]
+            LAST_SYMBOL_UPDATE = datetime.now()
+            
+            # 변경된 종목 로깅
+            added_symbols = set(MONITORED_SYMBOLS) - set(old_symbols)
+            removed_symbols = set(old_symbols) - set(MONITORED_SYMBOLS)
+            
+            logger.log_system(f"종목 재스캔 완료: {len(MONITORED_SYMBOLS)}개 종목")
+            logger.log_system(f"추가된 종목: {len(added_symbols)}개")
+            logger.log_system(f"제거된 종목: {len(removed_symbols)}개")
+            
+            # 통합 전략 업데이트 및 재시작 (50개만 사용)
+            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:50])
+            await combined_strategy.start(MONITORED_SYMBOLS[:50])
+            
+            # 재스캔 결과 로그
+            logger.log_trade(
+                action="RESCAN_COMPLETE",
+                symbol="SYSTEM",
+                price=0,
+                quantity=len(MONITORED_SYMBOLS),
+                reason=f"종목 재스캔 완료",
+                added_count=len(added_symbols),
+                removed_count=len(removed_symbols),
+                time=datetime.now().strftime("%H:%M:%S"),
+                status="SUCCESS"
+            )
+            
+        except Exception as e:
+            logger.log_error(e, "종목 재스캔 중 오류 발생")
+            # 오류 발생 시 기존 종목으로 전략 재시작
+            await combined_strategy.start(MONITORED_SYMBOLS[:50])
     
     def _is_market_open(self, current_time: datetime_time) -> bool:
         """장 시간 확인"""
-    
-        # 실제 장 시간 체크
-        is_market_time = (
-            self.trading_config.market_open <= current_time <= 
-            self.trading_config.market_close
-        )
-        
-        logger.log_system(f"시장 시간 체크: {current_time}, 장 시간 여부: {is_market_time}")
-        return is_market_time
+        return (self.trading_config.market_open <= current_time <= 
+                self.trading_config.market_close)
     
     async def _handle_market_close(self):
         """장 마감 처리"""
@@ -523,20 +590,20 @@ class TradingBot:
             summary = await order_manager.get_daily_summary()
             
             # 성과 기록
-            db.save_performance(summary)
+            database_manager.save_performance(summary)
             
             # 일일 리포트 전송
             await alert_system.send_daily_report(summary)
             
             # 데이터베이스 백업
-            db.backup_database()
+            database_manager.backup_database()
             
             logger.log_system("Market closed. Daily process completed")
             
         except Exception as e:
             logger.log_error(e, "Market close handling error")
     
-    async def shutdown(self, error: str = None):
+    async def shutdown(self, error: Optional[str] = None) -> None:
         """종료"""
         logger.log_system(f"Shutdown called. Error: {error}")
         try:
@@ -552,7 +619,7 @@ class TradingBot:
             # 시스템 상태 업데이트 및 메시지 준비
             if error:
                 logger.log_system(f"Updating system status to ERROR: {error}")
-                db.update_system_status("ERROR", error)
+                database_manager.update_system_status("ERROR", error)
 
                 message_type = "오류 종료"
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -566,7 +633,7 @@ class TradingBot:
                 """
             else:
                 logger.log_system("Updating system status to STOPPED")
-                db.update_system_status("STOPPED")
+                database_manager.update_system_status("STOPPED")
 
                 message_type = "정상 종료"
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -621,10 +688,10 @@ def is_important_message(message: str) -> bool:
     ]
     return any(keyword in message for keyword in important_keywords)
 
-async def main(force_update=False):
+async def main(force_update: bool = False) -> int:
     """메인 함수"""
     # 초기 설정
-    bot = TradingBot()
+    bot: TradingBot = TradingBot()
     telegram_task = None
     heartbeat_task = None
     exit_code = 0
@@ -725,7 +792,7 @@ def _setup_watchdog_monitor(last_heartbeat, watchdog_interval):
     )
 
 
-async def _run_trading_bot(bot, force_update=False):
+async def _run_trading_bot(bot: TradingBot, force_update: bool = False):
     """메인 봇 실행"""
     # API 초기화 시도
     logger.log_system("Starting main bot execution...")
@@ -780,7 +847,7 @@ async def _send_api_failure_notification(error_message):
             logger.log_error(e, "API 접속 실패 알림 전송 실패")
 
 
-async def _graceful_shutdown(bot):
+async def _graceful_shutdown(bot: TradingBot):
     """정상 종료 처리"""
     if bot:
         await bot.shutdown()
@@ -788,7 +855,7 @@ async def _graceful_shutdown(bot):
         await asyncio.sleep(2)
 
 
-async def _emergency_shutdown(bot, error=None):
+async def _emergency_shutdown(bot: TradingBot, error: str = None):
     """오류 발생 시 종료 처리"""
     if bot:
         logger.log_system("Attempting shutdown due to unexpected error...")

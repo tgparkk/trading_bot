@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import re
+import threading
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from config.settings import config  # config 변수를 명시적으로 임포트
@@ -83,39 +84,38 @@ class TradingLogger:
     """트레이딩 전용 로가 (싱글톤 패턴)"""
     
     _instance = None
+    _lock = threading.Lock()
     
     def __new__(cls, *args, **kwargs):
         """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized_instance = False
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
-        # 이미 초기화된 경우 재초기화 방지
-        if getattr(self, '_initialized_instance', False):
-            return
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # 기본 설정값
+            self.log_dir = "logs"
+            self.log_level = "INFO"
+            self.log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            self.trade_log = "trade"
+            self.error_log = "error"
+            self.system_log = "system"
             
-        self._initialized = False
-        # 기본 설정값
-        self.log_dir = "logs"
-        self.log_level = "INFO"
-        self.log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        self.trade_log = "trade"
-        self.error_log = "error"
-        self.system_log = "system"
-        
-        # 기본 디렉토리와 로거 설정
-        self._setup_directories()
-        self._setup_loggers()
-        
-        # 싱글톤 초기화 완료 표시
-        self._initialized_instance = True
+            # 기본 디렉토리와 로거 설정
+            self._setup_directories()
+            self._setup_loggers()
+            
+            # 초기화 완료 표시
+            self._initialized = True
     
     def initialize_with_config(self):
         """설정 파일로부터 로거 초기화"""
         # 이미 초기화 되었으면 건너뜀
-        if hasattr(self, '_initialized') and self._initialized:
+        if hasattr(self, '_config_initialized') and self._config_initialized:
             return
             
         log_config = config["logging"]
@@ -205,7 +205,7 @@ class TradingLogger:
         root_logger.addHandler(console_handler)
         
         # 초기화 완료 표시
-        self._initialized = True
+        self._config_initialized = True
         
         # 로그 시작 메시지
         self.log_system(f"Logger initialized. Logs will be saved in: {self.today_log_dir}")
