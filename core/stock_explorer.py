@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import numpy as np
 from core.api_client import api_client
 from utils.logger import logger
-from utils.database import db
+from utils.database import database_manager
 from config.settings import config
 
 class StockExplorer:
@@ -173,7 +173,7 @@ class StockExplorer:
     
     def _log_search_success(self, total_symbols: int, filtered_symbols: int):
         """종목 탐색 성공 로그 저장"""
-        db.save_symbol_search_log(
+        database_manager.save_symbol_search_log(
             total_symbols=total_symbols,
             filtered_symbols=filtered_symbols,
             search_criteria={"method": "volume_ranking"},
@@ -182,7 +182,7 @@ class StockExplorer:
     
     def _log_search_failure(self, error_message: str):
         """종목 탐색 실패 로그 저장"""
-        db.save_symbol_search_log(
+        database_manager.save_symbol_search_log(
             total_symbols=0,
             filtered_symbols=0,
             search_criteria={"method": "volume_ranking"},

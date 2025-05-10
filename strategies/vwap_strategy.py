@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Deque
 from datetime import datetime, time, timedelta
 from collections import deque
 import numpy as np
+import threading
 
 from config.settings import config
 from core.api_client import api_client
@@ -17,31 +18,42 @@ from monitoring.alert_system import alert_system
 
 class VWAPStrategy:
     """VWAP 기반 전략 클래스"""
-    
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
-            "std_dev_multiplier": 2,        # 표준편차 승수 (밴드 폭)
-            "entry_threshold": 0.003,       # 진입 임계값 (0.3%)
-            "exit_threshold": 0.005,        # 이탈 임계값 (0.5%)
-            "stop_loss_pct": 0.01,          # 손절 비율 (1%)
-            "take_profit_pct": 0.02,        # 익절 비율 (2%)
-            "max_positions": 3,             # 최대 포지션 개수
-            "position_size": 1000000,       # 기본 포지션 크기 (100만원)
-            "reset_daily": True             # VWAP 일일 리셋 여부
-        }
-        
-        # 설정에 vwap_params가 있으면 업데이트
-        if hasattr(config["trading"], "vwap_params"):
-            self.params.update(config["trading"].vwap_params)
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
+                "std_dev_multiplier": 2,        # 표준편차 승수 (밴드 폭)
+                "entry_threshold": 0.003,       # 진입 임계값 (0.3%)
+                "exit_threshold": 0.005,        # 이탈 임계값 (0.5%)
+                "stop_loss_pct": 0.01,          # 손절 비율 (1%)
+                "take_profit_pct": 0.02,        # 익절 비율 (2%)
+                "max_positions": 3,             # 최대 포지션 개수
+                "position_size": 1000000,       # 기본 포지션 크기 (100만원)
+                "reset_daily": True             # VWAP 일일 리셋 여부
+            }
             
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.price_data = {}              # {symbol: deque of price data}
-        self.vwap_data = {}               # {symbol: {'vwap': float, 'upper_band': float, 'lower_band': float}}
-        self.positions = {}               # {position_id: position_data}
-        self.last_reset_day = datetime.now().date()
+            # 설정에 vwap_params가 있으면 업데이트
+            if hasattr(config["trading"], "vwap_params"):
+                self.params.update(config["trading"].vwap_params)
+            
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.price_data = {}              # {symbol: deque of price data}
+            self.vwap_data = {}               # {symbol: {'vwap': float, 'upper_band': float, 'lower_band': float}}
+            self.positions = {}               # {position_id: position_data}
+            self.last_reset_day = datetime.now().date()
+            self._initialized = True
         
     async def start(self, symbols: List[str]):
         """전략 시작"""

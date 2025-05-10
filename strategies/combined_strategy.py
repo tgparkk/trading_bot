@@ -9,6 +9,7 @@ from collections import deque
 import numpy as np
 import os
 import random
+import threading
 
 from config.settings import config
 from core.api_client import api_client
@@ -27,105 +28,116 @@ from strategies.volume_spike_strategy import volume_strategy
 
 class CombinedStrategy:
     """통합 트레이딩 전략 클래스"""
-    
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
-            # 각 전략별 가중치 (0~1 사이 값, 합계 1.0)
-            "breakout_weight": 0.2,     # 브레이크아웃 전략 가중치
-            "momentum_weight": 0.25,    # 모멘텀 전략 가중치
-            "gap_weight": 0.2,          # 갭 트레이딩 전략 가중치
-            "vwap_weight": 0.2,         # VWAP 전략 가중치
-            "volume_weight": 0.15,      # 볼륨 스파이크 전략 가중치
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
+                # 각 전략별 가중치 (0~1 사이 값, 합계 1.0)
+                "breakout_weight": 0.2,     # 브레이크아웃 전략 가중치
+                "momentum_weight": 0.25,    # 모멘텀 전략 가중치
+                "gap_weight": 0.2,          # 갭 트레이딩 전략 가중치
+                "vwap_weight": 0.2,         # VWAP 전략 가중치
+                "volume_weight": 0.15,      # 볼륨 스파이크 전략 가중치
+                
+                # 매매 신호 기준
+                "buy_threshold": 5.0,       # 매수 신호 임계값 (0~10) - 5.0으로 낮춤 (원래 6.0)
+                "sell_threshold": 6.0,      # 매도 신호 임계값 (0~10)
+                "min_agreement": 2,         # 최소 몇 개 전략이 일치해야 하는지
+                
+                # 포지션 관리
+                "stop_loss_pct": 0.015,     # 손절 비율 (1.5%)
+                "take_profit_pct": 0.025,   # 익절 비율 (2.5%)
+                "max_positions": 5,         # 최대 포지션 개수
+                "position_size": 1000000,   # 기본 포지션 크기 (100만원)
+                "trailing_stop": True,      # 트레일링 스탑 사용 여부
+                "trailing_pct": 0.005       # 트레일링 스탑 비율 (0.5%)
+            }
             
-            # 매매 신호 기준
-            "buy_threshold": 5.0,       # 매수 신호 임계값 (0~10) - 5.0으로 낮춤 (원래 6.0)
-            "sell_threshold": 6.0,      # 매도 신호 임계값 (0~10)
-            "min_agreement": 2,         # 최소 몇 개 전략이 일치해야 하는지
+            # 설정에 combined_params가 있으면 업데이트
+            if hasattr(config["trading"], "combined_params"):
+                self.params.update(config["trading"].combined_params)
             
-            # 포지션 관리
-            "stop_loss_pct": 0.015,     # 손절 비율 (1.5%)
-            "take_profit_pct": 0.025,   # 익절 비율 (2.5%)
-            "max_positions": 5,         # 최대 포지션 개수
-            "position_size": 1000000,   # 기본 포지션 크기 (100만원)
-            "trailing_stop": True,      # 트레일링 스탑 사용 여부
-            "trailing_pct": 0.005       # 트레일링 스탑 비율 (0.5%)
-        }
-        
-        # 설정에 combined_params가 있으면 업데이트
-        if hasattr(config["trading"], "combined_params"):
-            self.params.update(config["trading"].combined_params)
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.positions = {}             # {position_id: position_data}
+            self.signals = {}               # {symbol: {'score': float, 'direction': str, 'strategies': {}}}
+            self.price_data = {}            # {symbol: deque of price data}
             
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.positions = {}             # {position_id: position_data}
-        self.signals = {}               # {symbol: {'score': float, 'direction': str, 'strategies': {}}}
-        self.price_data = {}            # {symbol: deque of price data}
-        
-        # 전략 객체 초기화 - 명시적 모듈 로드 및 에러 처리 개선
-        self.strategies = {}
-        
-        # 전략 모듈 로드 및 초기화
-        try:
-            # breakout 전략 로드
-            from strategies.breakout_strategy import breakout_strategy
-            self.strategies['breakout'] = breakout_strategy
-            logger.log_system("브레이크아웃 전략 로드 성공")
-        except ImportError as e:
-            logger.log_error(e, "브레이크아웃 전략 로드 실패")
-            self.strategies['breakout'] = None
-        
-        try:
-            # momentum 전략 로드
-            from strategies.momentum_strategy import momentum_strategy
-            self.strategies['momentum'] = momentum_strategy
-            logger.log_system("모멘텀 전략 로드 성공")
-        except ImportError as e:
-            logger.log_error(e, "모멘텀 전략 로드 실패")
-            self.strategies['momentum'] = None
-        
-        try:
-            # gap 전략 로드
-            from strategies.gap_strategy import gap_strategy
-            self.strategies['gap'] = gap_strategy
-            logger.log_system("갭 전략 로드 성공")
-        except ImportError as e:
-            logger.log_error(e, "갭 전략 로드 실패")
-            self.strategies['gap'] = None
-        
-        try:
-            # vwap 전략 로드
-            from strategies.vwap_strategy import vwap_strategy
-            self.strategies['vwap'] = vwap_strategy
-            logger.log_system("VWAP 전략 로드 성공")
-        except ImportError as e:
-            logger.log_error(e, "VWAP 전략 로드 실패")
-            self.strategies['vwap'] = None
-        
-        try:
-            # volume 전략 로드
-            from strategies.volume_spike_strategy import volume_strategy
-            self.strategies['volume'] = volume_strategy
-            logger.log_system("볼륨 전략 로드 성공")
-        except ImportError as e:
-            logger.log_error(e, "볼륨 전략 로드 실패")
-            self.strategies['volume'] = None
-        
-        # 전략 객체 유효성 확인
-        valid_strategies = 0
-        for strategy_name, strategy in self.strategies.items():
-            if strategy is None:
-                logger.log_error(f"{strategy_name} 전략 객체가 None입니다. 초기화에 실패했을 수 있습니다.")
-            elif not hasattr(strategy, "get_signal"):
-                logger.log_error(f"{strategy_name} 전략에 get_signal 메서드가 없습니다.")
-            else:
-                valid_strategies += 1
-        
-        logger.log_system(f"전략 초기화 상태: 총 {len(self.strategies)}개 중 {valid_strategies}개 유효")
-        
-        # 가중치 정규화
-        self._normalize_weights()
+            # 전략 객체 초기화 - 명시적 모듈 로드 및 에러 처리 개선
+            self.strategies = {}
+            
+            # 전략 모듈 로드 및 초기화
+            try:
+                # breakout 전략 로드
+                from strategies.breakout_strategy import breakout_strategy
+                self.strategies['breakout'] = breakout_strategy
+                logger.log_system("브레이크아웃 전략 로드 성공")
+            except ImportError as e:
+                logger.log_error(e, "브레이크아웃 전략 로드 실패")
+                self.strategies['breakout'] = None
+            
+            try:
+                # momentum 전략 로드
+                from strategies.momentum_strategy import momentum_strategy
+                self.strategies['momentum'] = momentum_strategy
+                logger.log_system("모멘텀 전략 로드 성공")
+            except ImportError as e:
+                logger.log_error(e, "모멘텀 전략 로드 실패")
+                self.strategies['momentum'] = None
+            
+            try:
+                # gap 전략 로드
+                from strategies.gap_strategy import gap_strategy
+                self.strategies['gap'] = gap_strategy
+                logger.log_system("갭 전략 로드 성공")
+            except ImportError as e:
+                logger.log_error(e, "갭 전략 로드 실패")
+                self.strategies['gap'] = None
+            
+            try:
+                # vwap 전략 로드
+                from strategies.vwap_strategy import vwap_strategy
+                self.strategies['vwap'] = vwap_strategy
+                logger.log_system("VWAP 전략 로드 성공")
+            except ImportError as e:
+                logger.log_error(e, "VWAP 전략 로드 실패")
+                self.strategies['vwap'] = None
+            
+            try:
+                # volume 전략 로드
+                from strategies.volume_spike_strategy import volume_strategy
+                self.strategies['volume'] = volume_strategy
+                logger.log_system("볼륨 전략 로드 성공")
+            except ImportError as e:
+                logger.log_error(e, "볼륨 전략 로드 실패")
+                self.strategies['volume'] = None
+            
+            # 전략 객체 유효성 확인
+            valid_strategies = 0
+            for strategy_name, strategy in self.strategies.items():
+                if strategy is None:
+                    logger.log_error(f"{strategy_name} 전략 객체가 None입니다. 초기화에 실패했을 수 있습니다.")
+                elif not hasattr(strategy, "get_signal"):
+                    logger.log_error(f"{strategy_name} 전략에 get_signal 메서드가 없습니다.")
+                else:
+                    valid_strategies += 1
+            
+            logger.log_system(f"전략 초기화 상태: 총 {len(self.strategies)}개 중 {valid_strategies}개 유효")
+            
+            # 가중치 정규화
+            self._normalize_weights()
+            self._initialized = True
         
     def _normalize_weights(self):
         """가중치 합이 1이 되도록 정규화"""

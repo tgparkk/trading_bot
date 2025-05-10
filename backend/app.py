@@ -7,7 +7,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS  # CORS 추가
-from utils.database import db
+from utils.database import database_manager
 from core.api_client import api_client
 from core.order_manager import order_manager
 from core.stock_explorer import stock_explorer
@@ -71,19 +71,19 @@ def home():
 
 @app.route('/api/status')
 def api_status():
-    return jsonify(db.get_latest_system_status())
+    return jsonify(database_manager.get_latest_system_status())
 
 @app.route('/api/trades')
 def api_trades():
-    return jsonify(db.get_trades()[:50])
+    return jsonify(database_manager.get_trades()[:50])
 
 @app.route('/api/token_logs')
 def api_token_logs():
-    return jsonify(db.get_token_logs()[:50])
+    return jsonify(database_manager.get_token_logs()[:50])
 
 @app.route('/api/symbol_search_logs')
 def api_symbol_search_logs():
-    return jsonify(db.get_symbol_search_logs()[:50])
+    return jsonify(database_manager.get_symbol_search_logs()[:50])
 
 @app.route('/api/account')
 def api_account():
@@ -204,7 +204,7 @@ def api_account():
 def api_positions():
     # 보유 종목 리스트 반환
     try:
-        positions = db.get_all_positions()
+        positions = database_manager.get_all_positions()
         return jsonify(positions)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -214,7 +214,7 @@ def api_candidates():
     # 매수 후보 리스트 반환 (최근 탐색 결과)
     try:
         # 최근 symbol_search_logs에서 마지막 성공 결과의 filtered_symbols
-        logs = db.get_symbol_search_logs()
+        logs = database_manager.get_symbol_search_logs()
         for log in logs:
             if log['status'] == 'SUCCESS' and log['filtered_symbols']:
                 # filtered_symbols는 심볼 리스트가 아니라 개수이므로, 실제 후보는 따로 관리 필요

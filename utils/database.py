@@ -3,6 +3,7 @@
 """
 import sqlite3
 import json
+import threading
 from datetime import datetime, timedelta
 import pytz
 from typing import Dict, List, Any, Optional
@@ -13,22 +14,28 @@ from utils.logger import logger
 # 한국 시간대 설정
 KST = pytz.timezone('Asia/Seoul')
 
-class Database:
+class DatabaseManager:
     """트레이딩 데이터베이스 (리팩토링: 쿼리 헬퍼 및 CRUD 간소화)"""
     
     _instance = None
+    _lock = threading.Lock()
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialize()
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
         return cls._instance
     
-    def _initialize(self, _force_initialize=False):
-        db_cfg = config.get("database", DatabaseConfig())
-        self.db_path = db_cfg.db_path
-        self.backup_interval = db_cfg.backup_interval
-        self._initialize_db(_force_initialize)
+    def __init__(self):
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            db_cfg = config.get("database", DatabaseConfig())
+            self.db_path = db_cfg.db_path
+            self.backup_interval = db_cfg.backup_interval
+            self._initialize_db()
+            self._initialized = True
     
     @contextmanager
     def get_connection(self, max_retries=3, retry_delay=0.5):
@@ -636,4 +643,4 @@ class Database:
             return None
 
 # 싱글톤 인스턴스 생성
-db = Database()
+database_manager = DatabaseManager()

@@ -3,6 +3,7 @@
 장 시작 후 30분간의 가격 범위를 기준으로 돌파 시 매매하는 전략
 """
 import asyncio
+import threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime, time, timedelta
 from collections import deque
@@ -18,9 +19,22 @@ from monitoring.alert_system import alert_system
 class BreakoutStrategy:
     """브레이크아웃 전략 클래스"""
     
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+    
     def __init__(self):
-        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-        self.params = {
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+            self.params = {
             "k_value": 0.4,             # 돌파 레벨 계산 시 사용할 K값 (0.3~0.5)
             "stop_loss_pct": 0.5,       # 손절 비율 (시작 범위의 50%)
             "take_profit_pct": 1.5,     # 익절 비율 (시작 범위의 150%)
@@ -28,17 +42,18 @@ class BreakoutStrategy:
             "position_size": 1000000    # 기본 포지션 크기 (100만원)
         }
         
-        # 설정에 breakout_params가 있으면 업데이트
-        if hasattr(config["trading"], "breakout_params"):
-            self.params.update(config["trading"].breakout_params)
-            
-        self.running = False
-        self.paused = False
-        self.watched_symbols = set()
-        self.price_data = {}          # {symbol: deque of price data}
-        self.breakout_levels = {}     # {symbol: {'high_level': float, 'low_level': float, 'range': float}}
-        self.positions = {}           # {position_id: position_data}
-        self.initialization_complete = {} # {symbol: bool} - 초기화 완료 여부
+            # 설정에 breakout_params가 있으면 업데이트
+            if hasattr(config["trading"], "breakout_params"):
+                self.params.update(config["trading"].breakout_params)
+                
+            self.running = False
+            self.paused = False
+            self.watched_symbols = set()
+            self.price_data = {}          # {symbol: deque of price data}
+            self.breakout_levels = {}     # {symbol: {'high_level': float, 'low_level': float, 'range': float}}
+            self.positions = {}           # {position_id: position_data}
+            self.initialization_complete = {} # {symbol: bool} - 초기화 완료 여부
+            self._initialized = True
         
     async def start(self, symbols: List[str]):
         """전략 시작"""

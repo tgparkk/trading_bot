@@ -34,6 +34,7 @@ class TradingConfig:
     scalping_params: Dict[str, Any] = None
     filters: Dict[str, Any] = None
     risk_params: Dict[str, Any] = None
+    max_websocket_retries: int = 3  # 웹소켓 재시도 횟수
 
     def __post_init__(self):
         if self.scalping_params is None:
@@ -79,7 +80,7 @@ class LoggingConfig:
 @dataclass
 class DatabaseConfig:
     """DB 설정"""
-    db_path: str = "trading_bot.db"
+    db_path: str = "trading_bot.database_manager"
     backup_interval: int = 3600
 
 class AlertConfig:

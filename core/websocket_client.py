@@ -5,6 +5,7 @@ import json
 import asyncio
 import websockets
 import os
+import threading
 from typing import Dict, Any, Callable, List, Optional
 from datetime import datetime
 from config.settings import config, APIConfig
@@ -13,83 +14,136 @@ from utils.logger import logger
 class KISWebSocketClient:
     """한국투자증권 웹소켓 클라이언트"""
     
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
+        with cls._lock:  # 스레드 안전성을 위한 락 사용
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+    
     def __init__(self):
-        self.config = config.get("api", APIConfig.from_env())
-        self.ws_url = self.config.ws_url
-        self.app_key = self.config.app_key
-        self.app_secret = self.config.app_secret
-        self.ws = None
-        self.running = False
-        self.subscriptions = {}
-        self.callbacks = {}
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10  # 최대 재시도 횟수 증가
-        self.reconnect_delay = 10  # 초기 재연결 대기 시간 증가 (10초)
-        self.auth_successful = False  # 인증 성공 여부 추적
-        self.connection_lock = asyncio.Lock()  # 연결 동시성 제어
-        self.subscription_semaphore = asyncio.Semaphore(2)  # 최대 2개 동시 구독 요청
-        self.last_connection_attempt = 0  # 마지막 연결 시도 시간
-        
-        # SKIP_WEBSOCKET 환경 변수 확인 (모든 공백 제거)
-        skip_websocket_env = os.environ.get('SKIP_WEBSOCKET', '')
-        self.skip_websocket = skip_websocket_env.strip().lower() in ('true', 't', '1', 'yes', 'y')
-        
-        # 환경 변수 확인 로그 강화
-        logger.log_system(f"⚠️ SKIP_WEBSOCKET 환경 변수 상태: '{skip_websocket_env}', 적용 여부(strip 후): {self.skip_websocket}")
-        
-        if self.skip_websocket:
-            logger.log_system("⚠️ SKIP_WEBSOCKET=True 환경 변수가 설정되어 있습니다. 웹소켓 연결을 건너뜁니다.")
-        else:
-            logger.log_system("⚠️ SKIP_WEBSOCKET 환경 변수가 False 또는 설정되지 않아 웹소켓 연결을 시도합니다.")
-        
-    async def connect(self):
-        """웹소켓 연결"""
-        # SKIP_WEBSOCKET이 True면 연결하지 않음
-        if self.skip_websocket:
-            logger.log_system("SKIP_WEBSOCKET=True 설정으로 웹소켓 연결을 건너뜁니다.")
-            return False
+        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
+        if not hasattr(self, '_initialized') or not self._initialized:
+            self.config = config.get("api", APIConfig.from_env())
+            self.ws_url = self.config.ws_url
+            self.app_key = self.config.app_key
+            self.app_secret = self.config.app_secret
+            self.ws = None
+            self.running = False
+            self.subscriptions = {}
+            self.callbacks = {}
+            self.reconnect_attempts = 0
+            self.max_reconnect_attempts = 10  # 최대 재시도 횟수 증가
+            self.reconnect_delay = 10  # 초기 재연결 대기 시간 증가 (10초)
+            self.auth_successful = False  # 인증 성공 여부 추적
+            self.connection_lock = asyncio.Lock()  # 연결 동시성 제어
+            self.subscription_semaphore = asyncio.Semaphore(5)  # 동시 구독 요청을 5개로 제한 (throttling)
+            self.last_connection_attempt = 0  # 마지막 연결 시도 시간
             
+            # 웹소켓 접속키 캐싱 (1년 유효)
+            self.approval_key = None
+            self.approval_key_expire_time = None
+            
+            # 구독 제한 관련 설정
+            self.max_subscriptions = 100  # 최대 구독 가능 종목 수
+            self.subscription_delay = 0.1  # 구독 요청 간 지연 시간 (초)
+            
+            self._initialized = True
+        
+    async def connect(self) -> bool:
+        """웹소켓 연결
+        
+        Returns:
+            bool: 연결 성공 여부
+        """
         # 연결 동시성 제어 - 하나의 연결 시도만 허용
         async with self.connection_lock:
             # 이미 접속 중이거나 최근 5초 이내에 시도한 경우 스킵
             current_time = datetime.now().timestamp()
-            if self.is_connected() or (current_time - self.last_connection_attempt < 5):
-                return
+            if self.is_connected():
+                logger.log_system("웹소켓이 이미 연결되어 있습니다.")
+                return True
+                
+            if (current_time - self.last_connection_attempt < 5):
+                logger.log_system("최근 연결 시도가 있었습니다. 5초 후 다시 시도해주세요.")
+                return False
                 
             self.last_connection_attempt = current_time
             
             try:
-                # 연결할 때 ping_interval과 ping_timeout 설정 추가
-                self.ws = await websockets.connect(
-                    self.ws_url,
-                    ping_interval=30,  # 30초마다 ping 전송
-                    ping_timeout=10,   # ping 응답 10초 대기
-                    close_timeout=5    # 종료 시 5초 대기
-                )
+                logger.log_system(f"웹소켓 연결 시도: {self.ws_url}")
+                
+                # 기존 연결이 있다면 정리
+                if self.ws:
+                    await self.close()
+                
+                # 웹소켓 연결 옵션 설정
+                connection_options = {
+                    "ping_interval": 30,    # 30초마다 ping 전송
+                    "ping_timeout": 10,     # ping 응답 10초 대기
+                    "close_timeout": 5,     # 종료 시 5초 대기
+                    "max_size": 1024 * 1024 * 10,  # 최대 메시지 크기 10MB
+                    "max_queue": 32         # 최대 대기열 크기
+                }
+                
+                # 연결 시도
+                try:
+                    self.ws = await asyncio.wait_for(
+                        websockets.connect(self.ws_url, **connection_options),
+                        timeout=10.0  # 연결 타임아웃 10초
+                    )
+                except asyncio.TimeoutError:
+                    logger.log_error(Exception("WebSocket connection timeout"), "웹소켓 연결 타임아웃 (10초)")
+                    self.ws = None
+                    return False
+                
                 self.running = True
                 self.reconnect_attempts = 0
-                logger.log_system("WebSocket connected successfully")
+                logger.log_system("웹소켓 연결 성공")
                 
                 # 인증
                 auth_success = await self._authenticate()
                 if not auth_success:
-                    logger.log_system("WebSocket authentication failed, closing connection")
+                    logger.log_error(Exception("WebSocket authentication failed"), "웹소켓 인증 실패")
                     await self.close()
-                    return
+                    return False
+                
+                logger.log_system("웹소켓 인증 성공")
                 
                 # 메시지 수신 루프 시작
-                asyncio.create_task(self._receive_messages())
+                self._receive_task = asyncio.create_task(self._receive_messages())
+                
+                # 핸핑 태스크 시작
+                self._ping_task = asyncio.create_task(self._ping_loop())
+                
+                logger.log_system("웹소켓 연결 및 태스크 시작 완료")
+                return True
                 
             except Exception as e:
-                logger.log_error(e, "WebSocket connection failed")
-                await self._handle_reconnect()
+                self.ws = None
+                self.running = False
+                self.auth_successful = False
+                logger.log_error(e, f"웹소켓 연결 실패: {type(e).__name__}")
+                
+                # 재연결 처리
+                if self.reconnect_attempts < self.max_reconnect_attempts:
+                    await self._handle_reconnect()
+                
+                return False
     
     async def _authenticate(self):
         """웹소켓 인증"""
         try:
+            # 접속키 획득 (1년 유효)
+            approval_key = await self._get_approval_key()
+            
             auth_data = {
                 "header": {
-                    "approval_key": await self._get_approval_key(),
+                    "approval_key": approval_key,
                     "custtype": "P",  # 개인
                     "tr_type": "1",  # 등록
                     "content-type": "utf-8"
@@ -126,8 +180,23 @@ class KISWebSocketClient:
             return False
     
     async def _get_approval_key(self) -> str:
-        """웹소켓 접속키 발급"""
+        """웹소켓 접속키 발급 (1년 유효)"""
         import aiohttp
+        
+        # 현재 시간
+        current_time = datetime.now().timestamp()
+        
+        # 기존 접속키가 유효한지 확인 (1개월 이상 남아있으면 재사용)
+        if self.approval_key and self.approval_key_expire_time:
+            remaining_days = (self.approval_key_expire_time - current_time) / (24 * 60 * 60)
+            if remaining_days > 30:  # 1개월 이상 남아있으면 재사용
+                logger.log_system(f"웹소켓 접속키 재사용 (만료까지 {remaining_days:.0f}일 남음)")
+                return self.approval_key
+            else:
+                logger.log_system(f"웹소켓 접속키 만료 임박 ({remaining_days:.0f}일 남음), 새로 발급")
+        
+        # 새 접속키 발급
+        logger.log_system("웹소켓 접속키 발급 시작...")
         
         url = f"{self.config.base_url}/oauth2/Approval"
         headers = {"content-type": "application/json"}
@@ -145,7 +214,12 @@ class KISWebSocketClient:
                 async with session.post(url, json=body, headers=headers) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return data["approval_key"]
+                        self.approval_key = data["approval_key"]
+                        # 접속키 만료 시간 설정 (1년)
+                        self.approval_key_expire_time = current_time + (365 * 24 * 60 * 60)
+                        
+                        logger.log_system(f"웹소켓 접속키 발급 성공 (1년간 유효)")
+                        return self.approval_key
                     else:
                         error_text = await response.text()
                         logger.log_system(f"Failed to get approval key: {response.status}, {error_text}")
@@ -158,51 +232,45 @@ class KISWebSocketClient:
             raise
     
     async def subscribe_price(self, symbol: str, callback: Callable = None) -> bool:
-        """실시간 가격 구독"""
-        # 매번 환경 변수를 새로 확인 (스크립트 실행 중 변경 가능성 고려)
-        skip_websocket_env = os.environ.get('SKIP_WEBSOCKET', '')
-        skip_websocket_val = skip_websocket_env.strip().lower() in ('true', 't', '1', 'yes', 'y')
+        """실시간 가격 구독
         
-        # 환경 변수 확인 로그 (상세)
-        logger.log_system(f"🔍 {symbol} 구독 시도 - SKIP_WEBSOCKET 환경 변수 값: '{skip_websocket_env}'")
-        logger.log_system(f"🔍 SKIP_WEBSOCKET 환경 변수 길이: {len(skip_websocket_env)}, 공백제거 후 길이: {len(skip_websocket_env.strip())}")
-        logger.log_system(f"🔍 적용되는 SKIP_WEBSOCKET 값: {skip_websocket_val}")
-        
-        # 환경 변수와 객체 속성이 일치하는지 확인하고 필요시 업데이트
-        if skip_websocket_val != self.skip_websocket:
-            logger.log_system(f"⚠️ SKIP_WEBSOCKET 값 불일치 감지 - 환경 변수: {skip_websocket_val}, 인스턴스: {self.skip_websocket}. 업데이트합니다.")
-            self.skip_websocket = skip_websocket_val
+        Args:
+            symbol: 종목코드 (ex: "005930")
+            callback: 가격 업데이트 시 호출될 콜백 함수
             
-        # SKIP_WEBSOCKET이 True면 구독하지 않고 성공으로 처리
-        if self.skip_websocket:
-            logger.log_system(f"[OK] {symbol} - SKIP_WEBSOCKET=True 설정으로 웹소켓 구독을 건너뜁니다.")
-            # 콜백이 있으면 등록은 함
-            if callback:
-                callback_key = f"H0STCNT0|{symbol}"
-                self.callbacks[callback_key] = callback
-            # 구독 정보 추가
-            self.subscriptions[symbol] = {"type": "price", "callback": callback}
+        Returns:
+            bool: 구독 성공 여부
+        """
+        # 현재 구독 종목 수 확인
+        if len(self.subscriptions) >= self.max_subscriptions:
+            logger.log_warning(f"최대 구독 가능 종목 수({self.max_subscriptions})를 초과했습니다.")
+            return False
+            
+        # 이미 구독 중인지 확인
+        if symbol in self.subscriptions:
+            logger.log_system(f"{symbol} 종목은 이미 구독 중입니다.")
             return True
             
-        # SKIP_WEBSOCKET이 False인 경우 웹소켓 연결 시도
-        logger.log_system(f"🔌 {symbol} - 실제 웹소켓 구독을 시도합니다...")
-        
-        # 세마포어를 사용해 최대 동시 구독 요청 제한
+        # 세마포어를 사용해 동시 구독 요청 제한
         async with self.subscription_semaphore:
             try:
                 # 연결 상태 확인
                 if not self.is_connected():
                     logger.log_system(f"웹소켓 연결이 없습니다. {symbol} 구독 전 연결 시도... (시도 1/3)")
                     for i in range(3):  # 최대 3회 시도
-                        await self.connect()
-                        if self.is_connected():
+                        if await self.connect():
                             break
                         if i < 2:  # 마지막 시도가 아니면
                             logger.log_system(f"웹소켓 연결이 없습니다. {symbol} 구독 전 연결 시도... (시도 {i+2}/3)")
                             await asyncio.sleep(3)  # 3초 대기 후 재시도
                     
                     if not self.is_connected():
-                        raise Exception("WebSocket connection failed after 3 attempts")
+                        logger.log_error(Exception("WebSocket connection failed"), 
+                                       f"{symbol} 구독을 위한 웹소켓 연결 실패")
+                        return False
+                
+                # 구독 간 지연 시간 (서버 부하 방지)
+                await asyncio.sleep(self.subscription_delay)
                 
                 # 구독 데이터 구성
                 subscribe_data = {
@@ -214,6 +282,7 @@ class KISWebSocketClient:
                 
                 # 구독 요청 전송
                 await self.ws.send(json.dumps(subscribe_data))
+                logger.log_system(f"{symbol} 종목 실시간 가격 구독 요청")
                 
                 # 콜백 등록
                 if callback:
@@ -221,107 +290,29 @@ class KISWebSocketClient:
                     self.callbacks[callback_key] = callback
                 
                 # 구독 정보 추가
-                self.subscriptions[symbol] = {"type": "price", "callback": callback}
-                
-                return True
-                
-            except Exception as e:
-                logger.log_error(e, f"[Failed to subscribe price for {symbol}]")
-                return False
-    
-    async def subscribe_orderbook(self, symbol: str, callback: Callable):
-        """실시간 호가 구독"""
-        # 구독 동시성 제어
-        async with self.subscription_semaphore:
-            # 웹소켓 연결 확인 및 연결 시도
-            retry_count = 0
-            max_retries = 3
-            
-            while not self.is_connected() and retry_count < max_retries:
-                retry_count += 1
-                logger.log_system(f"웹소켓 연결이 없습니다. {symbol} 호가 구독 전 연결 시도... (시도 {retry_count}/{max_retries})")
-                await self.connect()
-                
-                # 연결 시도 후 잠시 대기
-                await asyncio.sleep(3)
-            
-            # 연결 후에도 웹소켓이 None이면 오류 로그 남기고 종료
-            if not self.is_connected():
-                logger.log_error(Exception(f"WebSocket connection failed after {max_retries} attempts"), 
-                                f"Failed to subscribe orderbook for {symbol}")
-                return False
-            
-            # 인증 확인
-            if not self.auth_successful:
-                logger.log_system(f"WebSocket not authenticated, attempting re-authentication for {symbol} orderbook")
-                auth_success = await self._authenticate()
-                if not auth_success:
-                    logger.log_system(f"Re-authentication failed, cannot subscribe to {symbol} orderbook")
-                    return False
-                
-                # 인증 후 추가 대기
-                await asyncio.sleep(1)
-            
-            tr_id = "H0STASP0"  # 실시간 호가
-            tr_key = symbol
-            
-            try:
-                subscribe_data = {
-                    "header": {
-                        "approval_key": await self._get_approval_key(),
-                        "custtype": "P",
-                        "tr_type": "1",
-                        "content-type": "utf-8"
-                    },
-                    "body": {
-                        "input": {
-                            "tr_id": tr_id,
-                            "tr_key": tr_key
-                        }
-                    }
+                self.subscriptions[symbol] = {
+                    "type": "price", 
+                    "callback": callback,
+                    "subscribed_at": datetime.now()
                 }
                 
-                # 웹소켓이 여전히 연결되어 있는지 확인
-                if not self.is_connected():
-                    logger.log_system(f"웹소켓 연결이 끊어졌습니다. {symbol} 호가 구독을 취소합니다.")
-                    return False
-                
-                await self.ws.send(json.dumps(subscribe_data))
-                
-                # 구독 응답 대기 추가
-                asyncio.create_task(self._wait_for_subscription_response(symbol))
-                
-                # 콜백 등록
-                self.callbacks[f"{tr_id}|{tr_key}"] = callback
-                self.subscriptions[f"{symbol}_orderbook"] = tr_id
-                
-                logger.log_system(f"Subscribed to orderbook feed for {symbol}")
-                
-                # 구독 후 잠시 대기 (서버 부하 방지)
-                await asyncio.sleep(1)
-                
+                logger.log_system(f"{symbol} 종목 실시간 가격 구독 성공 (현재 구독 종목 수: {len(self.subscriptions)})")
                 return True
                 
             except Exception as e:
-                error_type = type(e).__name__
-                logger.log_error(e, f"Error subscribing to orderbook feed for {symbol}: {error_type}")
-                
-                # 연결 오류인 경우 재연결 시도를 위해 연결 객체 초기화
-                if "ConnectionClosed" in error_type or "WebSocketClosedError" in error_type:
-                    logger.log_system(f"{symbol} 호가 구독 중 웹소켓 연결이 닫혔습니다. 웹소켓을 초기화합니다.")
-                    self.ws = None
-                    self.running = False
-                    self.auth_successful = False
-                
+                logger.log_error(e, f"{symbol} 종목 구독 실패")
                 return False
+    
+
     
     async def unsubscribe(self, symbol: str, feed_type: str = "price"):
         """구독 취소"""
-        # SKIP_WEBSOCKET이 True면 구독 취소하지 않고 구독 정보만 제거
-        if self.skip_websocket:
-            logger.log_system(f"{symbol} - SKIP_WEBSOCKET 설정으로 웹소켓 구독 취소를 건너뜁니다.")
-            # 내부 상태 업데이트 (콜백 및 구독 정보 제거)
-            if symbol in self.subscriptions:
+        # 웹소켓 연결 상태 확인
+        if not self.is_connected():
+            logger.log_system(f"웹소켓 연결이 없어 {symbol}의 {feed_type} 구독 취소를 건너뜁니다.")
+            
+            # 단, 내부 상태는 업데이트
+            if feed_type == "price" and symbol in self.subscriptions:
                 if isinstance(self.subscriptions[symbol], dict) and "type" in self.subscriptions[symbol]:
                     callback_key = f"H0STCNT0|{symbol}"
                     if callback_key in self.callbacks:
@@ -336,20 +327,6 @@ class KISWebSocketClient:
                         del self.callbacks[callback_key]
                     del self.subscriptions[symbol]
                     logger.log_system(f"Cleaned up subscription info for {symbol} {feed_type}")
-            return
-            
-        # 웹소켓 연결 상태 확인
-        if not self.is_connected():
-            logger.log_system(f"웹소켓 연결이 없어 {symbol}의 {feed_type} 구독 취소를 건너뜁니다.")
-            
-            # 단, 내부 상태는 업데이트
-            if feed_type == "price" and symbol in self.subscriptions:
-                tr_id = self.subscriptions.get(symbol)
-                callback_key = f"{tr_id}|{symbol}"
-                if callback_key in self.callbacks:
-                    del self.callbacks[callback_key]
-                del self.subscriptions[symbol]
-                logger.log_system(f"Cleaned up subscription info for {symbol} {feed_type}")
             elif f"{symbol}_{feed_type}" in self.subscriptions:
                 tr_id = self.subscriptions.get(f"{symbol}_{feed_type}")
                 callback_key = f"{tr_id}|{symbol}"
@@ -573,23 +550,133 @@ class KISWebSocketClient:
                 if restored_count > 0:
                     logger.log_system(f"Successfully restored {restored_count} price subscriptions")
     
+    async def _ping_loop(self):
+        """주기적으로 ping을 발송하여 연결 상태를 확인하는 루프"""
+        try:
+            while self.running and self.ws:
+                try:
+                    # 30초마다 ping 전송
+                    await asyncio.sleep(30)
+                    
+                    if self.ws and self.ws.open:
+                        pong_waiter = await self.ws.ping()
+                        try:
+                            await asyncio.wait_for(pong_waiter, timeout=5.0)
+                            logger.log_debug("WebSocket ping-pong successful")
+                        except asyncio.TimeoutError:
+                            logger.log_warning("WebSocket pong timeout - connection may be unstable")
+                            # 연결 불안정하면 재연결 시도
+                            await self._handle_reconnect()
+                            break
+                    else:
+                        logger.log_warning("WebSocket connection lost during ping loop")
+                        await self._handle_reconnect()
+                        break
+                        
+                except Exception as e:
+                    logger.log_error(e, "Error in ping loop")
+                    await self._handle_reconnect()
+                    break
+                    
+        except asyncio.CancelledError:
+            logger.log_system("Ping loop cancelled")
+        except Exception as e:
+            logger.log_error(e, "Unexpected error in ping loop")
+    
     async def close(self):
         """웹소켓 연결 종료"""
         self.running = False
         self.auth_successful = False
+        
+        # 태스크 취소
+        if hasattr(self, '_receive_task') and self._receive_task:
+            self._receive_task.cancel()
+        if hasattr(self, '_ping_task') and self._ping_task:
+            self._ping_task.cancel()
+            
+        # 웹소켓 연결 종료
         if self.ws:
             try:
                 await self.ws.close()
-            except:
-                pass
-            self.ws = None
+            except Exception as e:
+                logger.log_debug(f"Error closing websocket: {e}")
+            finally:
+                self.ws = None
+                
         logger.log_system("WebSocket connection closed")
+    
+    async def subscribe_multiple_prices(self, symbols: List[str], callback: Callable = None) -> Dict[str, bool]:
+        """여러 종목의 실시간 가격 구독
+        
+        Args:
+            symbols: 종목코드 리스트 (ex: ["005930", "000660"])
+            callback: 가격 업데이트 시 호출될 콜백 함수
+            
+        Returns:
+            Dict[str, bool]: 각 종목별 구독 성공 여부
+        """
+        results = {}
+        total_symbols = len(symbols)
+        success_count = 0
+        failure_count = 0
+        
+        logger.log_system(f"{total_symbols}개 종목 실시간 가격 구독 시작")
+        
+        # 배치 처리를 위해 종목을 나눕니다
+        batch_size = 10  # 한 번에 10개씩 처리
+        
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            
+            # 병렬 처리
+            tasks = []
+            for symbol in batch:
+                if symbol in self.subscriptions:
+                    results[symbol] = True  # 이미 구독 중
+                    success_count += 1
+                else:
+                    task = self.subscribe_price(symbol, callback)
+                    tasks.append((symbol, task))
+            
+            # 배치 내 종목들 동시 처리
+            for symbol, task in tasks:
+                try:
+                    result = await task
+                    results[symbol] = result
+                    if result:
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} 구독 중 오류 발생")
+                    results[symbol] = False
+                    failure_count += 1
+            
+            # 배치 간 지연시간 (서버 부하 방지)
+            if i + batch_size < len(symbols):
+                await asyncio.sleep(1.0)
+                logger.log_system(f"구독 진행중: {min(i + batch_size, total_symbols)}/{total_symbols} 종목 완료")
+        
+        logger.log_system(
+            f"종목 구독 완료 - 성공: {success_count}, 실패: {failure_count}, "
+            f"총 구독 종목 수: {len(self.subscriptions)}/{self.max_subscriptions}"
+        )
+        
+        return results
+    
+    def get_subscription_status(self) -> Dict[str, Any]:
+        """현재 구독 상태 정보 반환"""
+        return {
+            "total_subscriptions": len(self.subscriptions),
+            "max_subscriptions": self.max_subscriptions,
+            "subscribed_symbols": list(self.subscriptions.keys()),
+            "semaphore_available": self.subscription_semaphore._value,
+            "is_connected": self.is_connected(),
+            "auth_successful": self.auth_successful
+        }
     
     def is_connected(self) -> bool:
         """웹소켓 연결 상태 확인"""
-        # SKIP_WEBSOCKET이 True면 항상 연결된 것으로 간주
-        if self.skip_websocket:
-            return True
         return self.ws is not None and self.running
 
 # 싱글톤 인스턴스
