@@ -162,6 +162,105 @@ class TradingBot:
                         # 포지션 체크
                         await order_manager.check_positions()
                         
+                        # 매도 신호 체크 및 주문 실행 로직 추가
+                        now = datetime.now()
+                        if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
+                            logger.log_system("======== 익절 조건 체크 시작 ========")
+                            
+                            # 포지션 정보 가져오기
+                            try:
+                                positions = await order_manager.get_positions()
+                                if positions and "output1" in positions:
+                                    position_items = positions.get("output1", {})
+                                    logger.log_system(f"보유 종목 수: {len(position_items)}개")
+                                    
+                                    sell_orders_placed = 0
+                                    
+                                    # 각 보유 종목 체크
+                                    for position in position_items:
+                                        try:
+                                            # 종목 정보 추출
+                                            symbol = position.get("pdno", "")  # 종목코드
+                                            qty = int(position.get("hldg_qty", "0"))  # 보유수량
+                                            avg_price = float(position.get("pchs_avg_pric", "0"))  # 매수 평균가
+                                            current_profit_rate = float(position.get("evlu_pfls_rt", "0"))  # 현재 손익률
+                                            
+                                            # 손익률이 2% 이상인지 확인
+                                            if current_profit_rate >= 2.0 and qty > 0:
+                                                logger.log_system(f"[익절 조건 감지] {symbol}: 보유수량={qty}주, 매수가={avg_price:,.0f}원, 손익률={current_profit_rate:.2f}%")
+                                                
+                                                # 현재가 조회
+                                                symbol_info = await asyncio.wait_for(
+                                                    api_client.get_symbol_info(symbol),
+                                                    timeout=2.0
+                                                )
+                                                
+                                                if symbol_info and "current_price" in symbol_info:
+                                                    current_price = symbol_info["current_price"]
+                                                    # 실제 수익률 계산 (API 응답과 일치여부 확인)
+                                                    calc_profit_rate = ((current_price / avg_price) - 1) * 100
+                                                    
+                                                    logger.log_system(f"[익절 예정] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
+                                                                    f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
+                                                    
+                                                    # 2% 이상 수익률 확인 후 매도 주문
+                                                    if calc_profit_rate >= 2.0 or current_profit_rate >= 2.0:
+                                                        logger.log_system(f"[익절 주문] {symbol} 매도 실행: 수량={qty}주, 가격={current_price:,.0f}원")
+                                                        
+                                                        # 매도 주문 실행
+                                                        try:
+                                                            order_result = await asyncio.wait_for(
+                                                                order_manager.place_order(
+                                                                    symbol=symbol,
+                                                                    side="SELL",
+                                                                    quantity=qty,
+                                                                    price=current_price,
+                                                                    order_type="MARKET",
+                                                                    strategy="main_bot",
+                                                                    reason="profit_take_2pct"
+                                                                ),
+                                                                timeout=5.0
+                                                            )
+                                                            
+                                                            if order_result and order_result.get("status") == "success":
+                                                                sell_orders_placed += 1
+                                                                logger.log_system(f"✅ 익절 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
+                                                                
+                                                                # 주문 정보 로깅
+                                                                logger.log_trade(
+                                                                    action="SELL",
+                                                                    symbol=symbol,
+                                                                    price=current_price,
+                                                                    quantity=qty,
+                                                                    reason="2% 익절 자동 매도",
+                                                                    strategy="main_bot",
+                                                                    profit_rate=f"{calc_profit_rate:.2f}%",
+                                                                    time=datetime.now().strftime("%H:%M:%S"),
+                                                                    status="SUCCESS"
+                                                                )
+                                                            else:
+                                                                logger.log_system(f"❌ 익절 주문 실패: {symbol}, 사유={order_result.get('reason')}")
+                                                        except asyncio.TimeoutError:
+                                                            logger.log_system(f"⏱️ 익절 주문 타임아웃: {symbol}")
+                                                        except Exception as order_error:
+                                                            logger.log_error(order_error, f"{symbol} 익절 주문 처리 중 오류")
+                                                    else:
+                                                        logger.log_system(f"[익절 패스] {symbol}: API 손익률과 계산 손익률이 모두 2% 미만입니다.")
+                                            else:
+                                                logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
+                                                
+                                        except Exception as position_error:
+                                            logger.log_error(position_error, f"포지션 {symbol} 처리 중 오류")
+                                    
+                                    # 익절 주문 결과 요약
+                                    logger.log_system(f"익절 주문 실행 결과: {sell_orders_placed}개 주문 실행됨")
+                                else:
+                                    logger.log_system("보유 종목 정보가 없습니다.")
+                            except Exception as positions_error:
+                                logger.log_error(positions_error, "포지션 정보 조회 실패")
+                            
+                            logger.log_system("======== 익절 조건 체크 종료 ========")
+                            
                         # 매수 신호 체크 및 주문 실행 로직 추가
                         if len(MONITORED_SYMBOLS) > 0:
                             # 2분마다 신호 체크
@@ -431,6 +530,72 @@ class TradingBot:
             
             # 분석 시간 고려하여 상위 200개만 분석
             analysis_symbols = all_symbols[:200]
+            
+            # *** 전략들이 데이터를 준비하도록 초기화 ***
+            logger.log_system("전략 데이터 준비 시작...")
+            
+            for strategy_name, strategy in valid_strategies.items():
+                try:
+                    # 전략별로 초기 데이터 준비
+                    if hasattr(strategy, '_load_initial_data'):
+                        logger.log_system(f"{strategy_name} 전략 초기 데이터 로딩 중...")
+                        
+                        # 각 심볼에 대해 초기 데이터 로딩
+                        for symbol in analysis_symbols[:50]:  # 부하 분산을 위해 50개씩
+                            try:
+                                # 전략의 price_data 초기화
+                                if not hasattr(strategy, 'price_data'):
+                                    strategy.price_data = {}
+                                
+                                # deque 초기화
+                                from collections import deque
+                                max_period = 100  # 충분한 데이터 저장을 위해
+                                if hasattr(strategy, 'params'):
+                                    # 전략별 파라미터 확인
+                                    if strategy_name == 'momentum':
+                                        max_period = max(strategy.params.get('rsi_period', 14), 
+                                                       strategy.params.get('ma_long_period', 20)) * 2
+                                    elif strategy_name == 'breakout':
+                                        max_period = strategy.params.get('period', 20) * 2
+                                    elif strategy_name == 'gap':
+                                        max_period = strategy.params.get('confirmation_period', 10) * 2
+                                    elif strategy_name == 'vwap':
+                                        max_period = strategy.params.get('confirmation_bars', 3) * 2
+                                    elif strategy_name == 'volume':
+                                        max_period = strategy.params.get('volume_sma_period', 20) * 2
+                                
+                                strategy.price_data[symbol] = deque(maxlen=max_period)
+                                
+                                # indicators 초기화
+                                if not hasattr(strategy, 'indicators'):
+                                    strategy.indicators = {}
+                                
+                                strategy.indicators[symbol] = {
+                                    'rsi': None,
+                                    'ma_short': None,
+                                    'ma_long': None,
+                                    'macd': None,
+                                    'macd_signal': None,
+                                    'prev_rsi': None,
+                                    'prev_ma_cross': False
+                                }
+                                
+                                # watched_symbols 초기화 (일부 전략에서 필요)
+                                if not hasattr(strategy, 'watched_symbols'):
+                                    strategy.watched_symbols = set()
+                                strategy.watched_symbols.add(symbol)
+                                
+                                # 초기 데이터 로딩
+                                await strategy._load_initial_data(symbol)
+                                
+                            except Exception as e:
+                                logger.log_error(e, f"{strategy_name} - {symbol} 초기 데이터 로딩 실패")
+                                
+                except Exception as e:
+                    logger.log_error(e, f"{strategy_name} 전략 데이터 준비 실패")
+            
+            logger.log_system("전략 데이터 준비 완료")
+            # *** 초기화 끝 ***
             
             for idx, symbol in enumerate(analysis_symbols):
                 try:
