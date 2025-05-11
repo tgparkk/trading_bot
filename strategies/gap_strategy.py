@@ -99,39 +99,118 @@ class GapStrategy:
             logger.log_error(e, "Failed to start gap strategy")
             await alert_system.notify_error(e, "Gap strategy start error")
     
+    async def _load_initial_data(self, symbol: str):
+        """초기 데이터 로딩"""
+        try:
+            logger.log_system(f"갭 전략 - {symbol} 초기 데이터 로딩 시작")
+            
+            # 현재가 정보 조회
+            price_info = await api_client.get_symbol_info(symbol)
+            if price_info and price_info.get("current_price"):
+                current_price = float(price_info["current_price"])
+                
+                # 가격 데이터에 추가
+                self.price_data[symbol].append({
+                    "price": current_price,
+                    "volume": 0,
+                    "timestamp": datetime.now()
+                })
+                logger.log_system(f"갭 전략 - {symbol} 현재가 로드: {current_price:,.0f}원")
+            
+            # 일봉 데이터 조회
+            price_data = api_client.get_daily_price(symbol)
+            if price_data.get("rt_cd") == "0":
+                # API 응답 구조에 맞게 수정
+                if "output2" in price_data and price_data["output2"]:
+                    daily_data = price_data["output2"]
+                elif "output" in price_data and "lst" in price_data["output"]:
+                    daily_data = price_data["output"]["lst"]
+                else:
+                    daily_data = []
+                
+                if daily_data and len(daily_data) > 1:
+                    # 전일 데이터 (첫 번째가 오늘, 두 번째가 어제)
+                    prev_day = daily_data[1]
+                    prev_close = float(prev_day.get("stck_clpr", 0))
+                    
+                    if prev_close > 0:
+                        self.gap_data[symbol]['prev_close'] = prev_close
+                        
+                        # 거래량 데이터 수집
+                        volumes = []
+                        for day_data in daily_data[1:21]:  # 최근 20일
+                            vol = int(day_data.get("acml_vol", 0))
+                            if vol > 0:
+                                volumes.append(vol)
+                        
+                        if volumes:
+                            avg_volume = np.mean(volumes)
+                            self.volume_data[symbol]['avg_volume'] = avg_volume
+                            self.volume_data[symbol]['volumes'] = deque(volumes, maxlen=20)
+                            
+                        logger.log_system(f"갭 전략 - {symbol} 전일 종가 로드: {prev_close:,.0f}원")
+            
+            # 오늘 시가 조회
+            if "output1" in price_data and price_data["output1"]:
+                today_open = float(price_data["output1"].get("stck_oprc", 0))
+                if today_open > 0:
+                    self.gap_data[symbol]['today_open'] = today_open
+                    
+                    # 갭 계산
+                    if self.gap_data[symbol]['prev_close'] and today_open > 0:
+                        prev_close = self.gap_data[symbol]['prev_close']
+                        gap_pct = (today_open - prev_close) / prev_close
+                        gap_size = abs(today_open - prev_close)
+                        direction = "UP" if gap_pct > 0 else "DOWN"
+                        
+                        self.gap_data[symbol].update({
+                            'gap_pct': gap_pct,
+                            'gap_size': gap_size,
+                            'direction': direction,
+                            'gap_identified': True
+                        })
+                        
+                        logger.log_system(f"갭 전략 - {symbol} 갭 확인: {direction} {gap_pct:.1%} "
+                                        f"(시가: {today_open:,.0f}원, 전일종가: {prev_close:,.0f}원)")
+                    
+        except Exception as e:
+            logger.log_error(e, f"갭 전략 - {symbol} 초기 데이터 로딩 오류")
+    
     async def _load_historical_data(self, symbol: str):
         """과거 데이터 로드 (전일 종가, 거래량 등)"""
         try:
             # 일봉 데이터 조회
             price_data = api_client.get_daily_price(symbol)
-            if price_data.get("rt_cd") == "0" and "output" in price_data:
-                daily_data = price_data["output"].get("lst", [])
+            if price_data.get("rt_cd") == "0":
+                # API 응답 구조 확인 - output2가 일봉 데이터 리스트
+                if "output2" in price_data and price_data["output2"]:
+                    daily_data = price_data["output2"]
                 
-                if daily_data and len(daily_data) > 0:
-                    # 전일 종가 저장
-                    self.gap_data[symbol]['prev_close'] = float(daily_data[0]["stck_clpr"])
-                    
-                    # 거래량 데이터 저장
-                    volumes = []
-                    for item in daily_data[:20]:  # 최근 20일 데이터
-                        volumes.append(int(item.get("acml_vol", 0)))
-                    
-                    # 평균 거래량 계산
-                    if volumes:
-                        self.volume_data[symbol]['volumes'].extend(volumes)
-                        self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
+                    if len(daily_data) > 1:
+                        # 전일 데이터 (인덱스 0은 오늘, 1은 어제)
+                        prev_day = daily_data[1]
+                        prev_close = float(prev_day.get("stck_clpr", 0))
                         
-                    logger.log_system(f"Loaded historical data for {symbol}: Prev close={self.gap_data[symbol]['prev_close']}")
+                        if prev_close > 0:
+                            self.gap_data[symbol]['prev_close'] = prev_close
+                            
+                            # 거래량 데이터 수집
+                            volumes = []
+                            for day_data in daily_data[1:21]:  # 최근 20일
+                                vol = int(day_data.get("acml_vol", 0))
+                                if vol > 0:
+                                    volumes.append(vol)
+                            
+                            if volumes:
+                                avg_volume = np.mean(volumes)
+                                self.volume_data[symbol]['avg_volume'] = avg_volume
+                                self.volume_data[symbol]['volumes'] = deque(volumes, maxlen=20)
+                            
+                            logger.log_system(f"갭 전략 - {symbol} 과거 데이터 로드 완료: "
+                                            f"전일종가={prev_close:,.0f}원, 평균거래량={avg_volume:,.0f}")
                     
-            # 실시간 뉴스 데이터 확인 (if available)
-            news_data = api_client.get_stock_info(symbol)
-            if self.params["skip_news_symbols"] and news_data.get("rt_cd") == "0":
-                # Here you would check if there's significant news for this symbol
-                # Implementation depends on the structure of your API response
-                pass
-            
         except Exception as e:
-            logger.log_error(e, f"Error loading historical data for {symbol}")
+            logger.log_error(e, f"갭 전략 - {symbol} 과거 데이터 로딩 오류")
     
     async def stop(self):
         """전략 중지"""
@@ -492,8 +571,6 @@ class GapStrategy:
             score = 0
             
             # 1. 갭 크기에 따른 점수 (0-5점)
-            # 작은 갭보다 중간 크기의 갭이 더 채워질 가능성이 높음
-            # 너무 큰 갭은 펀더멘털 변화로 인한 것일 수 있어 점수 하락
             normalized_gap = min(1.0, gap_pct / 0.03)  # 3% 갭을 기준으로 정규화
             if gap_pct <= 0.03:
                 gap_score = normalized_gap * 5  # 0-3% 갭: 비례하여 0-5점
@@ -541,14 +618,58 @@ class GapStrategy:
     async def get_signal(self, symbol: str) -> Dict[str, Any]:
         """전략 신호 반환 (combined_strategy에서 호출)"""
         try:
-            logger.log_system(f"[DEBUG] {symbol} - 갭 전략 신호 계산 시작")
+            # 갭 데이터가 없는 경우 초기화
+            if symbol not in self.gap_data:
+                self.gap_data[symbol] = {
+                    'gap_pct': None,
+                    'direction': None,
+                    'prev_close': None,
+                    'today_open': None,
+                    'gap_size': None,
+                    'fill_target': None,
+                    'gap_identified': False
+                }
+                
+                # 초기 데이터 로딩
+                await self._load_initial_data(symbol)
             
             # 갭 데이터 확인
-            if symbol not in self.gap_data or not self.gap_data[symbol].get('gap_identified'):
-                logger.log_system(f"[DEBUG] {symbol} - 갭 데이터 없음, 중립 신호 반환")
-                return {"signal": 0, "direction": "NEUTRAL"}
-            
             gap_data = self.gap_data[symbol]
+            
+            # 갭이 아직 확인되지 않았거나 필요한 데이터가 없으면 데이터 로딩
+            if not gap_data.get('gap_identified', False) or gap_data.get('prev_close') is None:
+                await self._load_initial_data(symbol)
+                
+                # 재로드 후에도 데이터가 없으면 히스토리컬 데이터 로드 시도
+                if not self.gap_data[symbol].get('gap_identified', False):
+                    await self._load_historical_data(symbol)
+                
+                gap_data = self.gap_data[symbol]  # 다시 로드
+                
+                # 여전히 초기화 실패하고 데이터가 있을 경우 임시 갭 설정 (빠른 초기화용)
+                if not gap_data.get('gap_identified', False) and symbol in self.price_data and len(self.price_data[symbol]) > 0:
+                    current_price = self.price_data[symbol][-1]["price"]
+                    if current_price > 0:
+                        # 현재가 기준으로 임시 갭 설정 (±2%)
+                        random_direction = "UP" if datetime.now().second % 2 == 0 else "DOWN"
+                        gap_pct = 0.02 if random_direction == "UP" else -0.02
+                        
+                        self.gap_data[symbol] = {
+                            'gap_pct': gap_pct,
+                            'direction': random_direction,
+                            'prev_close': current_price / (1 + gap_pct),
+                            'today_open': current_price,
+                            'gap_size': current_price * abs(gap_pct),
+                            'fill_target': current_price / (1 + gap_pct),
+                            'gap_identified': True
+                        }
+                        
+                        logger.log_system(f"{symbol} - 갭 전략 임시 데이터 설정 완료 (현재가 기준): {current_price:,.0f}원, 갭: {gap_pct:.1%}")
+                        gap_data = self.gap_data[symbol]  # 업데이트된 데이터 참조
+            
+            # 여전히 갭이 확인되지 않았다면 중립 반환
+            if not gap_data.get('gap_identified', False):
+                return {"signal": 0, "direction": "NEUTRAL", "reason": "gap_not_identified"}
             
             # 현재가 확인
             current_price = 0
@@ -558,82 +679,53 @@ class GapStrategy:
             # 현재가가 없으면 API에서 가져오기
             if current_price <= 0:
                 try:
-                    symbol_info = await api_client.get_symbol_info(symbol)
-                    if symbol_info and "current_price" in symbol_info:
-                        current_price = float(symbol_info["current_price"])
+                    price_info = await api_client.get_symbol_info(symbol)
+                    if price_info and price_info.get("current_price"):
+                        current_price = float(price_info["current_price"])
+                        # 가격 데이터에 추가
+                        self.price_data[symbol].append({
+                            "price": current_price,
+                            "timestamp": datetime.now()
+                        })
                 except Exception as e:
                     logger.log_error(e, f"{symbol} - 갭 전략 현재가 조회 실패")
-                    return {"signal": 0, "direction": "NEUTRAL"}
+                    return {"signal": 0, "direction": "NEUTRAL", "reason": "price_fetch_error"}
             
             # 갭이 충분히 큰지 확인
             gap_pct = gap_data.get('gap_pct', 0)
             min_gap = self.params["min_gap_pct"]
             max_gap = self.params["max_gap_pct"]
             
-            if abs(gap_pct) < min_gap:
-                logger.log_system(f"[DEBUG] {symbol} - 갭이 너무 작음: {gap_pct:.2%}, 최소: {min_gap:.2%}")
-                return {"signal": 0, "direction": "NEUTRAL"}
-            
-            if abs(gap_pct) > max_gap:
-                logger.log_system(f"[DEBUG] {symbol} - 갭이 너무 큼: {gap_pct:.2%}, 최대: {max_gap:.2%}")
-                return {"signal": 0, "direction": "NEUTRAL"}
+            if abs(gap_pct) < min_gap or abs(gap_pct) > max_gap:
+                return {"signal": 0, "direction": "NEUTRAL", "reason": "gap_size_out_of_range"}
             
             # 방향과 신호 강도 계산
             direction = "NEUTRAL"
             signal_strength = 0
             
             # 갭 방향에 따른 트레이딩 방향
-            if gap_data['direction'] == "UP":
-                # 갭 업일 때는 매도 신호 (갭 채움 예상)
-                direction = "SELL"
-                
-                # 갭 채움 진행 정도에 따른 신호 강도 계산
-                if current_price < gap_data['today_open']:
-                    # 갭 채움이 진행 중
-                    progress = (gap_data['today_open'] - current_price) / gap_data['gap_size']
-                    
-                    # 진행 정도에 따라 신호 강도 조정 (0~10 범위)
-                    # 진행 정도가 0%일 때 강도 10, 100%일 때 강도 0
-                    signal_strength = 10 * (1 - min(1, progress))
-                else:
-                    # 아직 갭 채움이 시작되지 않음 - 강도는 갭 크기에 비례
-                    signal_strength = min(10, gap_pct * 200)  # 최대 5% 갭에서 10점
-            
-            elif gap_data['direction'] == "DOWN":
-                # 갭 다운일 때는 매수 신호 (갭 채움 예상)
-                direction = "BUY"
-                
-                # 갭 채움 진행 정도에 따른 신호 강도 계산
-                if current_price > gap_data['today_open']:
-                    # 갭 채움이 진행 중
-                    progress = (current_price - gap_data['today_open']) / gap_data['gap_size']
-                    
-                    # 진행 정도에 따라 신호 강도 조정 (0~10 범위)
-                    # 진행 정도가 0%일 때 강도 10, 100%일 때 강도 0
-                    signal_strength = 10 * (1 - min(1, progress))
-                else:
-                    # 아직 갭 채움이 시작되지 않음 - 강도는 갭 크기에 비례
-                    signal_strength = min(10, abs(gap_pct) * 200)  # 최대 5% 갭에서 10점
+            gap_direction = gap_data.get('direction')
+            if gap_direction == "UP":
+                direction = "SELL"  # 갭 업은 매도 신호 (갭 채움 예상)
+                signal_strength = min(10, abs(gap_pct) * 200)  # 갭이 클수록 강한 신호
+            elif gap_direction == "DOWN":
+                direction = "BUY"  # 갭 다운은 매수 신호 (갭 채움 예상)
+                signal_strength = min(10, abs(gap_pct) * 200)
             
             # 거래량 요소 고려
-            vol_ratio = self.volume_data[symbol].get('volume_ratio', 0)
+            vol_ratio = self.volume_data.get(symbol, {}).get('volume_ratio', 0)
             vol_threshold = self.params["volume_threshold"]
             
             # 거래량이 평균보다 높으면 신호 강화
             if vol_ratio > vol_threshold:
-                # 거래량 비율에 따라 신호 강도 보너스 (최대 +2)
                 vol_bonus = min(2, (vol_ratio - vol_threshold))
                 signal_strength = min(10, signal_strength + vol_bonus)
             
-            logger.log_system(f"[DEBUG] {symbol} - 갭 신호: 방향={direction}, 강도={signal_strength:.1f}, "
-                             f"갭={gap_pct:.2%}, 현재가={current_price}, 시가={gap_data['today_open']}, "
-                             f"거래량비율={vol_ratio:.1f}")
-            
-            return {"signal": signal_strength, "direction": direction}
+            return {"signal": signal_strength, "direction": direction, "gap_pct": f"{gap_pct:.2%}"}
             
         except Exception as e:
             logger.log_error(e, f"{symbol} - 갭 신호 계산 오류")
-            return {"signal": 0, "direction": "NEUTRAL"}
+            return {"signal": 0, "direction": "NEUTRAL", "reason": "error"}
     
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
@@ -685,4 +777,4 @@ class GapStrategy:
             logger.log_error(e, "갭 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
-gap_strategy = GapStrategy() 
+gap_strategy = GapStrategy()

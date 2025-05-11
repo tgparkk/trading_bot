@@ -70,16 +70,16 @@ class KISAPIClient:
         
         # 토큰이 있고 만료되지 않았으면 재사용
         if self.access_token and self.token_expire_time:
-            # 만료 1시간 전까지는 기존 토큰 재사용
-            if current_time < self.token_expire_time - 3600:
+            # 만료 1시간 전까지는 기존 토큰 재사용 (더 여유 있게 설정)
+            if current_time < self.token_expire_time - 7200:  # 2시간(7200초) 전까지 재사용
                 logger.log_system(f"[토큰재사용] 기존 토큰이 유효하여 재사용합니다. (만료까지 {(self.token_expire_time - current_time)/3600:.1f}시간 남음)")
                 return self.access_token
             
-            # 만료 1시간 전이면 토큰 갱신
-            logger.log_system("[토큰갱신] 토큰이 곧 만료되어 갱신합니다.")
-        
-        # 토큰 발급/갱신 작업 로그
-        logger.log_system("새로운 KIS API 토큰 발급을 시작합니다...")
+            # 만료 2시간 전이면 토큰 갱신
+            logger.log_system(f"[토큰갱신] 토큰이 곧 만료되어 갱신합니다. (만료까지 {(self.token_expire_time - current_time)/3600:.1f}시간 남음)")
+        else:
+            # 토큰 발급/갱신 작업 로그
+            logger.log_system("[토큰없음] 새로운 KIS API 토큰 발급을 시작합니다...")
         
         # 토큰 발급/갱신
         url = f"{self.base_url}/oauth2/tokenP"
@@ -229,26 +229,32 @@ class KISAPIClient:
         """비동기 방식으로 액세스 토큰 획득"""
         async with self._token_lock:
             # 파일에서 토큰 정보 다시 확인
-            self.load_token_from_file()
+            token_loaded = self.load_token_from_file()
             
             current_time = datetime.now().timestamp()
             
             # 토큰이 있고 유효한지 확인
             if self.access_token and self.token_expire_time:
-                # 현재 시간이 만료 시간보다 3시간 이상 남았으면 기존 토큰 사용 (1시간에서 3시간으로 변경)
+                # 토큰 만료까지 남은 시간 계산 (시간 단위)
                 remaining_hours = (self.token_expire_time - current_time) / 3600
-                if current_time < self.token_expire_time - 10800:  # 3시간(10800초)으로 수정
+                
+                # 만료 시간이 1시간 이상 남았으면 기존 토큰 사용
+                if current_time < self.token_expire_time - 3600:  # 1시간(3600초)으로 수정
                     logger.log_system(f"[토큰재사용] 유효한 토큰이 있습니다. 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
                                      f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
                                      f"남은시간={remaining_hours:.1f}시간")
                     return self.access_token
                 
-                # 만료 3시간 이내인 경우에만 갱신 시도
-                logger.log_system(f"[토큰갱신] 토큰 만료 3시간 이내, 갱신 필요: 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                # 만료 1시간 이내인 경우에만 갱신 시도
+                logger.log_system(f"[토큰갱신] 토큰 만료 1시간 이내, 갱신 필요: 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
                                  f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
                                  f"남은시간={remaining_hours:.1f}시간")
             else:
-                logger.log_system("[토큰없음] 유효한 토큰이 없어 새로 발급합니다.")
+                # 파일에서 로드 시도 결과에 따라 다른 메시지 표시
+                if token_loaded:
+                    logger.log_system("[토큰오류] 파일에서 토큰을 로드했지만 유효하지 않습니다.")
+                else:
+                    logger.log_system("[토큰없음] 유효한 토큰이 없어 새로 발급합니다.")
             
             # 새 토큰 발급 필요
             loop = asyncio.get_event_loop()
@@ -629,14 +635,18 @@ class KISAPIClient:
         """계좌 잔고 조회"""
         path = "/uapi/domestic-stock/v1/trading/inquire-balance"
         
-        # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
-        test_mode_str = os.getenv("TEST_MODE", "False").strip()
-        is_test_mode = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
-        
-        logger.log_system(f"계좌 조회 - 테스트 모드: {is_test_mode} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        # 모의투자 여부 확인
+        is_dev = False
+        try:
+            # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
+            test_mode_str = os.getenv("TEST_MODE", "False").strip()
+            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+            logger.log_system(f"계좌 조회 - 모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        except Exception as e:
+            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
         
         # 거래소코드 설정 (모의투자 또는 실전투자)
-        tr_id = "VTTC8434R" if is_test_mode else "TTTC8434R"  # 모의투자(V) vs 실전투자(T)
+        tr_id = "VTTC8434R" if is_dev else "TTTC8434R"  # 모의투자(V) vs 실전투자(T)
         
         headers = {
             "tr_id": tr_id
@@ -709,14 +719,25 @@ class KISAPIClient:
         """주문 실행"""
         path = "/uapi/domestic-stock/v1/trading/order-cash"
         
-        # 매수/매도 구분
+        # 모의투자 여부 확인
+        is_dev = False
+        try:
+            # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
+            test_mode_str = os.getenv("TEST_MODE", "False").strip()
+            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+            logger.log_system(f"주문 실행 - 모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        except Exception as e:
+            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
+        
+        # 매수/매도 구분 (모의투자/실거래 TR_ID 구분)
         if side.upper() == "BUY":
-            tr_id = "TTTC0802U"  # 매수
+            tr_id = "TTTC0012U" if not is_dev else "TTTC0012U"  # 매수 (모의투자:VTTC0012U / 실거래:TTTC0012U)
         else:
-            tr_id = "TTTC0801U"  # 매도
+            tr_id = "TTTC0011U" if not is_dev else "TTTC0011U"  # 매도 (모의투자:VTTC0011U / 실거래:TTTC0011U)
         
         headers = {
-            "tr_id": tr_id
+            "tr_id": tr_id,
+            "Content-Type": "application/json"
         }
         
         # 주문 유형 (00: 지정가, 01: 시장가)
@@ -728,7 +749,10 @@ class KISAPIClient:
             "PDNO": symbol,
             "ORD_DVSN": ord_dvsn,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(price) if ord_dvsn == "00" else "0"
+            "ORD_UNPR": str(price) if ord_dvsn == "00" else "0",
+            "CTAC_TLNO": "", # 연락전화번호(널값 가능)
+            "SLL_TYPE": "00", # 매도유형(00: 고정값)
+            "ALGO_NO": ""     # 알고리즘 주문번호(선택값)
         }
         
         # 해시키 생성
@@ -837,6 +861,75 @@ class KISAPIClient:
         
         return self._make_request("GET", path, headers=headers, params=params)
     
+    def get_minute_price(self, symbol: str, time_unit: str = "1") -> Dict[str, Any]:
+        """분 단위 가격 정보 조회
+        
+        Args:
+            symbol (str): 종목 코드
+            time_unit (str): 시간 단위 ("1":1분, "3":3분, "5":5분, "10":10분, "15":15분, "30":30분, "60":60분)
+        """
+        try:
+            path = "/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"  # 시간별 체결가 조회
+            
+            # 시간 단위별 FID_PW_DATA_INTP_HOUR_CLS_CODE 설정
+            hour_cls_code_map = {
+                "1": "0",   # 1분
+                "3": "1",   # 3분 (지원 안됨)
+                "5": "2",   # 5분
+                "10": "3",  # 10분
+                "15": "4",  # 15분 
+                "30": "5",  # 30분
+                "60": "6"   # 60분
+            }
+            
+            hour_cls_code = hour_cls_code_map.get(time_unit, "0")
+            
+            headers = {
+                "tr_id": "FHKST01010600"  # 분봉 조회 TR ID 
+            }
+            
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",      # 시장구분 (J: 주식)
+                "FID_INPUT_ISCD": symbol,            # 종목코드
+                "FID_PW_DATA_INTP_HOUR_CLS_CODE": hour_cls_code,  # 시간 클래스 코드
+                "FID_HOUR_CLS_CODE": hour_cls_code   # 시간 구분 코드 (중복인듯하지만 API 문서 따름)
+            }
+            
+            result = self._make_request("GET", path, headers=headers, params=params)
+            
+            if result.get("rt_cd") == "0":
+                logger.log_system(f"{symbol} {time_unit}분봉 데이터 조회 성공")
+                
+                # 응답 구조 통일화 (output.lst 형태로)
+                if "output" in result and not isinstance(result.get("output"), dict):
+                    # output이 리스트인 경우, lst 키로 변환
+                    output_data = result.get("output", [])
+                    result["output"] = {"lst": output_data}
+                elif "output" not in result:
+                    # output이 아예 없는 경우 빈 구조 생성
+                    result["output"] = {"lst": []}
+                
+                # output1, output2 등의 데이터가 있으면 lst에 통합
+                if "output1" in result and isinstance(result["output1"], list):
+                    result["output"] = {"lst": result["output1"]}
+                elif "output2" in result and isinstance(result["output2"], list):
+                    result["output"] = {"lst": result["output2"]}
+                    
+            else:
+                error_msg = result.get("msg1", "알 수 없는 오류")
+                logger.log_system(f"{symbol} {time_unit}분봉 데이터 조회 실패: {error_msg}")
+            
+            return result
+            
+        except Exception as e:
+            logger.log_error(e, f"{symbol} 분봉 데이터 조회 중 오류 발생")
+            # 오류 발생 시에도 최소한의 응답 구조 제공
+            return {
+                "rt_cd": "9999",
+                "msg1": str(e),
+                "output": {"lst": []}
+            }
+    
     def get_daily_price(self, symbol: str, max_days: int = 30) -> Dict[str, Any]:
         """일별 가격 정보 조회"""
         try:
@@ -895,6 +988,121 @@ class KISAPIClient:
                 "output2": []
             }
     
+    def get_volume_ranking(self, market: str = "ALL") -> Dict[str, Any]:
+        """거래량 순위 종목 조회
+        
+        Args:
+            market (str): 시장 구분 ("ALL", "KOSPI", "KOSDAQ")
+            
+        Returns:
+            Dict[str, Any]: API 응답 결과
+                - rt_cd: 성공/실패 여부 ("0": 성공)
+                - msg_cd: 응답코드
+                - msg1: 응답메세지
+                - output: 거래량 순위 데이터 리스트
+        """
+        try:
+            logger.log_system(f"[API] 거래량 순위 조회 시작 - 시장: {market}")
+            
+            path = "/uapi/domestic-stock/v1/quotations/volume-rank"
+            headers = {
+                "tr_id": "FHPST01710000",  # 거래량 순위 TR ID
+                "custtype": "P"  # 개인
+            }
+            
+            # 시장 구분 코드 매핑
+            market_code_map = {
+                "ALL": "0000",     # 전체
+                "KOSPI": "0001",   # 코스피
+                "KOSDAQ": "1001",  # 코스닥
+                "0": "0000",      # 전체
+                "J": "0000"       # 전체 (주식)
+            }
+            
+            market_code = market_code_map.get(market.upper(), "0000")
+            logger.log_system(f"[API] 시장 코드 매핑: {market} -> {market_code}")
+            
+            # API 요청 파라미터 - API 문서에 맞춰 수정
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",          # 조건 시장 분류 코드 (J: 주식)
+                "FID_COND_SCR_DIV_CODE": "20171",       # 조건 화면 분류 코드 (20171: 거래량순위)
+                "FID_INPUT_ISCD": market_code,          # 입력 종목코드 (시장구분)
+                "FID_DIV_CLS_CODE": "0",                # 분류 구분 코드 (0: 전체)
+                "FID_BLNG_CLS_CODE": "0",               # 소속 구분 코드 (0: 평균거래량)
+                "FID_TRGT_CLS_CODE": "111111111",       # 대상 구분 코드 (증거금 30% 40% 50% 60% 100% 신용보증금 30% 40% 50% 60%)
+                "FID_TRGT_EXLS_CLS_CODE": "0000000000", # 대상 제외 구분 코드 (10자리)
+                "FID_INPUT_PRICE_1": "",                # 입력 가격1 (전체 가격 대상)
+                "FID_INPUT_PRICE_2": "",                # 입력 가격2 (전체 가격 대상)
+                "FID_VOL_CNT": "",                      # 거래량 수 (전체 거래량 대상)
+                "FID_INPUT_DATE_1": ""                  # 입력 날짜1 (공란)
+            }
+            
+            logger.log_system(f"[API] 요청 파라미터: {params}")
+            
+            # API 호출 전 토큰 상태 확인
+            if not self.access_token or not self.token_expire_time:
+                logger.log_system("[API] 거래량 순위 조회 전 - 토큰이 없어서 발급 필요")
+                self._get_access_token()
+            else:
+                remaining_hours = (self.token_expire_time - datetime.now().timestamp()) / 3600
+                logger.log_system(f"[API] 거래량 순위 조회 전 - 토큰 유효 (만료까지 {remaining_hours:.1f}시간)")
+            
+            # API 요청 실행
+            result = self._make_request("GET", path, headers=headers, params=params)
+            
+            # 응답 로깅 (디버깅용)
+            logger.log_system(f"[API] 응답 rt_cd: {result.get('rt_cd')}")
+            logger.log_system(f"[API] 응답 msg_cd: {result.get('msg_cd', 'N/A')}")
+            logger.log_system(f"[API] 응답 msg1: {result.get('msg1', 'N/A')}")
+            
+            if result.get("rt_cd") == "0":
+                # 성공 처리
+                logger.log_system(f"[API] 거래량 순위 조회 성공 (시장: {market})")
+                
+                # output 데이터 확인 및 처리
+                output_data = result.get("output", [])
+                if isinstance(output_data, list) and output_data:
+                    logger.log_system(f"[API] 거래량 순위 데이터 수: {len(output_data)}")
+                    # 상위 30개 종목만 로깅  
+                    for i, item in enumerate(output_data[:30]):
+                        if isinstance(item, dict):
+                            # 첫번째 항목의 필드 정보 출력
+                            if i == 0:
+                                logger.log_system(f"[API] 첫번째 항목의 전체 필드: {list(item.keys())}")
+                                
+                            # 필드명 매핑 - API 문서에 맞춰 수정
+                            symbol = item.get("mksc_shrn_iscd", "N/A")  # 유가증권 단축 종목코드
+                            name = item.get("hts_kor_isnm", "N/A")      # HTS 한글 종목명
+                            volume = item.get("acml_vol", "0")          # 누적 거래량
+                            price = item.get("stck_prpr", "0")          # 주식 현재가
+                            change_rate = item.get("prdy_ctrt", "0")    # 전일 대비율
+                            rank = item.get("data_rank", str(i+1))      # 데이터 순위
+                            
+                            logger.log_system(f"[API] #{rank} {symbol} {name}: 가격 {price}원, 거래량 {volume}, 등락률 {change_rate}%")
+                else:
+                    logger.log_system(f"[API] output 데이터가 비어있거나 리스트가 아님: {type(output_data)}")
+            else:
+                # 실패 처리
+                error_msg = result.get("msg1", "알 수 없는 오류")
+                logger.log_system(f"[API] 거래량 순위 조회 실패: {error_msg}")
+                logger.log_system(f"[API] 전체 응답: {result}")
+            
+            return result
+            
+        except Exception as e:
+            logger.log_error(e, f"[API] 거래량 순위 조회 중 예외 발생 (시장: {market})")
+            # 예외 타입과 메시지 로깅
+            logger.log_system(f"[API] 예외 타입: {type(e).__name__}")
+            logger.log_system(f"[API] 예외 메시지: {str(e)}")
+            
+            # 오류 발생 시에도 최소한의 응답 구조 제공
+            return {
+                "rt_cd": "9999",
+                "msg_cd": "ERR",
+                "msg1": str(e),
+                "output": []
+            }
+
     def get_market_trading_volume(self, market: str = "ALL") -> Dict[str, Any]:
         """시장 거래량 정보 조회"""
         try:

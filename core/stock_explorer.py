@@ -26,6 +26,9 @@ class StockExplorer:
             List[str]: 거래량 상위 종목 목록
         """
         try:
+            # 디버깅: 시장 타입 확인
+            logger.log_system(f"거래량 상위 종목 조회 시작 - 시장 타입: {market_type}")
+            
             # 1) 거래량 순위 API 호출
             # 시장 코드 변환 (ALL: 전체, KOSPI: 코스피, KOSDAQ: 코스닥)
             market_code = {
@@ -34,11 +37,23 @@ class StockExplorer:
                 "KOSDAQ": "KOSDAQ"
             }.get(market_type, "ALL")
             
-            vol_data = api_client.get_market_trading_volume(market=market_code)
+            logger.log_system(f"API 호출 전 - 시장 코드: {market_code}")
+            
+            try:
+                vol_data = api_client.get_volume_ranking(market=market_code)
+            except Exception as api_error:
+                logger.log_error(api_error, f"API 호출 중 예외 발생")
+                self._log_search_failure(f"API 호출 예외: {str(api_error)}")
+                return []
+            
+            # API 응답 전체 로깅 (디버깅용)
+            logger.log_system(f"API 응답 구조: {list(vol_data.keys())}")
+            logger.log_system(f"API 응답 rt_cd: {vol_data.get('rt_cd')}")
+            logger.log_system(f"API 응답 msg1: {vol_data.get('msg1', 'N/A')}")
             
             # API 응답 로깅 (오류 발생 시에만)
             if vol_data.get("rt_cd") != "0":
-                logger.log_system(f"API 응답 구조: {list(vol_data.keys())}")
+                logger.log_system(f"API 응답 전체 내용: {vol_data}")
             
             if vol_data.get("rt_cd") != "0":
                 logger.log_error("거래량 순위 조회 실패: " + vol_data.get("msg_cd", "알 수 없는 오류"))
@@ -108,8 +123,9 @@ class StockExplorer:
             )
             
             # 상위 5개 종목만 로그에 남김 (10개에서 축소)
-            for symbol in symbols[:5]:
+            for i, symbol in enumerate(symbols[:5]):
                 try:
+                    logger.log_system(f"종목 정보 조회 {i+1}/5: {symbol}")
                     symbol_info = self.get_symbol_info(symbol)
                     if symbol_info:
                         # 각 종목별 상세 정보 로그 (trade.log에 기록)

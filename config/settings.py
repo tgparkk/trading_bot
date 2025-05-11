@@ -14,7 +14,7 @@ class APIConfig:
     app_key: str
     app_secret: str
     account_no: str
-    ws_url: str = "ws://ops.koreainvestment.com:21000"
+    ws_url: str  
 
     @classmethod
     def from_env(cls) -> "APIConfig":
@@ -23,7 +23,7 @@ class APIConfig:
             app_key=dotenv_helper.get_value("KIS_APP_KEY", ""),
             app_secret=dotenv_helper.get_value("KIS_APP_SECRET", ""),
             account_no=dotenv_helper.get_value("KIS_ACCOUNT_NO", ""),
-            ws_url=dotenv_helper.get_value("KIS_WS_URL", "ws://ops.koreainvestment.com:21000"),
+            ws_url=dotenv_helper.get_value("KIS_WS_URL", ""),
         )
 
 @dataclass
