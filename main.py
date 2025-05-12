@@ -107,16 +107,21 @@ class TradingBot:
                 retry_count += 1
                 try:
                     logger.log_system(f"웹소켓 연결 시도... ({retry_count}/{self.max_retries})")
-                    await ws_client.connect()
+                    connection_success = await ws_client.connect()
                     websocket_connected = ws_client.is_connected()
                     if websocket_connected:
                         logger.log_system("웹소켓 연결 성공!")
                         break
+                    else:
+                        logger.log_warning(f"웹소켓 연결 시도 실패 ({retry_count}/{self.max_retries})")
                 except Exception as e:
                     logger.log_error(e, f"웹소켓 연결 실패 ({retry_count}/{self.max_retries})")
                 
                 if retry_count < self.max_retries:
-                    await asyncio.sleep(2)  # 재시도 전 2초 대기
+                    # 재시도 간격을 지수적으로 증가 (1초, 2초, 4초, ...)
+                    wait_time = 2 ** (retry_count - 1)
+                    logger.log_system(f"웹소켓 재연결 {wait_time}초 후 재시도...")
+                    await asyncio.sleep(wait_time)
             
             # 시스템 상태 업데이트
             database_manager.update_system_status("RUNNING")

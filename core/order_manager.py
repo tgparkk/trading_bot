@@ -91,19 +91,24 @@ class OrderManager:
                          bypass_pause: bool = False) -> Dict[str, Any]:
         """주문 실행"""
         try:
+            logger.log_system(f"[주문시도] {symbol} {side} 주문 시작 - 수량: {quantity}주, 가격: {price}, 타입: {order_type}")
+            
             # 거래 일시 중지 상태 확인 (bypass_pause가 False이고 거래가 일시 중지된 경우)
             if not bypass_pause and self.trading_paused:
                 # 전략에 의한 자동 거래 (reason에 'user_request'가 없는 경우)인 경우만 거부
                 if not reason or 'user_request' not in reason:
-                    logger.log_system(f"Order rejected for {symbol}: trading is paused")
+                    logger.log_system(f"[주문거부] {symbol}: 거래가 일시 중지 상태입니다.")
                     return {"status": "rejected", "reason": "trading_paused"}
             
             # 리스크 체크
-            if not await self._check_risk(symbol, side, quantity, price):
+            risk_check_result = await self._check_risk(symbol, side, quantity, price)
+            if not risk_check_result:
+                logger.log_system(f"[주문거부] {symbol}: 리스크 체크 실패")
                 return {"status": "rejected", "reason": "risk_check_failed"}
             
             # 주문 실행
             if order_type.upper() == "MARKET":
+                logger.log_system(f"[주문실행] {symbol} 시장가 주문 실행")
                 order_result = api_client.place_order(
                     symbol=symbol,
                     order_type="MARKET",
@@ -112,9 +117,11 @@ class OrderManager:
                 )
             else:
                 if price is None:
+                    logger.log_system(f"[가격조회] {symbol} 현재가 조회")
                     price_data = api_client.get_current_price(symbol)
                     price = float(price_data["output"]["stck_prpr"])
                 
+                logger.log_system(f"[주문실행] {symbol} 지정가 주문 실행 - 가격: {price}")
                 order_result = api_client.place_order(
                     symbol=symbol,
                     order_type="LIMIT",
@@ -123,9 +130,10 @@ class OrderManager:
                     price=int(price)
                 )
             
-            # 주문 성공
+            # 주문 결과 확인
             if order_result.get("rt_cd") == "0":
                 order_id = order_result["output"]["ODNO"]
+                logger.log_system(f"[주문성공] {symbol} 주문 성공 - 주문ID: {order_id}")
                 
                 # 주문 데이터 저장
                 order_data = {
@@ -178,6 +186,7 @@ class OrderManager:
             
             else:
                 error_msg = order_result.get("msg1", "Unknown error")
+                logger.log_system(f"[주문실패] {symbol} 주문 실패 - 오류: {error_msg}")
                 logger.log_error(
                     Exception(error_msg),
                     f"Order failed for {symbol}"
@@ -185,6 +194,7 @@ class OrderManager:
                 return {"status": "failed", "reason": error_msg}
             
         except Exception as e:
+            logger.log_system(f"[주문오류] {symbol} 주문 처리 중 예외 발생: {str(e)}")
             logger.log_error(e, "Order placement error")
             return {"status": "error", "reason": str(e)}
     
@@ -286,57 +296,67 @@ class OrderManager:
                          price: float = None) -> bool:
         """리스크 체크"""
         try:
+            logger.log_system(f"[리스크체크] {symbol} 리스크 체크 시작")
+            
             # 루프 및 실행기 가져오기
             loop = asyncio.get_event_loop()
             
             # 현재가 조회 (price가 None인 경우에만)
             if price is None:
                 try:
+                    logger.log_system(f"[가격조회] {symbol} 현재가 조회")
                     # run_in_executor를 사용하여 비동기적으로 동기 함수 호출
                     price_data = await loop.run_in_executor(None, 
                                                            lambda: api_client.get_current_price(symbol))
                     if price_data.get("rt_cd") == "0" and "output" in price_data:
                         price = float(price_data["output"]["stck_prpr"])
+                        logger.log_system(f"[가격조회] {symbol} 현재가: {price:,}원")
                     else:
+                        error_msg = price_data.get("msg1", "Unknown error")
+                        logger.log_system(f"[가격조회실패] {symbol} 현재가 조회 실패: {error_msg}")
                         logger.log_error(
-                            Exception(f"Failed to get current price: {price_data.get('msg1', 'Unknown error')}"),
+                            Exception(f"Failed to get current price: {error_msg}"),
                             f"Risk check error for {symbol}"
                         )
                         return False
                 except Exception as e:
+                    logger.log_system(f"[가격조회오류] {symbol} 현재가 조회 중 오류: {str(e)}")
                     logger.log_error(e, f"Error getting current price for {symbol}")
                     return False
             
             # 포지션 사이즈 체크
             position_value = quantity * price
-            if position_value > self.trading_config.max_position_size:
+            max_position_size = self.trading_config.risk_params.get("max_position_size", 10_000_000)
+            if position_value > max_position_size:
                 logger.log_system(
-                    f"Risk check failed: Position size too large for {symbol} - "
-                    f"Value: {position_value:,.0f}원, Limit: {self.trading_config.max_position_size:,.0f}원"
+                    f"[포지션크기초과] {symbol} - 포지션 크기 제한 초과: "
+                    f"계산값={position_value:,.0f}원, 제한={max_position_size:,.0f}원"
                 )
                 return False
             
             # 일일 손실 한도 체크
-            daily_loss_limit = -self.trading_config.max_loss_rate * 100000  # 손실한도 10만원
+            max_loss_rate = self.trading_config.risk_params.get("max_loss_rate", 0.02)
+            daily_loss_limit = -max_loss_rate * 100000
             if self.daily_pnl < daily_loss_limit:
                 logger.log_system(
-                    f"Risk check failed: Daily loss limit reached - "
-                    f"Current Loss: {self.daily_pnl:,.0f}원, Limit: {daily_loss_limit:,.0f}원"
+                    f"[일일손실한도] 일일 손실 한도 도달: "
+                    f"현재손실={self.daily_pnl:,.0f}원, 한도={daily_loss_limit:,.0f}원"
                 )
                 return False
             
             # 종목별 최대 포지션 수량 체크
             current_position = self.positions.get(symbol, {"quantity": 0})
-            max_position_per_symbol = getattr(self.trading_config, "max_position_per_symbol", 1000)
+            max_position_per_symbol = self.trading_config.risk_params.get("max_position_per_symbol", 1000)
             if side == "BUY" and current_position["quantity"] + quantity > max_position_per_symbol:
                 logger.log_system(
-                    f"Risk check failed: Max position per symbol reached for {symbol} - "
-                    f"Current: {current_position['quantity']}주, Adding: {quantity}주, Limit: {max_position_per_symbol}주"
+                    f"[포지션수량초과] {symbol} - 종목별 최대 포지션 수량 초과: "
+                    f"현재={current_position['quantity']}주, 추가={quantity}주, 제한={max_position_per_symbol}주"
                 )
                 return False
             
             # 변동성 체크
             try:
+                logger.log_system(f"[변동성체크] {symbol} 변동성 체크")
                 # run_in_executor를 사용하여 비동기적으로 동기 함수 호출
                 price_data = await loop.run_in_executor(None, 
                                                       lambda: api_client.get_daily_price(symbol))
@@ -355,26 +375,28 @@ class OrderManager:
                     # 최소 2일 이상의 가격 데이터가 있어야 변동성 계산 가능
                     if len(prices) >= 2:
                         volatility = self._calculate_volatility(prices)
-                        max_volatility = getattr(self.trading_config, "max_volatility", 0.1)  # 기본값 10%
+                        max_volatility = self.trading_config.risk_params.get("max_volatility", 0.1)  # 기본값 10%
                         
                         if volatility > max_volatility:
                             logger.log_system(
-                                f"Risk check failed: High volatility for {symbol} - "
-                                f"Volatility: {volatility:.2%}, Limit: {max_volatility:.2%}"
+                                f"[변동성초과] {symbol} - 변동성 제한 초과: "
+                                f"현재={volatility:.2%}, 제한={max_volatility:.2%}"
                             )
                             return False
-                        logger.log_system(f"Volatility check passed for {symbol}: {volatility:.2%}")
+                        logger.log_system(f"[변동성체크] {symbol} 변동성: {volatility:.2%}")
                     else:
-                        logger.log_system(f"Insufficient price data for volatility check: {symbol}, using only {len(prices)} days")
+                        logger.log_system(f"[변동성체크] {symbol} 변동성 계산을 위한 충분한 데이터가 없습니다. (데이터 수: {len(prices)})")
                 else:
-                    logger.log_system(f"Could not retrieve price data for volatility check: {symbol}")
+                    logger.log_system(f"[변동성체크실패] {symbol} 가격 이력 조회 실패")
             except Exception as e:
+                logger.log_system(f"[변동성체크오류] {symbol} 변동성 체크 중 오류: {str(e)}")
                 logger.log_error(e, f"Error in volatility check for {symbol}")
                 # 변동성 체크 실패 시 경고만 하고 계속 진행
                 logger.log_system(f"Warning: Skipping volatility check for {symbol} due to error")
             
             # 거래량 체크
             try:
+                logger.log_system(f"[거래량체크] {symbol} 거래량 체크")
                 # run_in_executor를 사용하여 비동기적으로 동기 함수 호출
                 volume_data = await loop.run_in_executor(None, api_client.get_market_trading_volume)
                 
@@ -386,32 +408,33 @@ class OrderManager:
                     
                     if symbol_volume:
                         volume = int(symbol_volume.get("prdy_vrss_vol", 0))
-                        min_volume = getattr(self.trading_config, "min_daily_volume", 10000)  # 기본값 1만주
+                        min_volume = self.trading_config.risk_params.get("min_daily_volume", 10000)  # 기본값 1만주
                         
                         if volume < min_volume:
                             logger.log_system(
-                                f"Risk check failed: Low trading volume for {symbol} - "
-                                f"Volume: {volume:,}주, Minimum: {min_volume:,}주"
+                                f"[거래량부족] {symbol} - 거래량 부족: "
+                                f"현재={volume:,}주, 최소={min_volume:,}주"
                             )
                             return False
-                        logger.log_system(f"Volume check passed for {symbol}: {volume:,}주")
+                        logger.log_system(f"[거래량체크] {symbol} 거래량: {volume:,}주")
                     else:
-                        logger.log_system(f"Could not find volume data for {symbol} in market data")
+                        logger.log_system(f"[거래량체크실패] {symbol} 거래량 데이터를 찾을 수 없음")
                 else:
-                    logger.log_system(f"Could not retrieve market volume data for check: {symbol}")
+                    logger.log_system(f"[거래량체크실패] {symbol} 시장 거래량 데이터 조회 실패")
             except Exception as e:
+                logger.log_system(f"[거래량체크오류] {symbol} 거래량 체크 중 오류: {str(e)}")
                 logger.log_error(e, f"Error in volume check for {symbol}")
                 # 거래량 체크 실패 시 경고만 하고 계속 진행
                 logger.log_system(f"Warning: Skipping volume check for {symbol} due to error")
             
             # 모든 체크 통과
-            logger.log_system(f"All risk checks passed for {symbol}")
+            logger.log_system(f"[리스크체크] {symbol} 모든 리스크 체크 통과")
             return True
-            
         except Exception as e:
+            logger.log_system(f"[리스크체크오류] {symbol} 리스크 체크 중 예외 발생: {str(e)}")
             logger.log_error(e, f"Risk check error for {symbol}")
             return False
-            
+
     def _calculate_volatility(self, prices: List[float]) -> float:
         """변동성 계산"""
         if len(prices) < 2:
@@ -437,7 +460,10 @@ class OrderManager:
                     pnl_rate = (current_price - position["avg_price"]) / position["avg_price"]
                     
                     # 손절/익절 체크
-                    if pnl_rate <= -self.trading_config.max_loss_rate:
+                    max_loss_rate = self.trading_config.risk_params.get("max_loss_rate", 0.02)
+                    max_profit_rate = self.trading_config.scalping_params.get("take_profit", 0.015)
+                    
+                    if pnl_rate <= -max_loss_rate:
                         # 손절 (거래 중지 상태에서도 동작하도록 bypass_pause=True 설정)
                         result = await self.place_order(
                             symbol=symbol,
@@ -452,7 +478,7 @@ class OrderManager:
                         if result["status"] != "success":
                             logger.log_system(f"Stop loss failed for {symbol}: {result.get('reason', 'Unknown error')}")
                         
-                    elif pnl_rate >= self.trading_config.max_profit_rate:
+                    elif pnl_rate >= max_profit_rate:
                         # 익절 (거래 중지 상태에서도 동작하도록 bypass_pause=True 설정)
                         result = await self.place_order(
                             symbol=symbol,
