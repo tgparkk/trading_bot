@@ -68,18 +68,34 @@ class KISAPIClient:
         """접근 토큰 발급/갱신"""
         current_time = datetime.now().timestamp()
         
-        # 토큰이 있고 만료되지 않았으면 재사용
-        if self.access_token and self.token_expire_time:
-            # 만료 1시간 전까지는 기존 토큰 재사용 (더 여유 있게 설정)
-            if current_time < self.token_expire_time - 7200:  # 2시간(7200초) 전까지 재사용
-                logger.log_system(f"[토큰재사용] 기존 토큰이 유효하여 재사용합니다. (만료까지 {(self.token_expire_time - current_time)/3600:.1f}시간 남음)")
-                return self.access_token
+        # 토큰 재발급 임계값 (12시간 = 43200초)
+        # KIS 토큰은 24시간 유효하므로 12시간으로 설정
+        TOKEN_RENEWAL_THRESHOLD = 43200
+        
+        # 먼저 파일에서 토큰 정보 로드 시도
+        token_loaded = self.load_token_from_file()
+        
+        # 파일에서 토큰을 성공적으로 로드했고, 토큰이 유효한 경우
+        if token_loaded and self.access_token and self.token_expire_time:
+            # 만료까지 남은 시간
+            remaining_seconds = self.token_expire_time - current_time
+            remaining_hours = remaining_seconds / 3600
             
-            # 만료 2시간 전이면 토큰 갱신
-            logger.log_system(f"[토큰갱신] 토큰이 곧 만료되어 갱신합니다. (만료까지 {(self.token_expire_time - current_time)/3600:.1f}시간 남음)")
+            # 임계값 이상 시간이 남았으면 기존 토큰 재사용
+            if remaining_seconds > TOKEN_RENEWAL_THRESHOLD:
+                # 시간당 한번만 로깅하도록 제한
+                if int(remaining_hours) % 2 == 0 or remaining_hours < 1.0:
+                    logger.log_system(f"[토큰재사용] 기존 토큰이 유효하여 재사용합니다. (만료까지 {remaining_hours:.1f}시간 남음)")
+                return self.access_token
+            else:
+                # 만료 임계값 이하로 남았을 때만 갱신
+                logger.log_system(f"[토큰갱신] 토큰이 {remaining_hours:.1f}시간 후 만료 예정, 갱신합니다. (현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, 만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')})")
         else:
             # 토큰 발급/갱신 작업 로그
-            logger.log_system("[토큰없음] 새로운 KIS API 토큰 발급을 시작합니다...")
+            if not token_loaded:
+                logger.log_system("[토큰발급] 파일에서 유효한 토큰을 찾을 수 없어 새로운 토큰을 발급합니다...")
+            else:
+                logger.log_system("[토큰발급] 새로운 KIS API 토큰 발급을 시작합니다...")
         
         # 토큰 발급/갱신
         url = f"{self.base_url}/oauth2/tokenP"
@@ -183,46 +199,79 @@ class KISAPIClient:
             logger.log_error(e, "토큰 정보를 파일에 저장하는 중 오류 발생")
 
     def load_token_from_file(self):
-        """파일에서 토큰 정보 로드"""
+        """파일에서 토큰 정보 로드
+        
+        Returns:
+            bool: 토큰 로드 성공 여부 (True: 유효한 토큰 로드 성공, False: 실패)
+        """
+        # 토큰 재발급 임계값 (12시간 = 43200초)
+        # KIS 토큰은 24시간 유효하므로 12시간으로 설정
+        TOKEN_RENEWAL_THRESHOLD = 43200
+        
+        # 현재 시간 가져오기 (한 번만 계산)
+        current_time = datetime.now().timestamp()
+        
         try:
+            # 1. 파일 존재 여부 확인
             if not os.path.exists(TOKEN_FILE_PATH):
-                logger.log_system(f"토큰 파일이 존재하지 않습니다: {TOKEN_FILE_PATH}")
+                logger.log_debug(f"토큰 파일이 존재하지 않습니다: {TOKEN_FILE_PATH}")
                 return False
             
-            with open(TOKEN_FILE_PATH, 'r') as f:
-                token_info = json.load(f)
+            # 2. 파일 읽기 시도
+            try:
+                with open(TOKEN_FILE_PATH, 'r') as f:
+                    token_info = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError) as e:
+                logger.log_error(e, f"토큰 파일 데이터 파싱 오류: {TOKEN_FILE_PATH}")
+                return False
             
+            # 3. 토큰 정보 구조 확인
             if 'current' not in token_info or not token_info['current']:
-                logger.log_system("토큰 파일에 유효한 토큰 정보가 없습니다.")
+                logger.log_debug("토큰 파일에 'current' 필드가 없습니다")
                 return False
             
             current_token = token_info['current']
             
+            # 4. 필수 필드 확인
             if 'token' not in current_token or 'expire_time' not in current_token:
-                logger.log_system("토큰 파일에 필수 정보(토큰 또는 만료 시간)가 없습니다.")
+                logger.log_debug("토큰 파일에 필수 필드(token/expire_time)가 없습니다")
                 return False
             
+            # 5. 토큰 정보 로드
             self.access_token = current_token['token']
             self.token_expire_time = current_token['expire_time']
-            self.token_issue_time = current_token.get('issue_time')
+            self.token_issue_time = current_token['issue_time']
             
-            # 현재 시간과 만료 시간 비교하여 유효성 검사
-            current_time = datetime.now().timestamp()
-            
-            if current_time < self.token_expire_time:
-                hours_remaining = (self.token_expire_time - current_time) / 3600
-                logger.log_system(f"파일에서 유효한 토큰을 로드했습니다. 만료까지 {hours_remaining:.1f}시간 남음")
-                return True
-            else:
+            # 6. 토큰 유효성 검사
+            if current_time >= self.token_expire_time:
+                # 이미 만료된 토큰
                 expire_time_str = datetime.fromtimestamp(self.token_expire_time).strftime("%Y-%m-%d %H:%M:%S")
-                logger.log_system(f"파일에서 로드한 토큰이 만료되었습니다. 만료 시간: {expire_time_str}")
+                logger.log_debug(f"만료된 토큰이 발견됨. 만료 시간: {expire_time_str}")
                 self.access_token = None
                 self.token_expire_time = None
                 self.token_issue_time = None
                 return False
+            
+            # 7. 만료 임박성 검사 - 로그 수준 조절
+            hours_remaining = (self.token_expire_time - current_time) / 3600
+            time_remaining = self.token_expire_time - current_time
+            
+            # 만료 시간이 임계값 미만이면 경고 로그 출력
+            if time_remaining < TOKEN_RENEWAL_THRESHOLD:
+                logger.log_system(f"유효한 토큰이지만 만료까지 {hours_remaining:.1f}시간만 남았습니다. (임계값: {TOKEN_RENEWAL_THRESHOLD/3600:.1f}시간)")
+            else:
+                # 토큰이 유효하고 충분한 시간이 남은 경우 로그 최소화 (시간당 1번만 출력)
+                if int(hours_remaining) % 6 == 0 or hours_remaining < 1.0:
+                    logger.log_system(f"파일에서 유효한 토큰을 로드했습니다. 만료까지 {hours_remaining:.1f}시간 남음")
+            
+            return True
                 
         except Exception as e:
-            logger.log_error(e, "파일에서 토큰 정보를 로드하는 중 오류 발생")
+            logger.log_error(e, "파일에서 토큰 정보를 로드하는 중 예상치 못한 오류 발생")
+            # 오류 발생 시 토큰 정보 초기화
+            self.access_token = None
+            self.token_expire_time = None
+            self.token_issue_time = None
             return False
     
     async def _get_access_token_async(self):
@@ -233,22 +282,28 @@ class KISAPIClient:
             
             current_time = datetime.now().timestamp()
             
+            # 토큰 재발급 임계값 (12시간 = 43200초)
+            # KIS 토큰은 24시간 유효하므로 12시간으로 설정
+            TOKEN_RENEWAL_THRESHOLD = 43200
+            
             # 토큰이 있고 유효한지 확인
             if self.access_token and self.token_expire_time:
                 # 토큰 만료까지 남은 시간 계산 (시간 단위)
-                remaining_hours = (self.token_expire_time - current_time) / 3600
+                remaining_seconds = self.token_expire_time - current_time
+                remaining_hours = remaining_seconds / 3600
                 
-                # 만료 시간이 1시간 이상 남았으면 기존 토큰 사용
-                if current_time < self.token_expire_time - 3600:  # 1시간(3600초)으로 수정
-                    logger.log_system(f"[토큰재사용] 유효한 토큰이 있습니다. 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                     f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                     f"남은시간={remaining_hours:.1f}시간")
+                # 만료 시간이 임계값 이상 남았으면 기존 토큰 사용
+                if remaining_seconds > TOKEN_RENEWAL_THRESHOLD:
+                    # 디버깅 과도한 로깅 방지: 1시간마다 또는 30분 미만일 때만 로깅
+                    if int(remaining_hours) % 1 == 0 or remaining_hours < 0.5:
+                        logger.log_system(f"[토큰재사용] 유효한 토큰이 있습니다. 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                                         f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                                         f"남은시간={remaining_hours:.1f}시간")
                     return self.access_token
-                
-                # 만료 1시간 이내인 경우에만 갱신 시도
-                logger.log_system(f"[토큰갱신] 토큰 만료 1시간 이내, 갱신 필요: 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                 f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                 f"남은시간={remaining_hours:.1f}시간")
+                else:
+                    # 만료 임계값 이내인 경우에만 갱신 시도
+                    logger.log_system(f"[토큰갱신] 토큰 만료 {remaining_hours:.1f}시간 이내, 갱신 필요: 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                                     f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}")
             else:
                 # 파일에서 로드 시도 결과에 따라 다른 메시지 표시
                 if token_loaded:
@@ -257,8 +312,15 @@ class KISAPIClient:
                     logger.log_system("[토큰없음] 유효한 토큰이 없어 새로 발급합니다.")
             
             # 새 토큰 발급 필요
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self._get_access_token)
+            try:
+                logger.log_system("[토큰발급] 새 토큰 발급 시작...")
+                loop = asyncio.get_event_loop()
+                new_token = await loop.run_in_executor(None, self._get_access_token)
+                logger.log_system("[토큰발급] 새 토큰 발급 완료")
+                return new_token
+            except Exception as e:
+                logger.log_error(e, "[토큰발급] 새 토큰 발급 중 오류 발생")
+                raise
 
     async def is_token_valid(self, min_hours: float = 0.5) -> bool:
         """토큰이 유효한지 확인
@@ -269,36 +331,37 @@ class KISAPIClient:
         Returns:
             bool: 토큰 유효 여부 (True: 유효, False: 만료 또는 없음)
         """
-        async with self._token_lock:
-            # 먼저 파일에서 최신 토큰 정보 로드
-            self.load_token_from_file()
-            
-            # 토큰이 없으면 유효하지 않음
+        # 로직 쏘하 및 성능 향상을 위해 전체 lock을 추가하지 않음
+        # 경처 노드에서는 토큰 유효성만 확인하면 됨
+        try:
+            # 토큰이 없으면 유효하지 않음 - 파일 읽기 불필요
             if not self.access_token or not self.token_expire_time:
                 return False
                 
             # 토큰 만료 시간을 확인
-            try:
-                current_time = datetime.now().timestamp()
-                time_remaining = self.token_expire_time - current_time
-                
-                # 최소 유효 시간 이상 남았는지 확인
-                if time_remaining > (min_hours * 3600):
+            current_time = datetime.now().timestamp()
+            time_remaining = self.token_expire_time - current_time
+            
+            # 최소 유효 시간 이상 남았는지 확인
+            if time_remaining > (min_hours * 3600):
+                # 로그 수량 최소화 - 디버그 레벨에서만 프린트
+                # 파일/DB 접근 최소화를 위해 로그 우선순위 낮춤
+                if time_remaining < 7200:  # 2시간 이내로 남았을 때만 로그 출력
                     hours_remaining = time_remaining / 3600
                     logger.log_debug(f"토큰이 유효함. 만료까지 {hours_remaining:.1f}시간 남음")
-                    return True
-                
-                # 만료 시간이 min_hours 이내로 남았거나 이미 만료됨
-                if time_remaining <= 0:
-                    logger.log_debug("토큰이 만료됨")
-                else:
-                    minutes_remaining = time_remaining / 60
-                    logger.log_debug(f"토큰 만료가 임박함. {minutes_remaining:.1f}분 남음")
-                return False
-                
-            except Exception as e:
-                logger.log_error(e, "토큰 유효성 확인 중 오류 발생")
-                return False
+                return True
+            
+            # 만료 시간이 min_hours 이내로 남았거나 이미 만료됨
+            if time_remaining <= 0:
+                logger.log_system("토큰이 만료되어 새로 발급이 필요합니다.")
+            else:
+                minutes_remaining = time_remaining / 60
+                logger.log_system(f"토큰 만료가 임박합니다. {minutes_remaining:.1f}분 남음, 갱신 필요")
+            return False
+            
+        except Exception as e:
+            logger.log_error(e, "토큰 유효성 확인 중 오류 발생")
+            return False
 
     def check_token_status(self) -> Dict[str, Any]:
         """토큰 상태 확인"""
@@ -462,7 +525,7 @@ class KISAPIClient:
         url = f"{self.base_url}{path}"
         
         # 상수 정의
-        TOKEN_EXPIRY_BUFFER = 3600  # 1시간 (토큰 갱신 버퍼)
+        TOKEN_RENEWAL_THRESHOLD = 43200  # 12시간 (43200초)
         MAX_TOKEN_REFRESH_ATTEMPTS = 2
         REQUEST_TIMEOUT = 30  # 요청 타임아웃 (초)
         
@@ -472,11 +535,11 @@ class KISAPIClient:
         # 파일에서 최신 토큰 정보 로드
         self.load_token_from_file()
         
-        # 토큰이 있고 아직 유효한지 확인 (만료 1시간 전까지 유효)
+        # 토큰이 있고 아직 유효한지 확인 (만료 12시간 전까지 유효)
         token_valid = (
             self.access_token and 
             self.token_expire_time and 
-            current_time < self.token_expire_time - TOKEN_EXPIRY_BUFFER
+            current_time < self.token_expire_time - TOKEN_RENEWAL_THRESHOLD
         )
         
         # 토큰이 유효하지 않으면 새로 발급
@@ -654,7 +717,7 @@ class KISAPIClient:
         
         params = {
             "CANO": self.account_no[:8],
-            "ACNT_PRDT_CD": self.account_no[8:],
+            "ACNT_PRDT_CD": self.account_no[8:10],  # 정확히 2자리만 가져오기
             "AFHR_FLPR_YN": "N",
             "OFL_YN": "N",
             "INQR_DVSN": "02",
@@ -731,34 +794,43 @@ class KISAPIClient:
         
         # 매수/매도 구분 (모의투자/실거래 TR_ID 구분)
         if side.upper() == "BUY":
-            tr_id = "TTTC0012U" if not is_dev else "TTTC0012U"  # 매수 (모의투자:VTTC0012U / 실거래:TTTC0012U)
+            # 매수 (모의투자:VTTC0802U / 실거래:TTTC0802U)
+            tr_id = "TTTC0802U" if not is_dev else "VTTC0802U"  
         else:
-            tr_id = "TTTC0011U" if not is_dev else "TTTC0011U"  # 매도 (모의투자:VTTC0011U / 실거래:TTTC0011U)
-        
-        headers = {
-            "tr_id": tr_id,
-            "Content-Type": "application/json"
-        }
+            # 매도 (모의투자:VTTC0801U / 실거래:TTTC0801U)
+            tr_id = "TTTC0801U" if not is_dev else "VTTC0801U"  
         
         # 주문 유형 (00: 지정가, 01: 시장가)
         ord_dvsn = "01" if order_type.upper() == "MARKET" else "00"
         
+        # 요청 데이터 준비 - 모든 KEY는 대문자로 작성
         data = {
             "CANO": self.account_no[:8],
-            "ACNT_PRDT_CD": self.account_no[8:],
+            "ACNT_PRDT_CD": self.account_no[8:10],  # 정확히 2자리만 가져오기
             "PDNO": symbol,
             "ORD_DVSN": ord_dvsn,
-            "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(price) if ord_dvsn == "00" else "0",
+            "ORD_QTY": str(quantity),  # 숫자를 문자열로 변환
+            "ORD_UNPR": str(price) if ord_dvsn == "00" else "0",  # 숫자를 문자열로 변환
             "CTAC_TLNO": "", # 연락전화번호(널값 가능)
-            "SLL_TYPE": "00", # 매도유형(00: 고정값)
+            "SLL_TYPE": "01", # 매도유형(01: 일반매도, 02: 원의매매, 05: 대차매도)
             "ALGO_NO": ""     # 알고리즘 주문번호(선택값)
         }
         
-        # 해시키 생성
+        # 헤더 설정
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P"  # 개인
+        }
+        
+        # 해시키 생성 및 헤더에 추가
         hashkey = self._get_hashkey(data)
         headers["hashkey"] = hashkey
         
+        # API 요청 실행 - data를 JSON 문자열로 변환
         result = self._make_request("POST", path, headers=headers, data=data)
         
         # 주문 결과 로깅
@@ -796,13 +868,24 @@ class KISAPIClient:
     def cancel_order(self, order_id: str, symbol: str, quantity: int) -> Dict[str, Any]:
         """주문 취소"""
         path = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
-        headers = {
-            "tr_id": "TTTC0803U"  # 취소
-        }
         
+        # 모의투자 여부 확인
+        is_dev = False
+        try:
+            # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
+            test_mode_str = os.getenv("TEST_MODE", "False").strip()
+            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+            logger.log_system(f"주문 취소 - 모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        except Exception as e:
+            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
+        
+        # TR ID 설정 (모의투자:VTTC0803U / 실거래:TTTC0803U)
+        tr_id = "TTTC0803U" if not is_dev else "VTTC0803U"
+        
+        # 요청 데이터 준비 - 모든 KEY는 대문자로 작성
         data = {
             "CANO": self.account_no[:8],
-            "ACNT_PRDT_CD": self.account_no[8:],
+            "ACNT_PRDT_CD": self.account_no[8:10],  # 정확히 2자리만 가져오기
             "KRX_FWDG_ORD_ORGNO": "",  # 주문 시 받은 한국거래소전송주문조직번호
             "ORGN_ODNO": order_id,  # 원주문번호
             "ORD_DVSN": "00",  # 주문구분
@@ -812,10 +895,51 @@ class KISAPIClient:
             "QTY_ALL_ORD_YN": "Y"  # 전량주문여부
         }
         
+        # 헤더 설정
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P"  # 개인
+        }
+        
+        # 해시키 생성 및 헤더에 추가
         hashkey = self._get_hashkey(data)
         headers["hashkey"] = hashkey
         
-        return self._make_request("POST", path, headers=headers, data=data)
+        # API 요청 실행
+        result = self._make_request("POST", path, headers=headers, data=data)
+        
+        # 주문 취소 결과 로깅
+        if result.get("rt_cd") == "0":
+            logger.log_system(f"[💰 주문취소성공] 주문ID: {order_id} 취소 성공!")
+            logger.log_trade(
+                action="CANCEL_ORDER", 
+                symbol=symbol,
+                quantity=quantity,
+                order_id=order_id,
+                status="SUCCESS",
+                reason="API 주문 취소 성공"
+            )
+        else:
+            error_msg = result.get("msg1", "Unknown error")
+            logger.log_system(f"[🚸 주문취소실패] 주문ID: {order_id} 취소 실패 - 오류: {error_msg}")
+            logger.log_error(
+                Exception(f"Order cancellation failed: {error_msg}"),
+                f"Cancel order {order_id}"
+            )
+            logger.log_trade(
+                action="CANCEL_ORDER_FAILED",
+                symbol=symbol,
+                quantity=quantity,
+                order_id=order_id,
+                reason=f"API 주문 취소 실패: {error_msg}",
+                status="FAILED"
+            )
+        
+        return result
     
     def get_order_history(self, start_date: str = None, end_date: str = None) -> Dict[str, Any]:
         """주문 내역 조회"""
@@ -825,13 +949,32 @@ class KISAPIClient:
             end_date = datetime.now().strftime("%Y%m%d")
             
         path = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        
+        # 모의투자 여부 확인
+        is_dev = False
+        try:
+            # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
+            test_mode_str = os.getenv("TEST_MODE", "False").strip()
+            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+            logger.log_system(f"주문 내역 조회 - 모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
+        except Exception as e:
+            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
+        
+        # TR ID 설정 (모의투자:VTTC8001R / 실거래:TTTC8001R)
+        tr_id = "TTTC8001R" if not is_dev else "VTTC8001R"
+        
         headers = {
-            "tr_id": "TTTC8001R"  # 일별 주문체결 조회
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P"  # 개인
         }
         
         params = {
             "CANO": self.account_no[:8],
-            "ACNT_PRDT_CD": self.account_no[8:],
+            "ACNT_PRDT_CD": self.account_no[8:10],  # 정확히 2자리만 가져오기
             "INQR_STRT_DT": start_date,
             "INQR_END_DT": end_date,
             "SLL_BUY_DVSN_CD": "00",  # 전체
@@ -846,7 +989,26 @@ class KISAPIClient:
             "CTX_AREA_NK100": ""
         }
         
-        return self._make_request("GET", path, headers=headers, params=params)
+        try:
+            # API 요청 실행
+            result = self._make_request("GET", path, headers=headers, params=params)
+            
+            if result and result.get("rt_cd") == "0":
+                logger.log_system(f"주문 내역 조회 성공: {start_date}~{end_date}")
+            else:
+                error_msg = result.get("msg1", "알 수 없는 오류")
+                logger.log_system(f"주문 내역 조회 실패: {error_msg}")
+            
+            return result
+        except Exception as e:
+            logger.log_error(e, "주문 내역 조회 중 오류 발생")
+            return {
+                "rt_cd": "9999", 
+                "msg1": f"주문 내역 조회 실패: {str(e)}", 
+                "output": [],
+                "ctx_area_fk100": "",
+                "ctx_area_nk100": ""
+            }
     
     def get_stock_info(self, symbol: str) -> Dict[str, Any]:
         """종목 기본 정보 조회"""

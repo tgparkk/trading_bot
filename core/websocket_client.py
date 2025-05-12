@@ -519,10 +519,15 @@ class KISWebSocketClient:
             self.subscriptions = {}
             
             # 연결 시도
-            await self.connect()
+            connection_success = await self.connect()
             
+            # 연결에 실패한 경우 재시도 중단
+            if not connection_success:
+                logger.log_system("재연결 시도 실패, 다음 재시도를 준비합니다.")
+                return
+                
             # 연결에 성공했으면 기존 구독 복원 - 실패 시 신경 쓰지 않음
-            if self.is_connected() and self.auth_successful:
+            if self.is_connected():
                 logger.log_system("WebSocket reconnected. Restoring subscriptions...")
                 
                 # 복원 시 지연 시간 추가
@@ -677,7 +682,8 @@ class KISWebSocketClient:
     
     def is_connected(self) -> bool:
         """웹소켓 연결 상태 확인"""
-        return self.ws is not None and self.running
+        # 웹소켓 객체가 존재하고, running 상태이며, 인증이 성공적으로 완료되었는지 확인
+        return self.ws is not None and self.running and self.auth_successful
 
 # 싱글톤 인스턴스
 ws_client = KISWebSocketClient()

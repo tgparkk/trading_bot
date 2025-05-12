@@ -88,7 +88,14 @@ class TelegramBotHandler:
             '/help': self.get_help,
         }
         self.message_lock = asyncio.Lock()  # 메시지 전송 동시성 제어를 위한 락
-        
+    
+    def safe_float(self, value, default=0.0):
+        """문자열을 실수로 안전하게 변환"""
+        try:
+            return float(value) if value else default
+        except (ValueError, TypeError):
+            return default
+    
     def set_shutdown_callback(self, callback: Callable):
         """종료 콜백 설정"""
         self.shutdown_callback = callback
@@ -557,10 +564,10 @@ class TelegramBotHandler:
         if not stock_info:
             return f"❌ {symbol} 종목 정보를 찾을 수 없습니다."
             
-        current_price = stock_info.get("current_price", 0)
-        prev_close = stock_info.get("prev_close", 0)
-        change_rate = stock_info.get("change_rate", 0)
-        volume = stock_info.get("volume", 0)
+        current_price = self.safe_float(stock_info.get("current_price", 0), 0)
+        prev_close = self.safe_float(stock_info.get("prev_close", 0), 0)
+        change_rate = self.safe_float(stock_info.get("change_rate", 0), 0)
+        volume = self.safe_float(stock_info.get("volume", 0), 0)
         
         # 상승/하락 이모지
         emoji = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
@@ -570,7 +577,7 @@ class TelegramBotHandler:
 
 현재가: {current_price:,.0f}원 {emoji}
 전일대비: {change_rate:.2f}%
-거래량: {volume:,}주
+거래량: {int(volume):,}주
 """
 
     async def get_trades(self, args: List[str]) -> str:
@@ -605,9 +612,9 @@ class TelegramBotHandler:
             trade_date = trade.get("created_at", "").split(" ")[0]
             side = trade.get("side", "")
             symbol = trade.get("symbol", "")
-            price = trade.get("price", 0)
-            quantity = trade.get("quantity", 0)
-            pnl = trade.get("pnl", 0)
+            price = self.safe_float(trade.get("price", 0), 0)
+            quantity = self.safe_float(trade.get("quantity", 0), 0)
+            pnl = self.safe_float(trade.get("pnl", 0), 0)
             
             # 매수/매도에 따른 이모지 및 색상
             emoji = "🟢" if side == "BUY" else "🔴"
@@ -619,13 +626,13 @@ class TelegramBotHandler:
                 pnl_text = f" ({pnl_emoji} {pnl:,.0f}원)"
             
             # 한 거래에 대한 텍스트 생성
-            trade_info = f"{emoji} {trade_date} {trade_time} | {symbol} | {side} | {price:,.0f}원 x {quantity}주{pnl_text}\n"
+            trade_info = f"{emoji} {trade_date} {trade_time} | {symbol} | {side} | {price:,.0f}원 x {int(quantity)}주{pnl_text}\n"
             trades_text += trade_info
         
         # 요약 정보 계산
         buy_count = sum(1 for t in trades if t.get("side") == "BUY")
         sell_count = sum(1 for t in trades if t.get("side") == "SELL")
-        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades if t.get("side") == "SELL")
+        total_pnl = sum(self.safe_float(t.get("pnl", 0), 0) for t in trades if t.get("side") == "SELL")
         
         summary = f"매수: {buy_count}건, 매도: {sell_count}건, 손익: {total_pnl:,.0f}원"
         
@@ -639,14 +646,6 @@ class TelegramBotHandler:
     async def get_balance(self, args: List[str]) -> str:
         """계좌 잔고 조회"""
         try:
-            # 안전한 숫자 변환 함수 정의 (다른 메서드에서 참조할 수 있으므로 최상단에 위치)
-            def safe_float(value, default=0.0):
-                """문자열을 실수로 안전하게 변환"""
-                try:
-                    return float(value) if value else default
-                except (ValueError, TypeError):
-                    return default
-                    
             # 실제 API 호출 시도
             account_info = await api_client.get_account_info()
             
@@ -668,10 +667,10 @@ class TelegramBotHandler:
                 logger.log_system(f"output2 데이터 발견: {output2_data}")
             
             # 주요 계좌 데이터 로깅
-            if output_data:
-                logger.log_system(f"API 계좌 정보 output 키: {list(output_data.keys() if output_data else [])}")
-                logger.log_system(f"dnca_tot_amt: {output_data.get('dnca_tot_amt', 'N/A')}")
-                logger.log_system(f"tot_evlu_amt: {output_data.get('tot_evlu_amt', 'N/A')}")
+            #if output_data:
+            #    logger.log_system(f"API 계좌 정보 output 키: {list(output_data.keys() if output_data else [])}")
+            #    logger.log_system(f"dnca_tot_amt: {output_data.get('dnca_tot_amt', 'N/A')}")
+            #    logger.log_system(f"tot_evlu_amt: {output_data.get('tot_evlu_amt', 'N/A')}")
             
             if output2_data:
                 logger.log_system(f"output2 dnca_tot_amt: {output2_data.get('dnca_tot_amt', 'N/A')}")
@@ -689,14 +688,14 @@ class TelegramBotHandler:
                     return "💰 계좌 정보 (실시간)\n\n계좌 정보가 없습니다."
                 
                 # 계좌 잔고 정보 추출 (output 또는 output2에서)
-                deposit = safe_float(main_data.get("dnca_tot_amt") or cash_data.get("dnca_tot_amt", 0))  # 예수금
-                total_assets = safe_float(main_data.get("tot_evlu_amt", 0))  # 총 평가금액
-                securities = safe_float(main_data.get("scts_evlu_amt", 0))  # 유가증권 평가금액
-                today_profit = safe_float(main_data.get("thdt_evlu_pfls_amt", 0))  # 금일 평가손익
-                total_profit = safe_float(main_data.get("evlu_pfls_smtl_amt", 0))  # 평가손익 합계금액
+                deposit = self.safe_float(cash_data.get("dnca_tot_amt"))  # 예수금
+                total_assets = self.safe_float(cash_data.get("tot_evlu_amt", 0))  # 총 평가금액
+                securities = self.safe_float(cash_data.get("scts_evlu_amt", 0))  # 유가증권 평가금액
+                #today_profit = self.safe_float(cash_data.get("thdt_evlu_pfls_amt", 0))  # 금일 평가손익
+                #total_profit = cash_data.get("evlu_pfls_smtl_amt", 0)  # 평가손익 합계금액
                 
                 # 출금 가능 금액 (실시간으로 중요한 정보)
-                withdrawable_amount = safe_float(main_data.get("psbl_wtdrw_amt") or cash_data.get("prvs_rcdl_excc_amt", 0))
+                # withdrawable_amount = self.safe_float(main_data.get("psbl_wtdrw_amt") or cash_data.get("prvs_rcdl_excc_amt", 0))
                 
                 # 총 평가금액 정보가 없는 경우 예수금을 총 평가금액으로 설정
                 if total_assets == 0:
@@ -713,26 +712,26 @@ class TelegramBotHandler:
                 
                 message += f"예수금: {deposit:,.0f}원\n"
                 
-                if withdrawable_amount > 0:
-                    message += f"출금가능금액: {withdrawable_amount:,.0f}원\n"
+                #if withdrawable_amount > 0:
+                #    message += f"출금가능금액: {withdrawable_amount:,.0f}원\n"
                 
-                if today_profit != 0:
-                    message += f"금일 손익: {today_profit:,.0f}원\n"
+                #if today_profit != 0:
+                #    message += f"금일 손익: {today_profit:,.0f}원\n"
                 
-                if total_profit != 0:
-                    message += f"총 손익: {total_profit:,.0f}원"
+                #if total_profit != 0:
+                #    message += f"총 손익: {total_profit:,.0f}원"
                 
                 # 오늘 수익률 계산 시도
-                try:
-                    if securities > 0 and today_profit != 0:
-                        today_profit_rate = today_profit / (securities - today_profit) * 100
-                        message += f"\n금일 수익률: {today_profit_rate:.2f}%"
+                #try:
+                    #if securities > 0 and today_profit != 0:
+                    #    today_profit_rate = today_profit / (securities - today_profit) * 100
+                    #    message += f"\n금일 수익률: {today_profit_rate:.2f}%"
                     
-                    if securities > 0 and total_profit != 0:
-                        total_profit_rate = total_profit / (securities - total_profit) * 100
-                        message += f"\n총 수익률: {total_profit_rate:.2f}%"
-                except Exception as e:
-                    logger.log_system(f"수익률 계산 중 오류: {str(e)}")
+                    #if securities > 0 and total_profit != 0:
+                    #    total_profit_rate = total_profit / (securities - total_profit) * 100
+                    #    message += f"\n총 수익률: {total_profit_rate:.2f}%"
+                #except Exception as e:
+                #    logger.log_system(f"수익률 계산 중 오류: {str(e)}")
                 
                 return message
             else:
@@ -771,11 +770,11 @@ class TelegramBotHandler:
             sell_trades = sum(1 for t in trades if t.get("side") == "SELL")
             
             # 수익/손실 계산
-            total_pnl = sum(t.get("pnl", 0) or 0 for t in trades if t.get("side") == "SELL")
+            total_pnl = sum(self.safe_float(t.get("pnl", 0), 0) for t in trades if t.get("side") == "SELL")
             
             # 승률 계산
-            win_trades = sum(1 for t in trades if t.get("side") == "SELL" and (t.get("pnl", 0) or 0) > 0)
-            loss_trades = sum(1 for t in trades if t.get("side") == "SELL" and (t.get("pnl", 0) or 0) < 0)
+            win_trades = sum(1 for t in trades if t.get("side") == "SELL" and self.safe_float(t.get("pnl", 0), 0) > 0)
+            loss_trades = sum(1 for t in trades if t.get("side") == "SELL" and self.safe_float(t.get("pnl", 0), 0) < 0)
             
             win_rate = win_trades / sell_trades * 100 if sell_trades > 0 else 0
             
@@ -865,16 +864,16 @@ class TelegramBotHandler:
             for idx, symbol_info in enumerate(top_volume_symbols, 1):
                 symbol = symbol_info.get("symbol", "N/A")
                 name = symbol_info.get("name", "N/A")
-                volume = symbol_info.get("volume", 0)
-                price = symbol_info.get("current_price", 0)
-                change_rate = symbol_info.get("change_rate", 0)
+                volume = self.safe_float(symbol_info.get("volume", 0), 0)
+                price = self.safe_float(symbol_info.get("current_price", 0), 0)
+                change_rate = self.safe_float(symbol_info.get("change_rate", 0), 0)
                 
                 # 상승/하락 이모지
                 emoji = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
                 
                 # 한 종목에 대한 텍스트
                 symbols_text += f"{idx}. <b>{name}</b> ({symbol}) - {emoji} {change_rate:.2f}%\n"
-                symbols_text += f"   가격: {price:,.0f}원 | 거래량: {volume:,}주\n\n"
+                symbols_text += f"   가격: {price:,.0f}원 | 거래량: {int(volume):,}주\n\n"
             
             # 결과 메시지 구성 
             result = f"""📊 <b>거래량 상위 종목 스캔 결과</b>{f' ({market})' if market else ''}
@@ -972,18 +971,32 @@ class TelegramBotHandler:
                 balance_value = 0
                 if account_info and account_info.get("rt_cd") == "0":
                     balance_str = account_info.get("output", {}).get("dnca_tot_amt", "0")
-                    if balance_str and balance_str != "N/A":
-                        balance_value = float(balance_str)
+                    balance_value = self.safe_float(balance_str, 0)
                 balance = f"{int(balance_value):,}"
-            except (ValueError, TypeError):
-                logger.log_error(Exception("잔고 정보 변환 오류"), "잔고 정보를 숫자로 변환하는 중 오류 발생")
+            except Exception as e:
+                logger.log_error(e, "잔고 정보 변환 오류")
                 balance = "0"
             
             # API 상태
             api_status = "🟢 정상" if await api_client.is_token_valid() else "🔴 오류"
             
-            # 웹소켓 상태
+            # 웹소켓 상태 확인 및 연결 시도
             from core.websocket_client import ws_client
+            
+            # 웹소켓이 연결되어 있지 않으면 연결 시도
+            if not ws_client.is_connected():
+                logger.log_system("웹소켓 연결이 끊어져 있어 재연결 시도합니다.")
+                try:
+                    # 비동기 연결 시도
+                    connect_success = await ws_client.connect()
+                    if connect_success:
+                        logger.log_system("웹소켓 재연결 성공")
+                    else:
+                        logger.log_system("웹소켓 재연결 실패", level="WARNING")
+                except Exception as e:
+                    logger.log_error(e, "웹소켓 재연결 중 오류 발생")
+            
+            # 연결 상태 확인
             ws_status = "🟢 연결됨" if ws_client.is_connected() else "🔴 끊김"
             
             # 실행 시간
@@ -1027,7 +1040,7 @@ class TelegramBotHandler:
         price = 0  # 시장가 주문
         if len(args) >= 3:
             try:
-                price = float(args[2])
+                price = self.safe_float(args[2], 0)
             except ValueError:
                 return "❌ 올바른 가격을 입력하세요."
         
@@ -1036,7 +1049,7 @@ class TelegramBotHandler:
             try:
                 stock_info = await stock_explorer.get_symbol_info(symbol)
                 if stock_info:
-                    price = stock_info.get("current_price", 0)
+                    price = self.safe_float(stock_info.get("current_price", 0), 0)
             except Exception as e:
                 logger.log_error(e, f"현재가 조회 실패: {symbol}")
         
@@ -1061,7 +1074,7 @@ class TelegramBotHandler:
 타입: {order_type}
 주문번호: {order_id}"""
         else:
-            error = result.get("message", "알 수 없는 오류") if result else "주문 실패"
+            error = result.get("reason", "알 수 없는 오류") if result else "주문 실패"
             return f"❌ <b>매수 주문 실패</b>\n{error}"
     
     async def sell_stock(self, args: List[str]) -> str:
@@ -1081,7 +1094,7 @@ class TelegramBotHandler:
         price = 0  # 시장가 주문
         if len(args) >= 3:
             try:
-                price = float(args[2])
+                price = self.safe_float(args[2], 0)
             except ValueError:
                 return "❌ 올바른 가격을 입력하세요."
         
@@ -1090,7 +1103,7 @@ class TelegramBotHandler:
             try:
                 stock_info = await stock_explorer.get_symbol_info(symbol)
                 if stock_info:
-                    price = stock_info.get("current_price", 0)
+                    price = self.safe_float(stock_info.get("current_price", 0), 0)
             except Exception as e:
                 logger.log_error(e, f"현재가 조회 실패: {symbol}")
         
@@ -1115,7 +1128,7 @@ class TelegramBotHandler:
 타입: {order_type}
 주문번호: {order_id}"""
         else:
-            error = result.get("message", "알 수 없는 오류") if result else "주문 실패"
+            error = result.get("reason", "알 수 없는 오류") if result else "주문 실패"
             return f"❌ <b>매도 주문 실패</b>\n{error}"
     
     async def get_positions(self, args: List[str]) -> str:
@@ -1130,16 +1143,16 @@ class TelegramBotHandler:
         
         for pos in positions:
             symbol = pos.get("symbol", "N/A")
-            quantity = pos.get("quantity", 0)
-            avg_price = pos.get("avg_price", 0)
-            current_price = pos.get("current_price", 0)
+            quantity = self.safe_float(pos.get("quantity", 0), 0)
+            avg_price = self.safe_float(pos.get("avg_price", 0), 0)
+            current_price = self.safe_float(pos.get("current_price", 0), 0)
             
             # 현재가가 없으면 API에서 조회
             if current_price == 0:
                 try:
                     stock_info = await stock_explorer.get_symbol_info(symbol)
                     if stock_info:
-                        current_price = stock_info.get("current_price", 0)
+                        current_price = self.safe_float(stock_info.get("current_price", 0), 0)
                 except Exception:
                     pass
             
@@ -1164,9 +1177,9 @@ class TelegramBotHandler:
             except Exception:
                 pass
             
-            positions_text += f"{profit_emoji} <b>{symbol}</b> - {stock_name}\\n"
-            positions_text += f"   {quantity}주 | {avg_price:,.0f}원 → {current_price:,.0f}원 | {profit_pct:.2f}%\\n"
-            positions_text += f"   가치: {position_value:,.0f}원\\n\\n"
+            positions_text += f"{profit_emoji} <b>{symbol}</b> - {stock_name}\n"
+            positions_text += f"   {int(quantity)}주 | {avg_price:,.0f}원 → {current_price:,.0f}원 | {profit_pct:.2f}%\n"
+            positions_text += f"   가치: {position_value:,.0f}원\n\n"
         
         return f"""📊 <b>보유 종목 현황</b>
 
