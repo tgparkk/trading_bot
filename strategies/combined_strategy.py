@@ -1193,7 +1193,7 @@ class CombinedStrategy:
             logger.log_error(e, f"Combined exit error for position {position_id}")
     
     def get_strategy_status(self, symbol: str = None) -> Dict:
-        """전략 상태 정보 반환"""
+        """전략 상태 정보 반환 - 항상 최신 신호 계산"""
         try:
             result = {
                 "running": self.running,
@@ -1206,9 +1206,9 @@ class CombinedStrategy:
             
             # 포지션 정보
             for pos_id, pos in self.positions.items():
-                symbol = pos["symbol"]
+                pos_symbol = pos["symbol"]
                 result["position_details"][pos_id] = {
-                    "symbol": symbol,
+                    "symbol": pos_symbol,
                     "side": pos["side"],
                     "entry_price": pos["entry_price"],
                     "stop_price": pos["stop_price"],
@@ -1217,20 +1217,76 @@ class CombinedStrategy:
                     "hold_time": (datetime.now() - pos["entry_time"]).total_seconds() / 60
                 }
             
-            # 특정 심볼에 대한 상세 정보 요청인 경우
-            if symbol and symbol in self.signals:
+            # 특정 심볼에 대한 상세 정보 요청인 경우 - 강제 업데이트
+            if symbol:
+                logger.log_system(f"[전략] get_strategy_status - {symbol} 신호 강제 업데이트 시작")
+                
+                # 비동기 함수를 동기적으로 실행하기 위한 이벤트 루프 얻기
+                try:
+                    # 현재 이벤트 루프 가져오기 시도
+                    loop = asyncio.get_event_loop()
+                    
+                    # 루프가 실행중인지 확인
+                    if loop.is_running():
+                        # 이미 실행 중인 루프에서는 Future를 생성하여 실행
+                        future = asyncio.run_coroutine_threadsafe(self._update_signals(symbol), loop)
+                        future.result(timeout=2.0)  # 2초 타임아웃 설정
+                        logger.log_system(f"[전략] {symbol} - run_coroutine_threadsafe로 신호 업데이트 완료")
+                    else:
+                        # 루프가 실행 중이 아니라면 직접 실행
+                        loop.run_until_complete(self._update_signals(symbol))
+                        logger.log_system(f"[전략] {symbol} - run_until_complete로 신호 업데이트 완료")
+                except Exception as loop_error:
+                    logger.log_error(loop_error, f"[전략] {symbol} - 이벤트 루프 처리 중 오류, 신호 업데이트 실패")
+                    # 이벤트 루프 오류가 발생해도 저장된 신호 데이터는 반환
+                
+                # 개별 전략 신호 (없으면 초기화)
+                if symbol not in self.signals:
+                    self.signals[symbol] = {
+                        'score': 0,
+                        'direction': "NEUTRAL",
+                        'strategies': {
+                            'breakout': {'signal': 0, 'direction': "NEUTRAL"},
+                            'momentum': {'signal': 0, 'direction': "NEUTRAL"},
+                            'gap': {'signal': 0, 'direction': "NEUTRAL"},
+                            'vwap': {'signal': 0, 'direction': "NEUTRAL"},
+                            'volume': {'signal': 0, 'direction': "NEUTRAL"}
+                        },
+                        'last_update': datetime.now()
+                    }
+                
+                # 통합 신호 다시 계산 (자체 타이머에 기능 제한 가능성이 있으므로 명시적 계산)
+                score, direction, agreements = self._calculate_combined_signal(symbol)
+                
+                # 통합 신호 결과 업데이트
+                self.signals[symbol]["combined_signal"] = score
+                self.signals[symbol]["score"] = score  # score 키 추가
+                self.signals[symbol]["direction"] = direction
+                self.signals[symbol]["agreements"] = agreements
+                self.signals[symbol]["last_update"] = datetime.now()
+                
+                logger.log_system(f"[전략] get_strategy_status - {symbol} 통합 신호 재계산 완료: 점수={score:.1f}, 방향={direction}")
+                
+                # 새로 계산된 결과 반환을 위해 설정
                 result["signals"][symbol] = {
-                    "score": self.signals[symbol]["score"],
-                    "direction": self.signals[symbol]["direction"],
-                    "agreements": self.signals[symbol].get("agreements", {}),
+                    "score": score,
+                    "direction": direction,
+                    "agreements": agreements,
                     "strategies": self.signals[symbol]["strategies"]
                 }
-            # 아니면 모든 심볼의 요약 정보
+                
+            # 아니면 모든 심볼의 요약 정보 (저장된 데이터 기반)
             elif not symbol:
                 for sym in self.watched_symbols:
                     if sym in self.signals:
+                        # "score" 키가 없는 경우 "combined_signal" 값 사용
+                        if "score" in self.signals[sym]:
+                            score_value = self.signals[sym]["score"]
+                        else:
+                            score_value = self.signals[sym].get("combined_signal", 0)
+                            
                         result["signals"][sym] = {
-                            "score": self.signals[sym]["score"],
+                            "score": score_value,
                             "direction": self.signals[sym]["direction"],
                             "agreements": self.signals[sym].get("agreements", {})
                         }

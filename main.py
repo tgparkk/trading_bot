@@ -218,12 +218,69 @@ class TradingBot:
                                                     # 실제 수익률 계산 (API 응답과 일치여부 확인)
                                                     calc_profit_rate = ((current_price / avg_price) - 1) * 100
                                                     
-                                                    logger.log_system(f"[익절 예정] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
+                                                    logger.log_system(f"[익절 확인] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
                                                                     f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
                                                     
-                                                    # 2% 이상 수익률 확인 후 매도 주문
-                                                    if calc_profit_rate >= 2.0 or current_profit_rate >= 2.0:
-                                                        logger.log_system(f"[익절 주문] {symbol} 매도 실행: 수량={qty}주, 가격={current_price:,.0f}원")
+                                                    # 전략 신호 확인 (개선된 익절 로직)
+                                                    should_sell = False
+                                                    sell_reason = "2% 익절 자동 매도"
+                                                    force_sell = False
+                                                    
+                                                    # 1. 고수익 안전장치 - 5% 이상이면 무조건 매도
+                                                    if calc_profit_rate >= 5.0 or current_profit_rate >= 5.0:
+                                                        should_sell = True
+                                                        force_sell = True
+                                                        sell_reason = "5% 이상 고수익 확정 매도"
+                                                        logger.log_system(f"[전략 무관 매도] {symbol}: 5% 이상 고수익으로 전략 신호와 관계없이 매도")
+                                                    
+                                                    # 2. 손익률 기본 검증 - 최소 2% 이상
+                                                    if (calc_profit_rate >= 2.0 or current_profit_rate >= 2.0) and not force_sell:
+                                                        # 3. 전략 신호 확인
+                                                        try:
+                                                            logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
+                                                            strategy_status = combined_strategy.get_strategy_status(symbol)
+                                                            
+                                                            if "signals" in strategy_status and symbol in strategy_status["signals"]:
+                                                                signal_info = strategy_status["signals"][symbol]
+                                                                signal_direction = signal_info.get("direction", "NEUTRAL")
+                                                                signal_score = signal_info.get("score", 0)
+                                                                
+                                                                logger.log_system(f"[전략 결과] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
+                                                                
+                                                                # 전략 신호에 따른 매도 결정
+                                                                if signal_direction == "SELL":
+                                                                    # 매도 신호가 있으면 매도
+                                                                    should_sell = True
+                                                                    sell_reason = f"전략 매도 신호에 따른 익절 (점수: {signal_score:.1f})"
+                                                                    logger.log_system(f"[전략 매도] {symbol}: 매도 신호로 익절")
+                                                                elif signal_direction == "NEUTRAL":
+                                                                    # 중립 신호이고 2% 이상이면 매도
+                                                                    should_sell = True
+                                                                    sell_reason = "중립 신호 상태에서 2% 익절"
+                                                                    logger.log_system(f"[전략 매도] {symbol}: 중립 신호 + 2% 이상으로 익절")
+                                                                elif signal_direction == "BUY":
+                                                                    # 매수 신호면 3.5% 미만일 경우 홀딩 (3.5% 이상이면 매도)
+                                                                    if calc_profit_rate >= 3.5 or current_profit_rate >= 3.5:
+                                                                        should_sell = True
+                                                                        sell_reason = f"매수 신호지만 3.5% 이상 수익 확정 (전략 점수: {signal_score:.1f})"
+                                                                        logger.log_system(f"[전략 매도] {symbol}: 매수 신호지만 3.5% 이상 수익으로 매도")
+                                                                    else:
+                                                                        logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
+                                                            else:
+                                                                # 신호 데이터가 없으면 기본 익절 (안전 장치)
+                                                                should_sell = True
+                                                                sell_reason = "전략 데이터 없음, 2% 익절 진행"
+                                                                logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 기본 익절")
+                                                                
+                                                        except Exception as strategy_error:
+                                                            # 전략 오류 시 기본 익절 진행 (안전 장치)
+                                                            logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
+                                                            should_sell = True
+                                                            sell_reason = "전략 확인 오류, 2% 익절 진행"
+                                                    
+                                                    # 매도 실행 결정되었으면 주문 진행
+                                                    if should_sell:
+                                                        logger.log_system(f"[익절 주문] {symbol} 매도 실행: 수량={qty}주, 가격={current_price:,.0f}원, 사유={sell_reason}")
                                                         
                                                         # 매도 주문 실행
                                                         try:
@@ -235,7 +292,7 @@ class TradingBot:
                                                                     price=current_price,
                                                                     order_type="MARKET",
                                                                     strategy="main_bot",
-                                                                    reason="profit_take_2pct"
+                                                                    reason=sell_reason.replace(" ", "_").lower()
                                                                 ),
                                                                 timeout=5.0
                                                             )
@@ -250,7 +307,7 @@ class TradingBot:
                                                                     symbol=symbol,
                                                                     price=current_price,
                                                                     quantity=qty,
-                                                                    reason="2% 익절 자동 매도",
+                                                                    reason=sell_reason,
                                                                     strategy="main_bot",
                                                                     profit_rate=f"{calc_profit_rate:.2f}%",
                                                                     time=datetime.now().strftime("%H:%M:%S"),
@@ -263,7 +320,10 @@ class TradingBot:
                                                         except Exception as order_error:
                                                             logger.log_error(order_error, f"{symbol} 익절 주문 처리 중 오류")
                                                     else:
-                                                        logger.log_system(f"[익절 패스] {symbol}: API 손익률과 계산 손익률이 모두 2% 미만입니다.")
+                                                        logger.log_system(f"[익절 보류] {symbol}: 전략 신호에 따라 매도하지 않고 계속 보유")
+                                                        
+                                                else:
+                                                    logger.log_system(f"[익절 패스] {symbol}: API 손익률과 계산 손익률이 모두 2% 미만입니다.")
                                             else:
                                                 logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
                                                 
