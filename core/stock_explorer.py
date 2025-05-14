@@ -229,7 +229,7 @@ class StockExplorer:
                 if "output" in info:
                     output = info["output"]
                     # 가능한 이름 필드들을 순서대로 확인
-                    for field in ["hts_kor_isnm", "prdt_name", "stck_prdt_name", "kor_name", "name"]:
+                    for field in ["hts_kor_isnm", "prdt_name", "stck_prdt_name", "kor_name", "name", "rprs_mrkt_kor_name"]:
                         if field in output:
                             name = output[field]
                             name_field = field

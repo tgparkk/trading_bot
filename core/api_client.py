@@ -1362,20 +1362,69 @@ class KISAPIClient:
             response.raise_for_status()
             data = response.json()
             
+            # API 응답 로깅 (디버그용)
+            if data.get("rt_cd") != "0":
+                logger.log_system(f"[API] {symbol} 종목 정보 조회 실패 - 응답 코드: {data.get('rt_cd')}, 메시지: {data.get('msg1')}")
+                raise Exception(f"API 응답 실패: {data.get('msg1', '알 수 없는 오류')}")
+            
+            # output 필드 존재 여부 확인
+            if "output" not in data:
+                logger.log_system(f"[API] {symbol} 응답에 'output' 필드가 없습니다. 응답 키: {list(data.keys())}")
+                raise Exception(f"API 응답에 'output' 필드가 없습니다")
+            
+            # output 구조 로깅 (처음 한 번만)
+            output = data["output"]
+            logger.log_system(f"[API] {symbol} output 필드 목록: {list(output.keys())}")
+            
             if data["rt_cd"] == "0":
+                
+                # 필수 필드 안전하게 추출
+                try:
+                    rprs_mrkt_kor_name = output.get("rprs_mrkt_kor_name", "Unknown")
+                    current_price = float(output.get("stck_prpr", "0"))  # 주식 현재가
+                    open_price = float(output.get("stck_oprc", "0"))     # 주식 시가
+                    high_price = float(output.get("stck_hgpr", "0"))     # 주식 고가
+                    low_price = float(output.get("stck_lwpr", "0"))      # 주식 저가
+                    prev_close = float(output.get("stck_sdpr", "0"))     # 전일 종가
+                    volume = int(output.get("acml_vol", "0"))            # 누적 거래량
+                    change_rate = float(output.get("prdy_ctrt", "0"))    # 전일 대비 변동율
+                except (ValueError, TypeError) as e:
+                    logger.log_error(e, f"[API] {symbol} 가격 데이터 변환 오류")
+                    # 오류 정보 자세히 기록
+                    for field_name, field_value in [
+                        ("rprs_mrkt_kor_name", output.get("rprs_mrkt_kor_name")),
+                        ("stck_prpr", output.get("stck_prpr")),
+                        ("stck_oprc", output.get("stck_oprc")),
+                        ("stck_hgpr", output.get("stck_hgpr")),
+                        ("stck_lwpr", output.get("stck_lwpr")),
+                        ("stck_sdpr", output.get("stck_sdpr")),
+                        ("acml_vol", output.get("acml_vol")),
+                        ("prdy_ctrt", output.get("prdy_ctrt"))
+                    ]:
+                        logger.log_system(f"[API] {field_name}: {field_value} (타입: {type(field_value)})")
+                    
+                    # 기본값 설정
+                    current_price = 0
+                    open_price = 0
+                    high_price = 0
+                    low_price = 0
+                    prev_close = 0
+                    volume = 0
+                    change_rate = 0
+                
                 result = {
                     "symbol": symbol,
-                    "name": data["output"]["hts_kor_isnm"],
-                    "current_price": float(data["output"]["stck_prpr"]),  # 현재가
-                    "open_price": float(data["output"]["stck_oprc"]),     # 시가
-                    "high_price": float(data["output"]["stck_hgpr"]),     # 고가
-                    "low_price": float(data["output"]["stck_lwpr"]),      # 저가
-                    "prev_close": float(data["output"]["stck_sdpr"]),     # 전일 종가
-                    "volume": int(data["output"]["acml_vol"]),            # 누적 거래량
-                    "change_rate": float(data["output"]["prdy_ctrt"]),    # 전일 대비 변동율
+                    "name": rprs_mrkt_kor_name,
+                    "current_price": current_price,
+                    "open_price": open_price,
+                    "high_price": high_price,
+                    "low_price": low_price,
+                    "prev_close": prev_close,
+                    "volume": volume,
+                    "change_rate": change_rate,
                     "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                logger.log_system(f"[API] {symbol} 종목 정보 조회 성공: 현재가 {result['current_price']:,}원")
+                logger.log_system(f"[API] {symbol} 종목 정보 조회 성공: 종목명 '{rprs_mrkt_kor_name}', 현재가 {current_price:,}원")
                 return result
             else:
                 error_msg = data.get("msg1", "알 수 없는 오류")
@@ -1385,6 +1434,12 @@ class KISAPIClient:
         except requests.Timeout:
             logger.log_system(f"[API] {symbol} 종목 정보 조회 타임아웃 발생 (3초)")
             raise
+        except requests.RequestException as e:
+            logger.log_error(e, f"[API] {symbol} 종목 정보 조회 요청 오류")
+            raise Exception(f"API 요청 오류: {str(e)}")
+        except KeyError as e:
+            logger.log_error(e, f"[API] {symbol} 종목 정보 필수 필드 누락")
+            raise Exception(f"필수 필드 누락: {str(e)}")
         except Exception as e:
             logger.log_error(e, f"[API] {symbol} 종목 정보 조회 중 오류 발생")
             raise
