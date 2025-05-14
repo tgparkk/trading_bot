@@ -639,13 +639,32 @@ class VWAPStrategy:
     async def get_signal(self, symbol: str) -> Dict[str, Any]:
         """전략 신호 반환 (combined_strategy에서 호출)"""
         try:
+            # 종목 데이터가 없으면 초기화
+            if symbol not in self.price_data:
+                self.price_data[symbol] = deque(maxlen=2000)
+                logger.log_system(f"VWAP 전략: {symbol} 가격 데이터 구조 초기화됨")
+                
+            if symbol not in self.vwap_data:
+                self.vwap_data[symbol] = {
+                    'vwap': None,
+                    'upper_band': None,
+                    'lower_band': None,
+                    'std_dev': None,
+                    'cumulative_volume': 0,
+                    'cumulative_volume_price': 0,
+                    'price_volume_squared': 0,
+                    'last_calculation_time': None
+                }
+                logger.log_system(f"VWAP 전략: {symbol} VWAP 데이터 구조 초기화됨")
+            
             # VWAP 데이터가 없으면 초기화
-            if symbol not in self.vwap_data or self.vwap_data[symbol].get('vwap') is None:
+            if self.vwap_data[symbol].get('vwap') is None:
                 # 적극적인 초기화 시도
                 await self._load_initial_data(symbol)
                 
                 # 초기화 후에도 데이터가 없으면 임시 VWAP 설정 (빠른 초기화용)
-                if symbol in self.price_data and len(self.price_data[symbol]) > 0 and self.vwap_data[symbol].get('vwap') is None:
+                if (symbol in self.price_data and len(self.price_data[symbol]) > 0 and 
+                    symbol in self.vwap_data and self.vwap_data[symbol].get('vwap') is None):
                     current_price = self.price_data[symbol][-1]["price"]
                     if current_price > 0:
                         # 임시 VWAP 데이터 설정

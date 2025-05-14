@@ -99,16 +99,29 @@ class TradingBot:
                 else:
                     logger.log_warning(f"전략 {name}: None")
             
-            # 웹소켓 연결 - 재시도 추가
+            # 웹소켓 연결 - 개선된 재시도 로직
             websocket_connected = False
             retry_count = 0
+            
+            # API 서버가 준비되었는지 확인하기 위해 잠시 대기
+            logger.log_system("API 서버 준비 확인을 위해 3초 대기...")
+            await asyncio.sleep(3)
             
             while not websocket_connected and retry_count < self.max_retries:
                 retry_count += 1
                 try:
                     logger.log_system(f"웹소켓 연결 시도... ({retry_count}/{self.max_retries})")
+                    
+                    # 웹소켓 클라이언트 상태 초기화 확인
+                    if ws_client.ws is not None or ws_client.is_connected():
+                        logger.log_system("기존 웹소켓 연결 자원 정리...")
+                        await ws_client.close()
+                        await asyncio.sleep(2)  # 자원 정리를 위한 대기
+                    
+                    # 접속 시도
                     connection_success = await ws_client.connect()
                     websocket_connected = ws_client.is_connected()
+                    
                     if websocket_connected:
                         logger.log_system("웹소켓 연결 성공!")
                         break
@@ -118,8 +131,8 @@ class TradingBot:
                     logger.log_error(e, f"웹소켓 연결 실패 ({retry_count}/{self.max_retries})")
                 
                 if retry_count < self.max_retries:
-                    # 재시도 간격을 지수적으로 증가 (1초, 2초, 4초, ...)
-                    wait_time = 2 ** (retry_count - 1)
+                    # 재시도 간격을 증가
+                    wait_time = 5 * retry_count  # 선형적 증가 (5초, 10초, 15초...)
                     logger.log_system(f"웹소켓 재연결 {wait_time}초 후 재시도...")
                     await asyncio.sleep(wait_time)
             
@@ -922,12 +935,33 @@ async def _setup_telegram_bot():
     
     # 텔레그램 봇 준비 대기
     try:
-        logger.log_system("텔레그램 봇 핸들러 준비 대기 시작...")
-        await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=30)
-        logger.log_system("텔레그램 봇 핸들러 준비 완료!")
+        # 현재 루프 기록
+        current_loop = asyncio.get_running_loop()
+        logger.log_system(f"main.py 이벤트 루프 ID: {id(current_loop)}")
         
-        # 프로그램 시작 알림 전송
-        await _send_startup_notification()
+        # 이벤트가 생성되었는지 최대 5초 대기
+        wait_start = datetime.now()
+        while telegram_bot_handler.ready_event is None:
+            # 대기 시간이 5초를 넘으면 중단
+            if (datetime.now() - wait_start).total_seconds() > 5:
+                logger.log_error(Exception("Timeout waiting for ready_event creation"), 
+                              "텔레그램 봇 ready_event 생성 대기 타임아웃")
+                break
+            logger.log_system("텔레그램 봇 ready_event 생성 대기 중...")
+            await asyncio.sleep(0.5)
+        
+        # 이벤트가 생성되었으면 시그널 대기
+        if telegram_bot_handler.ready_event is not None:
+            logger.log_system("텔레그램 봇 핸들러 준비 대기 시작...")
+            await asyncio.wait_for(telegram_bot_handler.ready_event.wait(), timeout=30)
+            logger.log_system("텔레그램 봇 핸들러 준비 완료!")
+            
+            # 프로그램 시작 알림 전송
+            await _send_startup_notification()
+        else:
+            logger.log_error(Exception("ready_event not created"), 
+                          "텔레그램 봇 ready_event가 생성되지 않음")
+            
     except asyncio.TimeoutError:
         logger.log_error(Exception("텔레그램 봇 준비 시간 초과"), "텔레그램 봇 준비 타임아웃, 그래도 프로그램 계속 실행")
     except Exception as e:

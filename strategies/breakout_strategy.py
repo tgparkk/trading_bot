@@ -211,6 +211,17 @@ class BreakoutStrategy:
         try:
             if self.initialization_complete.get(symbol, False):
                 return
+            
+            # 종목 데이터가 없으면 초기화
+            if symbol not in self.breakout_levels:
+                self.breakout_levels[symbol] = {
+                    'init_high': None,
+                    'init_low': None,
+                    'high_level': None,
+                    'low_level': None,
+                    'range': None
+                }
+                logger.log_system(f"Breakout 전략: {symbol} 종목 데이터 구조 초기화됨")
                 
             breakout_data = self.breakout_levels[symbol]
             
@@ -302,13 +313,30 @@ class BreakoutStrategy:
             # 전략이 일시 중지 상태인지 확인
             if self.paused or order_manager.is_trading_paused():
                 return
-                
+            
+            # 데이터 구조 초기화 확인
+            if symbol not in self.price_data:
+                self.price_data[symbol] = []
+                return  # 데이터가 없으면 분석 불가능
+            
             # 충분한 데이터 있는지 확인
             if not self.price_data[symbol]:
                 return
                 
             # 현재가
             current_price = self.price_data[symbol][-1]["price"]
+            
+            # 브레이크아웃 데이터 확인
+            if symbol not in self.breakout_levels:
+                self.breakout_levels[symbol] = {
+                    'init_high': None,
+                    'init_low': None,
+                    'high_level': None,
+                    'low_level': None,
+                    'range': None
+                }
+                logger.log_system(f"Breakout 전략 (analyze): {symbol} 데이터 구조 초기화됨")
+                return  # 초기화만 하고 종료
             
             # 돌파 레벨
             breakout_data = self.breakout_levels[symbol]
@@ -469,6 +497,18 @@ class BreakoutStrategy:
             # 초기화 안 된 경우
             if not self.initialization_complete.get(symbol, False):
                 return 0
+            
+            # 브레이크아웃 데이터 없으면 초기화
+            if symbol not in self.breakout_levels:
+                self.breakout_levels[symbol] = {
+                    'init_high': None,
+                    'init_low': None,
+                    'high_level': None,
+                    'low_level': None,
+                    'range': None
+                }
+                logger.log_system(f"Breakout 전략 (signal_strength): {symbol} 데이터 구조 초기화됨")
+                return 0  # 초기화만 하고 점수는 0 반환
                 
             current_price = self.price_data[symbol][-1]["price"]
             breakout_data = self.breakout_levels[symbol]
@@ -517,6 +557,18 @@ class BreakoutStrategy:
             if symbol in self.price_data and self.price_data[symbol]:
                 current_price = self.price_data[symbol][-1]["price"]
             
+            # 브레이크아웃 데이터 없으면 초기화
+            if symbol not in self.breakout_levels:
+                self.breakout_levels[symbol] = {
+                    'init_high': None,
+                    'init_low': None,
+                    'high_level': None,
+                    'low_level': None,
+                    'range': None
+                }
+                logger.log_system(f"Breakout 전략 (signal_direction): {symbol} 데이터 구조 초기화됨")
+                return "NEUTRAL"  # 초기화만 하고 중립 반환
+            
             # 브레이크아웃 레벨 확인
             breakout_data = self.breakout_levels.get(symbol, {})
             if not breakout_data or 'high_level' not in breakout_data or 'low_level' not in breakout_data:
@@ -540,6 +592,20 @@ class BreakoutStrategy:
     async def get_signal(self, symbol: str) -> Dict[str, Any]:
         """전략 신호 반환 (combined_strategy에서 호출)"""
         try:
+            # 데이터 구조 초기화 확인
+            if symbol not in self.price_data:
+                self.price_data[symbol] = []
+                
+            if symbol not in self.breakout_levels:
+                self.breakout_levels[symbol] = {
+                    'init_high': None,
+                    'init_low': None,
+                    'high_level': None,
+                    'low_level': None,
+                    'range': None
+                }
+                logger.log_system(f"Breakout 전략 (get_signal): {symbol} 데이터 구조 초기화됨")
+                
             # 초기화 상태 로깅
             if not self.initialization_complete.get(symbol, False):
                 # 초기화가 필요한 경우 좀 더 적극적인 초기화 수행

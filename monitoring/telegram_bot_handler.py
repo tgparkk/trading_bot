@@ -63,6 +63,8 @@ class TelegramBotHandler:
         self.last_update_id = 0
         self.bot_running = False
         self.trading_paused = False
+        
+        # ready_event는 나중에 초기화
         self.ready_event = None
         
         # 종료 콜백 함수 초기화
@@ -236,7 +238,11 @@ class TelegramBotHandler:
     async def start_polling(self):
         """메시지 폴링 시작"""
         # 현재 이벤트 루프에서 사용할 ready_event 초기화
+        # 반드시 현재 실행 중인 이벤트 루프에 맞는 Event 객체 생성
+        logger.log_system("텔레그램 봇 핸들러 ready_event 생성 시작...")
+        loop = asyncio.get_running_loop()
         self.ready_event = asyncio.Event()
+        logger.log_system(f"텔레그램 봇 핸들러 ready_event 생성 완료(loop id: {id(loop)})")
         
         self.bot_running = True
         logger.log_system("텔레그램 봇 핸들러 폴링 시작...")
@@ -941,7 +947,7 @@ class TelegramBotHandler:
 
     def is_ready(self) -> bool:
         """봇이 준비되었는지 확인"""
-        return self.ready_event.is_set()
+        return self.ready_event is not None and self.ready_event.is_set()
 
     async def get_status(self, args: List[str]) -> str:
         """시스템 상태 조회"""
