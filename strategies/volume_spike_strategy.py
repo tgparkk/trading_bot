@@ -95,118 +95,102 @@ class VolumeStrategy:
     async def _load_historical_volumes(self, symbol: str):
         """과거 거래량 데이터 로드"""
         try:
-            logger.log_system(f"[DEBUG] {symbol} - 과거 거래량 데이터 로드 시작")
-            
-            # 일봉 데이터 조회 (비동기 래퍼 사용)
-            loop = asyncio.get_event_loop()
-            price_data = await loop.run_in_executor(None, api_client.get_daily_price, symbol)
-            
-            if price_data and price_data.get("rt_cd") == "0":
-                # API 응답 구조 확인 및 데이터 추출
-                daily_data = []
-                if "output2" in price_data:
-                    daily_data = price_data["output2"]
-                elif "output" in price_data and isinstance(price_data["output"], dict) and "lst" in price_data["output"]:
-                    daily_data = price_data["output"]["lst"]
-                elif "output" in price_data and isinstance(price_data["output"], list):
-                    daily_data = price_data["output"]
-                
+            # 일봉 데이터 조회
+            price_data = api_client.get_daily_price(symbol)
+            if price_data.get("rt_cd") == "0":
                 volumes = []
+                
+                # output2가 실제 일봉 데이터 배열임
+                daily_data = price_data.get("output2", [])
+                
                 if daily_data:
+                    logger.log_system(f"{symbol} - 볼륨 전략 일봉 데이터 {len(daily_data)}개 로드")
+                    
+                    # look_back_periods 개수만큼 필터링
                     for item in daily_data[:self.params["look_back_periods"]]:
-                        # API 응답 필드명 확인
+                        # 거래량 필드 확인 (다양한 필드명에 대응)
                         volume = 0
-                        if isinstance(item, dict):
-                            # 다양한 필드명 허용
-                            volume = int(item.get("acml_vol", item.get("cntg_vol", item.get("vol", 0))))
-                        volumes.append(volume)
+                        if "acml_vol" in item:
+                            volume = int(item["acml_vol"])
+                        elif "vol" in item:
+                            volume = int(item["vol"])
+                        elif "volume" in item:
+                            volume = int(item["volume"])
+                        
+                        if volume > 0:
+                            volumes.append(volume)
                     
                     # 평균 거래량 계산
                     if volumes:
                         self.volume_data[symbol]['historical_volumes'].extend(volumes)
                         self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
-                        logger.log_system(f"{symbol} - 일봉 평균 거래량: {self.volume_data[symbol]['avg_volume']:,.0f}")
+                        
+                        logger.log_system(f"일봉 거래량 데이터 로드 완료 - {symbol}: 평균={self.volume_data[symbol]['avg_volume']:.0f}")
                     else:
-                        logger.log_warning(f"{symbol} - 일봉 거래량 데이터 없음")
+                        logger.log_system(f"{symbol} - 거래량 데이터를 찾을 수 없음")
                 else:
-                    logger.log_warning(f"{symbol} - 일봉 데이터 비어있음")
+                    logger.log_system(f"{symbol} - 일봉 데이터가 없음")
             else:
-                logger.log_warning(f"{symbol} - 일봉 데이터 API 응답 실패: {price_data}")
-                # 테스트 데이터 생성
-                await self._generate_test_volume_data(symbol)
+                error_msg = price_data.get("msg1", "Unknown error")
+                logger.log_system(f"{symbol} - 일봉 데이터 조회 실패: {error_msg}")
             
-            # 분봉 데이터 조회 (비동기 래퍼 사용)
-            minute_data = await loop.run_in_executor(None, api_client.get_minute_price, symbol, "1")
-            
-            if minute_data and minute_data.get("rt_cd") == "0":
-                # API 응답 구조 확인 및 데이터 추출
-                minute_items = []
-                if "output" in minute_data and isinstance(minute_data["output"], dict) and "lst" in minute_data["output"]:
-                    minute_items = minute_data["output"]["lst"]
-                elif "output" in minute_data and isinstance(minute_data["output"], list):
-                    minute_items = minute_data["output"]
-                elif "output1" in minute_data and isinstance(minute_data["output1"], list):
-                    minute_items = minute_data["output1"]
+            # 분봉 데이터 조회 (당일)
+            minute_data = api_client.get_minute_price(symbol)
+            if minute_data.get("rt_cd") == "0":
+                # output2가 실제 분봉 데이터 배열임
+                minute_items = minute_data.get("output2", [])
                 
                 if minute_items:
-                    for item in minute_items[:60]:  # 최근 60개 분봉
-                        if isinstance(item, dict):
-                            volume = int(item.get("cntg_vol", item.get("vol", 0)))
-                            self.volume_data[symbol]['minute_volumes'].append(volume)
-                    logger.log_system(f"{symbol} - 분봉 데이터 {len(self.volume_data[symbol]['minute_volumes'])}개 로드")
+                    logger.log_system(f"{symbol} - 볼륨 전략 분봉 데이터 {len(minute_items)}개 로드")
+                    
+                    # 최근 60개 분봉 처리
+                    for item in minute_items[:60]:
+                        # 거래량 필드 확인
+                        volume = 0
+                        if "cntg_vol" in item:
+                            volume = int(item["cntg_vol"])
+                        elif "vol" in item:
+                            volume = int(item["vol"])
+                        elif "volume" in item:
+                            volume = int(item["volume"])
+                        
+                        # 시간 정보 추출
+                        time_str = ""
+                        if "time" in item:
+                            time_str = item["time"]
+                        elif "bass_tm" in item:
+                            time_str = item["bass_tm"]
+                        
+                        # 유효한 시간 형식인지 확인
+                        timestamp = None
+                        if time_str and len(time_str) >= 6:
+                            try:
+                                hour = int(time_str[:2])
+                                minute = int(time_str[2:4])
+                                timestamp = datetime.now().replace(hour=hour, minute=minute)
+                            except ValueError:
+                                timestamp = datetime.now()
+                        else:
+                            timestamp = datetime.now()
+                        
+                        # 분봉 거래량 데이터 저장
+                        self.volume_data[symbol]['minute_volumes'].append({
+                            'volume': volume,
+                            'minute': timestamp.minute,
+                            'hour': timestamp.hour,
+                            'timestamp': timestamp
+                        })
+                    
+                    logger.log_system(f"{symbol} - 분봉 거래량 데이터 로드 완료: {len(self.volume_data[symbol]['minute_volumes'])}개")
                 else:
-                    logger.log_warning(f"{symbol} - 분봉 데이터 비어있음")
+                    logger.log_system(f"{symbol} - 분봉 데이터가 없음")
             else:
-                logger.log_warning(f"{symbol} - 분봉 데이터 API 응답 실패: {minute_data}")
-                # 테스트 분봉 데이터 생성
-                await self._generate_test_minute_data(symbol)
-            
+                error_msg = minute_data.get("msg1", "Unknown error")
+                logger.log_system(f"{symbol} - 분봉 데이터 조회 실패: {error_msg}")
+        
         except Exception as e:
             logger.log_error(e, f"Error loading historical volume data for {symbol}")
-            # 오류 발생 시 테스트 데이터 생성
-            await self._generate_test_volume_data(symbol)
-            await self._generate_test_minute_data(symbol)
     
-    async def _generate_test_volume_data(self, symbol: str):
-        """테스트 일봉 거래량 데이터 생성"""
-        try:
-            logger.log_system(f"{symbol} - 테스트 일봉 거래량 데이터 생성 시작")
-            
-            base_volume = 1000000  # 기본 거래량 100만주
-            test_volumes = []
-            
-            for i in range(self.params["look_back_periods"]):
-                # 랜덤하게 거래량 변동 생성 (-20% ~ +50%)
-                volume_change = (np.random.random() - 0.2) * 0.7
-                test_volume = int(base_volume * (1 + volume_change))
-                test_volumes.append(test_volume)
-            
-            self.volume_data[symbol]['historical_volumes'].extend(test_volumes)
-            self.volume_data[symbol]['avg_volume'] = np.mean(test_volumes)
-            
-            logger.log_system(f"{symbol} - 테스트 일봉 평균 거래량: {self.volume_data[symbol]['avg_volume']:,.0f}")
-            
-        except Exception as e:
-            logger.log_error(e, f"{symbol} - 테스트 일봉 거래량 데이터 생성 실패")
-    
-    async def _generate_test_minute_data(self, symbol: str):
-        """테스트 분봉 거래량 데이터 생성"""
-        try:
-            logger.log_system(f"{symbol} - 테스트 분봉 거래량 데이터 생성 시작")
-            
-            # 일봉 평균을 분봉으로 변환 (390분 = 6.5시간)
-            avg_minute_volume = self.volume_data[symbol]['avg_volume'] / 390 if self.volume_data[symbol]['avg_volume'] else 2500
-            
-            for i in range(60):  # 최근 60분 데이터
-                # 랜덤하게 분봉 거래량 변동 (-50% ~ +200%)
-                volume_change = (np.random.random() - 0.3) * 2.5
-                test_volume = int(avg_minute_volume * (1 + volume_change))
-                self.volume_data[symbol]['minute_volumes'].append(test_volume)
-            
-            logger.log_system(f"{symbol} - 테스트 분봉 데이터 {len(self.volume_data[symbol]['minute_volumes'])}개 생성")
-            
-        except Exception as e:
-            logger.log_error(e, f"{symbol} - 테스트 분봉 거래량 데이터 생성 실패")
     
     async def stop(self):
         """전략 중지"""

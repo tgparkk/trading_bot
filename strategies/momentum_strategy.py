@@ -97,81 +97,77 @@ class MomentumStrategy:
         """초기 데이터 로딩"""
         try:
             # 분봉 데이터 조회
-            logger.log_system(f"[DEBUG] {symbol} - 초기 데이터 로딩 시작")
-            
-            # API 호출 (비동기 래퍼 사용)
-            loop = asyncio.get_event_loop()
-            price_data = await loop.run_in_executor(None, api_client.get_minute_price, symbol, "1")
-            
-            if price_data and price_data.get("rt_cd") == "0" and "output" in price_data:
+            price_data = api_client.get_minute_price(symbol, time_unit="1")
+            if price_data.get("rt_cd") == "0":
                 prices = []
                 volumes = []
                 timestamps = []
                 
-                # API 응답에서 필요한 데이터 추출
-                output_data = price_data.get("output", {})
-                lst_data = output_data.get("lst", [])
+                # API 응답에서 필요한 데이터 추출 - output2가 실제 차트 데이터
+                chart_data = price_data.get("output2", [])
                 
-                if not lst_data:
-                    logger.log_warning(f"{symbol} - API 응답에 데이터가 없습니다")
-                    # 테스트 데이터나 더미 데이터 생성
-                    test_price = 50000  # 임시 가격
-                    test_data_count = max(self.params["rsi_period"], self.params["ma_long_period"]) + 10
+                if chart_data:
+                    logger.log_system(f"{symbol} - 모멘텀 전략 초기 데이터 {len(chart_data)}개 로드 성공")
                     
-                    for i in range(test_data_count):
-                        # 랜덤하게 가격 변동 생성
-                        price_change = (np.random.random() - 0.5) * 0.02 * test_price
-                        test_price += price_change
+                    # 일반적으로 최신 데이터가 먼저 오므로, 과거->현재 순서로 처리하기 위해 reversed 사용
+                    # API 응답 구조에 따라 달라질 수 있음
+                    for item in reversed(chart_data):
+                        # 가격 데이터 - stck_prpr 또는 clos 필드 사용
+                        if "stck_prpr" in item:
+                            prices.append(float(item["stck_prpr"]))
+                        elif "clos" in item:  # 종가(clos) 필드가 있는 경우
+                            prices.append(float(item["clos"]))
+                        else:
+                            continue  # 가격 데이터가 없으면 건너뜀
                         
-                        self.price_data[symbol].append({
-                            "price": test_price,
-                            "volume": int(np.random.random() * 10000),
-                            "timestamp": datetime.now() - timedelta(minutes=test_data_count-i)
-                        })
-                    
-                    logger.log_system(f"{symbol} - 테스트 데이터 {test_data_count}개 생성 완료")
-                else:
-                    # 실제 API 데이터 처리
-                    for item in reversed(lst_data):  # 과거 -> 최근 순으로 처리
-                        try:
-                            price = float(item.get("stck_prpr", 0))
-                            volume = int(item.get("cntg_vol", 0))
-                            time_str = item.get("bass_tm", "")
-                            
-                            if price > 0:  # 유효한 가격만 저장
-                                prices.append(price)
-                                volumes.append(volume)
-                                timestamps.append(time_str)
-                        except (ValueError, TypeError) as e:
-                            logger.log_warning(f"{symbol} - 데이터 변환 오류: {e}")
-                            continue
+                        # 거래량 데이터 - cntg_vol 또는 vol 필드 사용
+                        if "cntg_vol" in item:
+                            volumes.append(int(item["cntg_vol"]))
+                        elif "vol" in item:
+                            volumes.append(int(item["vol"]))
+                        else:
+                            volumes.append(0)  # 거래량 데이터가 없으면 0으로 설정
+                        
+                        # 시간 데이터 - bass_tm 또는 time 필드 사용
+                        if "bass_tm" in item:
+                            timestamps.append(item["bass_tm"])
+                        elif "time" in item:
+                            timestamps.append(item["time"])
+                        else:
+                            timestamps.append("")  # 시간 데이터가 없으면 빈 문자열로 설정
                     
                     # 가격 데이터 저장
                     for i in range(len(prices)):
+                        # 시간 정보가 있으면 파싱, 없으면 현재 시간에서 역산
+                        if timestamps[i] and len(timestamps[i]) >= 6:
+                            # 시간 형식에 맞게 파싱 (예: "093000" -> 09:30:00)
+                            try:
+                                hour = int(timestamps[i][:2])
+                                minute = int(timestamps[i][2:4])
+                                second = int(timestamps[i][4:6])
+                                timestamp = datetime.now().replace(hour=hour, minute=minute, second=second)
+                            except ValueError:
+                                # 시간 파싱 실패 시 현재 시간에서 역산
+                                timestamp = datetime.now() - timedelta(minutes=len(prices)-i)
+                        else:
+                            # 시간 정보가 없으면 현재 시간에서 역산
+                            timestamp = datetime.now() - timedelta(minutes=len(prices)-i)
+                        
                         self.price_data[symbol].append({
                             "price": prices[i],
                             "volume": volumes[i],
-                            "timestamp": datetime.now() - timedelta(minutes=len(prices)-i)
+                            "timestamp": timestamp
                         })
                     
-                    logger.log_system(f"{symbol} - 실제 데이터 {len(prices)}개 로딩 완료")
-                
-                # 초기 지표 계산
-                if len(self.price_data[symbol]) >= max(self.params["rsi_period"], self.params["ma_long_period"]):
+                    # 초기 지표 계산
                     self._calculate_indicators(symbol)
-                    logger.log_system(f"{symbol} - 초기 지표 계산 완료")
+                    
+                    logger.log_system(f"Loaded initial data for {symbol}: {len(prices)} data points")
                 else:
-                    logger.log_warning(f"{symbol} - 데이터 부족으로 지표 계산 건너뜀")
-                
-            else:
-                logger.log_warning(f"{symbol} - API 응답 실패: {price_data}")
-                # API 실패시 테스트 데이터 생성
-                await self._generate_test_data(symbol)
+                    logger.log_system(f"{symbol} - 모멘텀 전략 초기 데이터 없음")
                 
         except Exception as e:
             logger.log_error(e, f"Error loading initial data for {symbol}")
-            # 오류 발생시 테스트 데이터 생성
-            await self._generate_test_data(symbol)
     
     async def _generate_test_data(self, symbol: str):
         """테스트 데이터 생성"""

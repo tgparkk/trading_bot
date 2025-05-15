@@ -537,78 +537,72 @@ class OrderManager:
                 )
                 return False
             
-            # 변동성 체크
-            try:
-                logger.log_system(f"[변동성체크] {symbol} 변동성 체크")
-                # run_in_executor를 사용하여 비동기적으로 동기 함수 호출
-                price_data = await loop.run_in_executor(None, 
-                                                      lambda: api_client.get_daily_price(symbol))
-                
-                if price_data.get("rt_cd") == "0" and "output2" in price_data:
+           # 변동성 체크
+            price_data = api_client.get_daily_price(symbol)
+            if price_data.get("rt_cd") == "0":
+                try:
+                    daily_data = price_data.get("output2", [])
                     prices = []
-                    # 최근 7일 또는 가능한 만큼의 가격 데이터 사용
-                    for item in price_data["output2"][:7]:
-                        try:
-                            close_price = float(item.get("stck_clpr", 0))
-                            if close_price > 0:
-                                prices.append(close_price)
-                        except (ValueError, TypeError):
-                            continue
                     
-                    # 최소 2일 이상의 가격 데이터가 있어야 변동성 계산 가능
+                    # 가격 데이터 추출 - 일반적인 필드명 확인
+                    for d in daily_data:
+                        for field in ["stck_clpr", "clos", "close", "clpr"]:
+                            if field in d and float(d[field]) > 0:
+                                prices.append(float(d[field]))
+                                break
+                    
+                    # 변동성 계산 및 검증
                     if len(prices) >= 2:
                         volatility = self._calculate_volatility(prices)
-                        max_volatility = self.trading_config.risk_params.get("max_volatility", 0.1)  # 기본값 10%
-                        
-                        if volatility > max_volatility:
-                            logger.log_system(
-                                f"[변동성초과] {symbol} - 변동성 제한 초과: "
-                                f"현재={volatility:.2%}, 제한={max_volatility:.2%}"
-                            )
+                        if volatility > self.trading_config.max_volatility:
+                            logger.log_system(f"Risk check failed: High volatility for {symbol}")
                             return False
-                        logger.log_system(f"[변동성체크] {symbol} 변동성: {volatility:.2%}")
-                    else:
-                        logger.log_system(f"[변동성체크] {symbol} 변동성 계산을 위한 충분한 데이터가 없습니다. (데이터 수: {len(prices)})")
-                else:
-                    logger.log_system(f"[변동성체크실패] {symbol} 가격 이력 조회 실패")
-            except Exception as e:
-                logger.log_system(f"[변동성체크오류] {symbol} 변동성 체크 중 오류: {str(e)}")
-                logger.log_error(e, f"Error in volatility check for {symbol}")
-                # 변동성 체크 실패 시 경고만 하고 계속 진행
-                logger.log_system(f"Warning: Skipping volatility check for {symbol} due to error")
-            
-            # 거래량 체크
-            try:
-                logger.log_system(f"[거래량체크] {symbol} 거래량 체크")
-                
-                # get_market_trading_volume API 대신 get_symbol_info API 사용
-                symbol_info_task = asyncio.create_task(api_client.get_symbol_info(symbol))
-                
-                try:
-                    symbol_info = await asyncio.wait_for(symbol_info_task, timeout=3.0)
-                    
-                    if symbol_info and "volume" in symbol_info:
-                        volume = int(symbol_info.get("volume", 0))
-                        min_volume = self.trading_config.risk_params.get("min_daily_volume", 10000)  # 기본값 1만주
-                        
-                        if volume < min_volume:
-                            logger.log_system(
-                                f"[거래량부족] {symbol} - 거래량 부족: "
-                                f"현재={volume:,}주, 최소={min_volume:,}주"
-                            )
-                            return False
-                        logger.log_system(f"[거래량체크] {symbol} 거래량: {volume:,}주")
-                    else:
-                        logger.log_system(f"[거래량체크] {symbol} 거래량 정보 없음, 체크 건너뜀")
-                except asyncio.TimeoutError:
-                    logger.log_system(f"[거래량체크] {symbol} 종목 정보 API 타임아웃, 체크 건너뜀")
                 except Exception as e:
-                    logger.log_system(f"[거래량체크] {symbol} 종목 정보 API 오류, 체크 건너뜀: {str(e)}")
-            except Exception as e:
-                logger.log_system(f"[거래량체크오류] {symbol} 거래량 체크 중 오류: {str(e)}")
-                logger.log_error(e, f"Error in volume check for {symbol}")
-                # 거래량 체크 실패 시 경고만 하고 계속 진행
-                logger.log_system(f"Warning: Skipping volume check for {symbol} due to error")
+                    logger.log_error(e, f"Volatility check error: {symbol}")
+            
+           # 거래량 체크
+            volume_data = api_client.get_market_trading_volume(market_code="J", top_n=100)
+            if volume_data.get("rt_cd") == "0":
+                volume_items = volume_data.get("output2", [])
+                # 특정 종목 찾기
+                symbol_volume = next((item for item in volume_items if item.get("mksc_shrn_iscd") == symbol), None)
+                
+                if symbol_volume:
+                    # 해당 종목 거래량 확인
+                    volume_field = "prdy_vrss_vol"  # 실제 API 응답의 거래량 필드명으로 수정 필요
+                    
+                    # 다양한 필드명 시도
+                    for field in ["prdy_vrss_vol", "vol", "acml_vol", "cntg_vol", "volume"]:
+                        if field in symbol_volume:
+                            volume_field = field
+                            break
+                            
+                    volume = int(symbol_volume.get(volume_field, 0))
+                    if volume < self.trading_config.min_daily_volume:
+                        logger.log_system(f"Risk check failed: Low trading volume for {symbol} - {volume} < {self.trading_config.min_daily_volume}")
+                        return False
+                else:
+                    # 특정 종목이 상위 거래량 목록에 없는 경우
+                    logger.log_system(f"Risk check: {symbol} not found in top volume list, using alternate check")
+                    
+                    # 대안: 해당 종목의 일봉 데이터에서 거래량 확인
+                    try:
+                        daily_data = api_client.get_daily_price(symbol)
+                        if daily_data.get("rt_cd") == "0" and daily_data.get("output2"):
+                            latest_data = daily_data["output2"][0]  # 최신 데이터
+                            
+                            # 거래량 필드 확인
+                            volume = 0
+                            for field in ["acml_vol", "vol", "volume"]:
+                                if field in latest_data:
+                                    volume = int(latest_data[field])
+                                    break
+                                    
+                            if volume < self.trading_config.min_daily_volume:
+                                logger.log_system(f"Risk check failed: Low trading volume for {symbol} - {volume} < {self.trading_config.min_daily_volume}")
+                                return False
+                    except Exception as e:
+                        logger.log_error(e, f"Failed to check volume for {symbol} from daily data")
             
             # 모든 체크 통과
             logger.log_system(f"[리스크체크] {symbol} 모든 리스크 체크 통과")

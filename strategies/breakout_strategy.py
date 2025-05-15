@@ -3,7 +3,6 @@
 장 시작 후 30분간의 가격 범위를 기준으로 돌파 시 매매하는 전략
 """
 import asyncio
-import threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime, time, timedelta
 from collections import deque
@@ -19,22 +18,9 @@ from monitoring.alert_system import alert_system
 class BreakoutStrategy:
     """브레이크아웃 전략 클래스"""
     
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls, *args, **kwargs):
-        """싱글톤 패턴 구현을 위한 __new__ 메서드 오버라이드"""
-        with cls._lock:  # 스레드 안전성을 위한 락 사용
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
-    
     def __init__(self):
-        """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
-        if not hasattr(self, '_initialized') or not self._initialized:
-            # get 메서드 대신 직접 속성 접근 또는 기본값 설정
-            self.params = {
+        # get 메서드 대신 직접 속성 접근 또는 기본값 설정
+        self.params = {
             "k_value": 0.4,             # 돌파 레벨 계산 시 사용할 K값 (0.3~0.5)
             "stop_loss_pct": 0.5,       # 손절 비율 (시작 범위의 50%)
             "take_profit_pct": 1.5,     # 익절 비율 (시작 범위의 150%)
@@ -42,18 +28,17 @@ class BreakoutStrategy:
             "position_size": 1000000    # 기본 포지션 크기 (100만원)
         }
         
-            # 설정에 breakout_params가 있으면 업데이트
-            if hasattr(config["trading"], "breakout_params"):
-                self.params.update(config["trading"].breakout_params)
-                
-            self.running = False
-            self.paused = False
-            self.watched_symbols = set()
-            self.price_data = {}          # {symbol: deque of price data}
-            self.breakout_levels = {}     # {symbol: {'high_level': float, 'low_level': float, 'range': float}}
-            self.positions = {}           # {position_id: position_data}
-            self.initialization_complete = {} # {symbol: bool} - 초기화 완료 여부
-            self._initialized = True
+        # 설정에 breakout_params가 있으면 업데이트
+        if hasattr(config["trading"], "breakout_params"):
+            self.params.update(config["trading"].breakout_params)
+            
+        self.running = False
+        self.paused = False
+        self.watched_symbols = set()
+        self.price_data = {}          # {symbol: deque of price data}
+        self.breakout_levels = {}     # {symbol: {'high_level': float, 'low_level': float, 'range': float}}
+        self.positions = {}           # {position_id: position_data}
+        self.initialization_complete = {} # {symbol: bool} - 초기화 완료 여부
         
     async def start(self, symbols: List[str]):
         """전략 시작"""
@@ -76,9 +61,6 @@ class BreakoutStrategy:
                 
                 # 웹소켓 구독
                 await ws_client.subscribe_price(symbol, self._handle_price_update)
-                
-                # 초기 데이터 로딩
-                await self._load_initial_data(symbol)
             
             logger.log_system(f"Breakout strategy started for {len(symbols)} symbols")
             
@@ -88,70 +70,6 @@ class BreakoutStrategy:
         except Exception as e:
             logger.log_error(e, "Failed to start breakout strategy")
             await alert_system.notify_error(e, "Breakout strategy start error")
-    
-    async def _load_initial_data(self, symbol: str):
-        """초기 데이터 로딩"""
-        try:
-            logger.log_system(f"브레이크아웃 전략 - {symbol} 초기 데이터 로딩 시작")
-            
-            # 현재가 정보 조회
-            price_info = await api_client.get_symbol_info(symbol)
-            if price_info and price_info.get("current_price"):
-                current_price = float(price_info["current_price"])
-                
-                # 가격 데이터에 추가
-                self.price_data[symbol].append({
-                    "price": current_price,
-                    "timestamp": datetime.now()
-                })
-                logger.log_system(f"브레이크아웃 전략 - {symbol} 현재가 로드: {current_price:,.0f}원")
-            
-            # 현재 시간 확인
-            current_time = datetime.now().time()
-            
-            # 장 시작 후 30분 이내인 경우 분봉 데이터로 초기화
-            if time(9, 0) <= current_time <= time(9, 30):
-                minute_data = api_client.get_minute_price(symbol, time_unit="1")
-                if minute_data.get("rt_cd") == "0":
-                    # API 응답 구조에 맞게 처리
-                    if "output" in minute_data and isinstance(minute_data["output"], dict) and "lst" in minute_data["output"]:
-                        data_list = minute_data["output"]["lst"]
-                    elif "output1" in minute_data and isinstance(minute_data["output1"], list):
-                        data_list = minute_data["output1"]
-                    elif "output2" in minute_data and isinstance(minute_data["output2"], list):
-                        data_list = minute_data["output2"]
-                    else:
-                        data_list = []
-                    
-                    if data_list:
-                        init_high = None
-                        init_low = None
-                        
-                        # 9:00~9:30 데이터만 사용
-                        for item in data_list:
-                            if "stck_bsop_date" in item and "stck_cntg_hour" in item:
-                                trade_time = item["stck_cntg_hour"]
-                                if "0900" <= trade_time <= "0930":
-                                    high_price = float(item.get("stck_hgpr", 0))
-                                    low_price = float(item.get("stck_lwpr", 0))
-                                    
-                                    if init_high is None or high_price > init_high:
-                                        init_high = high_price
-                                    if init_low is None or low_price < init_low:
-                                        init_low = low_price
-                        
-                        if init_high and init_low:
-                            self.breakout_levels[symbol]['init_high'] = init_high
-                            self.breakout_levels[symbol]['init_low'] = init_low
-                            logger.log_system(f"브레이크아웃 전략 - {symbol} 초기 범위 설정: "
-                                            f"high={init_high:,.0f}원, low={init_low:,.0f}원")
-            
-            # 이미 9:30 이후라면 브레이크아웃 레벨 설정
-            if current_time >= time(9, 30):
-                await self._set_breakout_levels(symbol)
-                    
-        except Exception as e:
-            logger.log_error(e, f"브레이크아웃 전략 - {symbol} 초기 데이터 로딩 오류")
     
     async def stop(self):
         """전략 중지"""
@@ -209,69 +127,78 @@ class BreakoutStrategy:
     async def _set_breakout_levels(self, symbol: str):
         """돌파 레벨 설정 (9:30에 실행)"""
         try:
-            if self.initialization_complete.get(symbol, False):
+            if self.initialization_complete[symbol]:
                 return
-            
-            # 종목 데이터가 없으면 초기화
-            if symbol not in self.breakout_levels:
-                self.breakout_levels[symbol] = {
-                    'init_high': None,
-                    'init_low': None,
-                    'high_level': None,
-                    'low_level': None,
-                    'range': None
-                }
-                logger.log_system(f"Breakout 전략: {symbol} 종목 데이터 구조 초기화됨")
                 
             breakout_data = self.breakout_levels[symbol]
             
             # 9:00~9:30 데이터에서 고가/저가 계산
             if breakout_data['init_high'] is None or breakout_data['init_low'] is None:
                 # 실시간 데이터 부족한 경우 API로 조회
-                minute_data = api_client.get_minute_price(symbol, time_unit="1")
-                if minute_data.get("rt_cd") == "0":
-                    # API 응답 구조에 맞게 처리
-                    if "output" in minute_data and isinstance(minute_data["output"], dict) and "lst" in minute_data["output"]:
-                        data_list = minute_data["output"]["lst"]
-                    elif "output1" in minute_data and isinstance(minute_data["output1"], list):
-                        data_list = minute_data["output1"]
-                    elif "output2" in minute_data and isinstance(minute_data["output2"], list):
-                        data_list = minute_data["output2"]
-                    else:
-                        data_list = []
+                price_data = api_client.get_minute_price(symbol)
+                if price_data.get("rt_cd") == "0":
+                    prices = []
+                    # output2가 실제 차트 데이터를 담고 있음
+                    chart_data = price_data.get("output2", [])
                     
-                    if data_list:
-                        prices_high = []
-                        prices_low = []
+                    # 데이터가 있는지 확인
+                    if chart_data:
+                        logger.log_system(f"{symbol} - 차트 데이터 {len(chart_data)}개 로드 성공")
                         
-                        for item in data_list[:30]:  # 최근 30개 데이터
-                            high_price = float(item.get("stck_hgpr", 0))
-                            low_price = float(item.get("stck_lwpr", 0))
-                            if high_price > 0:
-                                prices_high.append(high_price)
-                            if low_price > 0:
-                                prices_low.append(low_price)
+                        # 일반적으로 가장 최근 데이터가 배열의 첫 번째에 옴 - 역순으로 처리해야 할 수 있음
+                        for item in chart_data:
+                            # stck_prpr 또는 그에 상응하는 가격 필드 사용
+                            if "stck_prpr" in item:
+                                prices.append(float(item["stck_prpr"]))
+                            elif "clos" in item:  # 종가(clos) 필드가 있는 경우
+                                prices.append(float(item["clos"]))
+                            # 필요에 따라 다른 필드 처리 (고가/저가 등)
                         
-                        if prices_high and prices_low:
-                            breakout_data['init_high'] = max(prices_high)
-                            breakout_data['init_low'] = min(prices_low)
+                        if prices:
+                            # 시간 정보를 확인하여 9:00~9:30 데이터만 필터링 (옵션)
+                            # 실제 API 응답 구조에 따라 시간 필드 이름 조정 필요
+                            filtered_prices = []
+                            for i, item in enumerate(chart_data):
+                                if "time" in item:
+                                    time_str = item["time"]
+                                    # 시간 형식에 맞게 파싱해야 함
+                                    # 예: "090000"부터 "093000"까지의 데이터만 처리
+                                    if "090000" <= time_str <= "093000":
+                                        if i < len(prices):
+                                            filtered_prices.append(prices[i])
+                            
+                            # 필터링된 데이터가 있으면 사용, 없으면 모든 데이터 사용
+                            if filtered_prices:
+                                breakout_data['init_high'] = max(filtered_prices)
+                                breakout_data['init_low'] = min(filtered_prices)
+                            else:
+                                # 필터링된 데이터가 없으면 받아온 모든 데이터에서 처리
+                                breakout_data['init_high'] = max(prices[:min(30, len(prices))])
+                                breakout_data['init_low'] = min(prices[:min(30, len(prices))])
+                            
+                            logger.log_system(f"{symbol} - 초기 브레이크아웃 레벨: 고가={breakout_data['init_high']}, 저가={breakout_data['init_low']}")
+                        else:
+                            logger.log_system(f"{symbol} - 가격 데이터를 추출할 수 없음")
+                    else:
+                        logger.log_system(f"{symbol} - 차트 데이터 없음")
+            
+            # 고가/저가가 설정되었는지 확인
+            if breakout_data['init_high'] is None or breakout_data['init_low'] is None:
+                logger.log_system(f"{symbol} - 브레이크아웃 레벨 설정 실패: 고가/저가 데이터 없음")
+                return
             
             # 가격 범위 계산
-            if breakout_data['init_high'] and breakout_data['init_low']:
-                price_range = breakout_data['init_high'] - breakout_data['init_low']
-                
-                # 돌파 레벨 설정
-                k_value = self.params["k_value"]
-                breakout_data['high_level'] = breakout_data['init_high'] + (price_range * k_value)
-                breakout_data['low_level'] = breakout_data['init_low'] - (price_range * k_value)
-                breakout_data['range'] = price_range
-                
-                self.initialization_complete[symbol] = True
-                
-                logger.log_system(f"Breakout levels set for {symbol}: High={breakout_data['high_level']:,.0f}, "
-                                f"Low={breakout_data['low_level']:,.0f}, Range={price_range:,.0f}")
-            else:
-                logger.log_warning(f"Failed to set breakout levels for {symbol}: insufficient data")
+            price_range = breakout_data['init_high'] - breakout_data['init_low']
+            
+            # 돌파 레벨 설정
+            k_value = self.params["k_value"]
+            breakout_data['high_level'] = breakout_data['init_high'] + (price_range * k_value)
+            breakout_data['low_level'] = breakout_data['init_low'] - (price_range * k_value)
+            breakout_data['range'] = price_range
+            
+            self.initialization_complete[symbol] = True
+            
+            logger.log_system(f"Breakout levels set for {symbol}: High={breakout_data['high_level']}, Low={breakout_data['low_level']}, Range={price_range}")
             
         except Exception as e:
             logger.log_error(e, f"Error setting breakout levels for {symbol}")
@@ -313,30 +240,13 @@ class BreakoutStrategy:
             # 전략이 일시 중지 상태인지 확인
             if self.paused or order_manager.is_trading_paused():
                 return
-            
-            # 데이터 구조 초기화 확인
-            if symbol not in self.price_data:
-                self.price_data[symbol] = []
-                return  # 데이터가 없으면 분석 불가능
-            
+                
             # 충분한 데이터 있는지 확인
             if not self.price_data[symbol]:
                 return
                 
             # 현재가
             current_price = self.price_data[symbol][-1]["price"]
-            
-            # 브레이크아웃 데이터 확인
-            if symbol not in self.breakout_levels:
-                self.breakout_levels[symbol] = {
-                    'init_high': None,
-                    'init_low': None,
-                    'high_level': None,
-                    'low_level': None,
-                    'range': None
-                }
-                logger.log_system(f"Breakout 전략 (analyze): {symbol} 데이터 구조 초기화됨")
-                return  # 초기화만 하고 종료
             
             # 돌파 레벨
             breakout_data = self.breakout_levels[symbol]
@@ -497,18 +407,6 @@ class BreakoutStrategy:
             # 초기화 안 된 경우
             if not self.initialization_complete.get(symbol, False):
                 return 0
-            
-            # 브레이크아웃 데이터 없으면 초기화
-            if symbol not in self.breakout_levels:
-                self.breakout_levels[symbol] = {
-                    'init_high': None,
-                    'init_low': None,
-                    'high_level': None,
-                    'low_level': None,
-                    'range': None
-                }
-                logger.log_system(f"Breakout 전략 (signal_strength): {symbol} 데이터 구조 초기화됨")
-                return 0  # 초기화만 하고 점수는 0 반환
                 
             current_price = self.price_data[symbol][-1]["price"]
             breakout_data = self.breakout_levels[symbol]
@@ -557,18 +455,6 @@ class BreakoutStrategy:
             if symbol in self.price_data and self.price_data[symbol]:
                 current_price = self.price_data[symbol][-1]["price"]
             
-            # 브레이크아웃 데이터 없으면 초기화
-            if symbol not in self.breakout_levels:
-                self.breakout_levels[symbol] = {
-                    'init_high': None,
-                    'init_low': None,
-                    'high_level': None,
-                    'low_level': None,
-                    'range': None
-                }
-                logger.log_system(f"Breakout 전략 (signal_direction): {symbol} 데이터 구조 초기화됨")
-                return "NEUTRAL"  # 초기화만 하고 중립 반환
-            
             # 브레이크아웃 레벨 확인
             breakout_data = self.breakout_levels.get(symbol, {})
             if not breakout_data or 'high_level' not in breakout_data or 'low_level' not in breakout_data:
@@ -592,49 +478,10 @@ class BreakoutStrategy:
     async def get_signal(self, symbol: str) -> Dict[str, Any]:
         """전략 신호 반환 (combined_strategy에서 호출)"""
         try:
-            # 데이터 구조 초기화 확인
-            if symbol not in self.price_data:
-                self.price_data[symbol] = []
-                
-            if symbol not in self.breakout_levels:
-                self.breakout_levels[symbol] = {
-                    'init_high': None,
-                    'init_low': None,
-                    'high_level': None,
-                    'low_level': None,
-                    'range': None
-                }
-                logger.log_system(f"Breakout 전략 (get_signal): {symbol} 데이터 구조 초기화됨")
-                
-            # 초기화 상태 로깅
+            # 초기화가 완료되지 않았으면 중립 반환
             if not self.initialization_complete.get(symbol, False):
-                # 초기화가 필요한 경우 좀 더 적극적인 초기화 수행
-                await self._load_initial_data(symbol)
-                
-                # 초기화 상태 확인
-                current_time = datetime.now().time()
-                if time(9, 30) <= current_time:
-                    # 9:30 이후라면 브레이크아웃 레벨 강제 설정
-                    await self._set_breakout_levels(symbol)
-                    
-                    # 여전히 초기화 실패한 경우 - 임의 레벨 설정 (빠른 초기화용)
-                    if not self.initialization_complete.get(symbol, False) and symbol in self.price_data and len(self.price_data[symbol]) > 0:
-                        current_price = self.price_data[symbol][-1]["price"]
-                        if current_price > 0:
-                            # 현재가 기준으로 임시 레벨 설정 (±3%)
-                            self.breakout_levels[symbol] = {
-                                'init_high': current_price * 1.01,
-                                'init_low': current_price * 0.99,
-                                'high_level': current_price * 1.03,
-                                'low_level': current_price * 0.97,
-                                'range': current_price * 0.04
-                            }
-                            self.initialization_complete[symbol] = True
-                            logger.log_system(f"{symbol} - 브레이크아웃 임시 레벨 설정 완료 (현재가 기준): {current_price:,.0f}원")
-                
-                # 여전히 초기화가 완료되지 않았으면 중립 반환
-                if not self.initialization_complete.get(symbol, False):
-                    return {"signal": 0, "direction": "NEUTRAL", "reason": "initialization_incomplete"}
+                logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 초기화 미완료, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
             
             # 현재가 확인
             current_price = 0
@@ -644,26 +491,21 @@ class BreakoutStrategy:
             # 현재가가 없으면 API에서 가져오기
             if current_price <= 0:
                 try:
-                    price_info = await api_client.get_symbol_info(symbol)
-                    if price_info and price_info.get("current_price"):
-                        current_price = float(price_info["current_price"])
-                        # 가격 데이터에 추가
-                        self.price_data[symbol].append({
-                            "price": current_price,
-                            "timestamp": datetime.now()
-                        })
+                    symbol_info = await api_client.get_symbol_info(symbol)
+                    if symbol_info and "current_price" in symbol_info:
+                        current_price = float(symbol_info["current_price"])
                 except Exception as e:
                     logger.log_error(e, f"{symbol} - 브레이크아웃 현재가 조회 실패")
-                    return {"signal": 0, "direction": "NEUTRAL", "reason": "price_fetch_error"}
+                    return {"signal": 0, "direction": "NEUTRAL"}
             
             # 브레이크아웃 레벨 확인
             breakout_data = self.breakout_levels.get(symbol, {})
             if not breakout_data or 'high_level' not in breakout_data or 'low_level' not in breakout_data:
-                return {"signal": 0, "direction": "NEUTRAL", "reason": "no_breakout_levels"}
+                logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 레벨 미설정, 중립 신호 반환")
+                return {"signal": 0, "direction": "NEUTRAL"}
             
             high_level = breakout_data.get('high_level')
             low_level = breakout_data.get('low_level')
-            price_range = breakout_data.get('range', 0)
             
             # 방향과 신호 강도 계산
             direction = "NEUTRAL"
@@ -672,6 +514,7 @@ class BreakoutStrategy:
             if current_price > high_level:  # 상향 돌파
                 direction = "BUY"
                 # 돌파 정도에 따른 신호 강도 계산 (최대 10)
+                price_range = breakout_data.get('range', 0)
                 if price_range > 0:
                     excess = current_price - high_level
                     signal_strength = min(10, (excess / price_range) * 10)
@@ -681,31 +524,19 @@ class BreakoutStrategy:
             elif current_price < low_level:  # 하향 돌파
                 direction = "SELL"
                 # 돌파 정도에 따른 신호 강도 계산 (최대 10)
+                price_range = breakout_data.get('range', 0)
                 if price_range > 0:
                     excess = low_level - current_price
                     signal_strength = min(10, (excess / price_range) * 10)
                 else:
                     signal_strength = 5  # 기본값
-            else:
-                # 돌파하지 않은 경우에도 근접도 계산
-                if price_range > 0:
-                    # 상향 돌파 근접도
-                    high_proximity = (current_price - breakout_data['init_high']) / price_range
-                    if high_proximity > 0.8:  # 80% 이상 근접
-                        direction = "BUY"
-                        signal_strength = min(5, high_proximity * 5)
-                    
-                    # 하향 돌파 근접도
-                    low_proximity = (breakout_data['init_low'] - current_price) / price_range
-                    if low_proximity > 0.8:  # 80% 이상 근접
-                        direction = "SELL"
-                        signal_strength = min(5, low_proximity * 5)
             
+            logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}")
             return {"signal": signal_strength, "direction": direction}
             
         except Exception as e:
             logger.log_error(e, f"{symbol} - 브레이크아웃 신호 계산 오류")
-            return {"signal": 0, "direction": "NEUTRAL", "reason": "error"}
+            return {"signal": 0, "direction": "NEUTRAL"}
     
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
@@ -728,8 +559,6 @@ class BreakoutStrategy:
                     del self.price_data[symbol]
                 if symbol in self.breakout_levels:
                     del self.breakout_levels[symbol]
-                if symbol in self.initialization_complete:
-                    del self.initialization_complete[symbol]
             
             # 새 종목 초기화
             for symbol in to_add:
@@ -741,7 +570,6 @@ class BreakoutStrategy:
                     'init_high': None,
                     'init_low': None
                 }
-                self.initialization_complete[symbol] = False
             
             # 감시 종목 업데이트
             self.watched_symbols = list(new_set)
@@ -752,4 +580,4 @@ class BreakoutStrategy:
             logger.log_error(e, "브레이크아웃 전략 종목 업데이트 오류")
 
 # 싱글톤 인스턴스
-breakout_strategy = BreakoutStrategy()
+breakout_strategy = BreakoutStrategy() 
