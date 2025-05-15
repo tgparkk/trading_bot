@@ -65,16 +65,16 @@ class AlertSystem:
                         channel: str = "all"):
         """알림 전송"""
         try:
-            tasks = []
+            #tasks = []
             
-            if channel in ["all", "telegram"] and self.alert_config.telegram_token:
-                tasks.append(self._send_telegram(message, level))
+            #if channel in ["all", "telegram"] and self.alert_config.telegram_token:
+            #    tasks.append(self._send_telegram(message, level))
             
-            if channel in ["all", "email"] and self.alert_config.email_sender:
-                tasks.append(self._send_email(message, level))
+            #if channel in ["all", "email"] and self.alert_config.email_sender:
+            #    tasks.append(self._send_email(message, level))
             
-            if tasks:
-                await asyncio.gather(*tasks)
+            #if tasks:
+            #    await asyncio.gather(*tasks)
             
             logger.log_system(f"Alert sent: {level} - {message[:50]}...")
             

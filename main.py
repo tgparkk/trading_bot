@@ -352,11 +352,20 @@ class TradingBot:
                                 
                                 # 계좌 잔고 조회로 주문 금액 계산
                                 try:
+                                    # 새로운 형식으로 계좌 잔고 조회
                                     account_balance = await order_manager.get_account_balance()
-                                    balance_data = account_balance.get("output1", {})
                                     
-                                    # 예수금 총액 가져오기
-                                    deposit_balance = float(balance_data.get("dnca_tot_amt", "0"))
+                                    # 새로운 구조에서 예수금 정보 가져오기
+                                    deposit_balance = account_balance.get("cash_balance", 0.0)
+                                    total_balance = account_balance.get("total_balance", 0.0)
+                                    
+                                    # 계좌 정보 로깅
+                                    logger.log_system(f"계좌 정보: 예수금={deposit_balance:,.0f}원, 총평가금액={total_balance:,.0f}원")
+                                    
+                                    # 예수금이 0인 경우 처리
+                                    if deposit_balance <= 0:
+                                        logger.log_warning(f"예수금이 부족합니다: {deposit_balance:,.0f}원")
+                                        deposit_balance = 0
                                     
                                     # 주문 금액은 예수금의 50%
                                     order_amount = deposit_balance * 0.5
@@ -419,6 +428,26 @@ class TradingBot:
                                                         old_quantity = quantity
                                                         quantity = int(max_order_value / current_price)
                                                         logger.log_system(f"안전장치 작동: 주문 수량 제한 {old_quantity}→{quantity}주 (최대 {max_order_value:,.0f}원)")
+                                                    
+                                                    # 한국 증권사 최대 주문 수량 제한 (100,000주)
+                                                    max_quantity_limit = 10000  # 1만주로 보수적 설정
+                                                    if quantity > max_quantity_limit:
+                                                        old_quantity = quantity
+                                                        quantity = max_quantity_limit
+                                                        logger.log_system(f"안전장치 작동: 최대 주문 수량 제한 {old_quantity}→{quantity}주 (최대 {max_quantity_limit:,}주)")
+
+                                                    # 최소 주문 확인 - 0이 되면 주문 처리 안함
+                                                    if quantity <= 0:
+                                                        logger.log_system(f"주문 취소: {symbol}, 계산된 주문 수량이 0입니다.")
+                                                        continue
+                                                    
+                                                    # 주문 단위 조정 (일부 종목은 10주 단위 주문)
+                                                    order_unit = 1  # 기본 주문 단위 (1주)
+                                                    if order_unit > 1 and quantity % order_unit != 0:
+                                                        adjusted_quantity = (quantity // order_unit) * order_unit
+                                                        if adjusted_quantity > 0:
+                                                            quantity = adjusted_quantity
+                                                            logger.log_system(f"주문 단위 조정: {symbol}, 수량 {quantity}주 ({order_unit}주 단위)")
                                                     
                                                     # 주문 실행
                                                     logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={current_price * quantity:,.0f}원")
