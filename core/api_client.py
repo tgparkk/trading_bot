@@ -699,31 +699,22 @@ class KISAPIClient:
         
         Returns:
             Dict[str, Any]: 계좌 잔고 정보를 담은 딕셔너리
-                - output1 (list): 보유 종목 목록
-                - output2 (list): 계좌 요약 정보 (예수금 총액, 평가금액 등)
+                - output1 (list): 보유 종목 목록 (데이터 타입 변환 처리됨)
+                - output2 (list): 계좌 요약 정보 (예수금 총액, 평가금액 등) (데이터 타입 변환 처리됨)
         """
         path = "/uapi/domestic-stock/v1/trading/inquire-balance"
         
         # 모의투자 여부 확인
-        is_dev = False
-        try:
-            # 테스트 모드 확인 (TEST_MODE=True이면 모의투자, 아니면 실전투자)
-            test_mode_str = os.getenv("TEST_MODE", "False").strip()
-            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
-            logger.log_system(f"계좌 조회 - 모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
-        except Exception as e:
-            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
+        is_dev = self._is_virtual_trade()
         
         # 거래소코드 설정 (모의투자 또는 실전투자)
         tr_id = "VTTC8434R" if is_dev else "TTTC8434R"  # 모의투자(V) vs 실전투자(T)
         
-        headers = {
-            "tr_id": tr_id
-        }
+        headers = {"tr_id": tr_id}
         
         params = {
             "CANO": self.account_no[:8],
-            "ACNT_PRDT_CD": self.account_no[8:10],  # 정확히 2자리만 가져오기
+            "ACNT_PRDT_CD": self.account_no[8:10],  
             "AFHR_FLPR_YN": "N",
             "OFL_YN": "N",
             "INQR_DVSN": "02",
@@ -737,68 +728,144 @@ class KISAPIClient:
         
         try:
             # API 요청 전 유효한 토큰 확보
-            if not self.access_token or not self.token_expire_time:
-                logger.log_system("계좌 정보 조회 전 토큰 발급이 필요합니다.")
-                self._get_access_token()
-                
+            self._ensure_token()
+                    
             # API 요청 실행
             result = self._make_request("GET", path, headers=headers, params=params)
             
-            # 응답 로깅 (디버깅용)
+            # 응답 데이터 처리
             if result and result.get("rt_cd") == "0":
                 logger.log_system(f"계좌 정보 조회 성공: {result.get('msg1', '정상')}")
                 
-                # output1과 output2가 모두 있는지 확인
-                if "output1" in result and "output2" not in result:
-                    logger.log_system("API 응답에 output2가 없습니다. output1 기반으로 구조 생성")
-                    
-                    # output1이 리스트가 아니면 리스트로 변환하여 표준화
-                    if not isinstance(result["output1"], list):
-                        result["output1"] = [result["output1"]]
-                    
-                    # output2 구조 생성 (보유종목이 있으면 첫 항목의 계좌정보 활용)
-                    if result["output1"] and isinstance(result["output1"][0], dict):
-                        result["output2"] = [{
-                            "dnca_tot_amt": result["output1"][0].get("dnca_tot_amt", "0"),  # 예수금 총액
-                            "tot_evlu_amt": result["output1"][0].get("tot_evlu_amt", "0"),  # 총 평가금액
-                            "scts_evlu_amt": result["output1"][0].get("scts_evlu_amt", "0"),  # 유가증권 평가금액
-                            "nass_amt": result["output1"][0].get("nass_amt", "0")  # 순자산금액
-                        }]
-                    else:
-                        # 빈 output2 생성
-                        result["output2"] = [{
-                            "dnca_tot_amt": "0",  # 예수금 총액
-                            "tot_evlu_amt": "0",  # 총 평가금액
-                            "scts_evlu_amt": "0",  # 유가증권 평가금액
-                            "nass_amt": "0"  # 순자산금액
-                        }]
+                # 응답 데이터 구조 검증 및 표준화
+                standardized_result = self._standardize_balance_result(result)
+                
+                # 데이터 타입 변환 - 문자열 -> 숫자
+                standardized_result = self._convert_balance_data_types(standardized_result)
+                
+                return standardized_result
             else:
                 error_msg = result.get("msg1", "알 수 없는 오류")
                 logger.log_system(f"계좌 정보 조회 실패: {error_msg}", level="ERROR")
-                # 오류 응답에도 기본 구조 추가
-                result["output1"] = []
+                
+                # 오류 응답에도 표준 구조 제공
+                return self._create_default_balance_result(error_msg=error_msg)
+        except Exception as e:
+            logger.log_error(e, "계좌 정보 조회 중 예외 발생")
+            return self._create_default_balance_result(error_msg=str(e))
+            
+    def _is_virtual_trade(self) -> bool:
+        """모의투자 모드 여부 확인"""
+        try:
+            test_mode_str = os.getenv("TEST_MODE", "False").strip()
+            is_dev = test_mode_str.lower() in ['true', '1', 't', 'y', 'yes']
+            logger.log_debug(f"모의투자 모드: {is_dev} (환경 변수 TEST_MODE: '{test_mode_str}')")
+            return is_dev
+        except Exception as e:
+            logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
+            return False
+
+    def _ensure_token(self):
+        """토큰 유효성 확인 및 필요시 갱신"""
+        if not self.access_token or not self.token_expire_time:
+            logger.log_system("계좌 정보 조회 전 토큰 발급이 필요합니다.")
+            self._get_access_token()
+
+    def _standardize_balance_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """응답 결과 표준화"""
+        # output1과 output2가 모두 있는지 확인
+        if "output1" not in result:
+            result["output1"] = []
+        elif not isinstance(result["output1"], list):
+            result["output1"] = [result["output1"]]
+            
+        if "output2" not in result:
+            # output2 구조 생성 (보유종목이 있으면 첫 항목의 계좌정보 활용)
+            if result["output1"] and isinstance(result["output1"][0], dict):
+                result["output2"] = [{
+                    "dnca_tot_amt": result["output1"][0].get("dnca_tot_amt", "0"),  # 예수금 총액
+                    "tot_evlu_amt": result["output1"][0].get("tot_evlu_amt", "0"),  # 총 평가금액
+                    "scts_evlu_amt": result["output1"][0].get("scts_evlu_amt", "0"),  # 유가증권 평가금액
+                    "nass_amt": result["output1"][0].get("nass_amt", "0")  # 순자산금액
+                }]
+            else:
+                # 빈 output2 생성
                 result["output2"] = [{
                     "dnca_tot_amt": "0",  # 예수금 총액
                     "tot_evlu_amt": "0",  # 총 평가금액
                     "scts_evlu_amt": "0",  # 유가증권 평가금액
                     "nass_amt": "0"  # 순자산금액
                 }]
-                
+        elif not isinstance(result["output2"], list):
+            result["output2"] = [result["output2"]]
+        
+        return result
+
+    def _convert_balance_data_types(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """잔고 데이터 타입 변환 (문자열 -> 숫자)"""
+        # output1 변환 (보유 주식 목록)
+        for item in result.get("output1", []):
+            if isinstance(item, dict):
+                # 숫자 필드 변환
+                for numeric_field in ["hldg_qty", "ord_psbl_qty", "pchs_avg_pric", "evlu_pfls_rt", 
+                                    "evlu_pfls_amt", "evlu_amt", "pchs_amt"]:
+                    if numeric_field in item:
+                        try:
+                            item[numeric_field] = float(item[numeric_field])
+                            # 정수로 표현 가능한 경우 정수 변환
+                            if item[numeric_field].is_integer():
+                                item[numeric_field] = int(item[numeric_field])
+                        except (ValueError, TypeError):
+                            # 변환 실패 시 원래 값 유지
+                            pass
+        
+        # output2 변환 (계좌 요약 정보)
+        for item in result.get("output2", []):
+            if isinstance(item, dict):
+                # 숫자 필드 변환
+                for numeric_field in ["dnca_tot_amt", "tot_evlu_amt", "scts_evlu_amt", "nass_amt"]:
+                    if numeric_field in item:
+                        try:
+                            item[numeric_field] = float(item[numeric_field])
+                            # 정수로 표현 가능한 경우 정수 변환
+                            if item[numeric_field].is_integer():
+                                item[numeric_field] = int(item[numeric_field])
+                        except (ValueError, TypeError):
+                            # 변환 실패 시 원래 값 유지
+                            pass
+        
+        return result
+
+    def _create_default_balance_result(self, error_msg: str = "알 수 없는 오류") -> Dict[str, Any]:
+        """기본 잔고 결과 구조 생성 (오류 발생 시)"""
+        return {
+            "rt_cd": "9999", 
+            "msg1": error_msg, 
+            "output1": [],
+            "output2": [{
+                "dnca_tot_amt": 0,  # 예수금 총액
+                "tot_evlu_amt": 0,  # 총 평가금액
+                "scts_evlu_amt": 0,  # 유가증권 평가금액
+                "nass_amt": 0  # 순자산금액
+            }]
+        }
+
+    # 비동기 구현 개선 버전
+    async def get_account_balance_async(self) -> Dict[str, Any]:
+        """계좌 잔고 조회 (비동기 버전)"""
+        try:
+            # 비동기 토큰 확보
+            token = await self._get_access_token_async()
+            
+            # 동기 함수를 비동기적으로 실행
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.get_account_balance)
+            
+            # 결과 반환
             return result
         except Exception as e:
-            logger.log_error(e, "계좌 정보 조회 중 예외 발생")
-            # 표준화된 구조로 오류 응답 반환
-            return {
-                "rt_cd": "9999", 
-                "msg1": str(e), 
-                "output1": [],
-                "output2": [{
-                    "dnca_tot_amt": "0",  # 예수금 총액
-                    "tot_evlu_amt": "0",  # 총 평가금액
-                    "scts_evlu_amt": "0",  # 유가증권 평가금액
-                    "nass_amt": "0"  # 순자산금액
-                }]
-            }
+            logger.log_error(e, "비동기 계좌 정보 조회 중 오류 발생")
+            return self._create_default_balance_result(error_msg=str(e))
     
     def get_account_info(self) -> Dict[str, Any]:
         """
@@ -1342,121 +1409,6 @@ class KISAPIClient:
                 "msg1": str(e),
                 "output1": {},
                 "output2": []
-            }
-    
-    def get_volume_ranking(self, market: str = "ALL") -> Dict[str, Any]:
-        """거래량 순위 종목 조회
-        
-        Args:
-            market (str): 시장 구분 ("ALL", "KOSPI", "KOSDAQ")
-            
-        Returns:
-            Dict[str, Any]: API 응답 결과
-                - rt_cd: 성공/실패 여부 ("0": 성공)
-                - msg_cd: 응답코드
-                - msg1: 응답메세지
-                - output: 거래량 순위 데이터 리스트
-        """
-        try:
-            logger.log_system(f"[API] 거래량 순위 조회 시작 - 시장: {market}")
-            
-            path = "/uapi/domestic-stock/v1/quotations/volume-rank"
-            headers = {
-                "tr_id": "FHPST01710000",  # 거래량 순위 TR ID
-                "custtype": "P"  # 개인
-            }
-            
-            # 시장 구분 코드 매핑
-            market_code_map = {
-                "ALL": "0000",     # 전체
-                "KOSPI": "0001",   # 코스피
-                "KOSDAQ": "1001",  # 코스닥
-                "0": "0000",      # 전체
-                "J": "0000"       # 전체 (주식)
-            }
-            
-            market_code = market_code_map.get(market.upper(), "0000")
-            logger.log_system(f"[API] 시장 코드 매핑: {market} -> {market_code}")
-            
-            # API 요청 파라미터 - API 문서에 맞춰 수정
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",          # 조건 시장 분류 코드 (J: 주식)
-                "FID_COND_SCR_DIV_CODE": "20171",       # 조건 화면 분류 코드 (20171: 거래량순위)
-                "FID_INPUT_ISCD": market_code,          # 입력 종목코드 (시장구분)
-                "FID_DIV_CLS_CODE": "0",                # 분류 구분 코드 (0: 전체)
-                "FID_BLNG_CLS_CODE": "0",               # 소속 구분 코드 (0: 평균거래량)
-                "FID_TRGT_CLS_CODE": "111111111",       # 대상 구분 코드 (증거금 30% 40% 50% 60% 100% 신용보증금 30% 40% 50% 60%)
-                "FID_TRGT_EXLS_CLS_CODE": "0000000000", # 대상 제외 구분 코드 (10자리)
-                "FID_INPUT_PRICE_1": "",                # 입력 가격1 (전체 가격 대상)
-                "FID_INPUT_PRICE_2": "",                # 입력 가격2 (전체 가격 대상)
-                "FID_VOL_CNT": "",                      # 거래량 수 (전체 거래량 대상)
-                "FID_INPUT_DATE_1": ""                  # 입력 날짜1 (공란)
-            }
-            
-            logger.log_system(f"[API] 요청 파라미터: {params}")
-            
-            # API 호출 전 토큰 상태 확인
-            if not self.access_token or not self.token_expire_time:
-                logger.log_system("[API] 거래량 순위 조회 전 - 토큰이 없어서 발급 필요")
-                self._get_access_token()
-            else:
-                remaining_hours = (self.token_expire_time - datetime.now().timestamp()) / 3600
-                logger.log_system(f"[API] 거래량 순위 조회 전 - 토큰 유효 (만료까지 {remaining_hours:.1f}시간)")
-            
-            # API 요청 실행
-            result = self._make_request("GET", path, headers=headers, params=params)
-            
-            # 응답 로깅 (디버깅용)
-            logger.log_system(f"[API] 응답 rt_cd: {result.get('rt_cd')}")
-            logger.log_system(f"[API] 응답 msg_cd: {result.get('msg_cd', 'N/A')}")
-            logger.log_system(f"[API] 응답 msg1: {result.get('msg1', 'N/A')}")
-            
-            if result.get("rt_cd") == "0":
-                # 성공 처리
-                logger.log_system(f"[API] 거래량 순위 조회 성공 (시장: {market})")
-                
-                # output 데이터 확인 및 처리
-                output_data = result.get("output", [])
-                if isinstance(output_data, list) and output_data:
-                    logger.log_system(f"[API] 거래량 순위 데이터 수: {len(output_data)}")
-                    # 상위 30개 종목만 로깅  
-                    for i, item in enumerate(output_data[:30]):
-                        if isinstance(item, dict):
-                            # 첫번째 항목의 필드 정보 출력
-                            if i == 0:
-                                logger.log_system(f"[API] 첫번째 항목의 전체 필드: {list(item.keys())}")
-                                
-                            # 필드명 매핑 - API 문서에 맞춰 수정
-                            symbol = item.get("mksc_shrn_iscd", "N/A")  # 유가증권 단축 종목코드
-                            name = item.get("hts_kor_isnm", "N/A")      # HTS 한글 종목명
-                            volume = item.get("acml_vol", "0")          # 누적 거래량
-                            price = item.get("stck_prpr", "0")          # 주식 현재가
-                            change_rate = item.get("prdy_ctrt", "0")    # 전일 대비율
-                            rank = item.get("data_rank", str(i+1))      # 데이터 순위
-                            
-                            logger.log_system(f"[API] #{rank} {symbol} {name}: 가격 {price}원, 거래량 {volume}, 등락률 {change_rate}%")
-                else:
-                    logger.log_system(f"[API] output 데이터가 비어있거나 리스트가 아님: {type(output_data)}")
-            else:
-                # 실패 처리
-                error_msg = result.get("msg1", "알 수 없는 오류")
-                logger.log_system(f"[API] 거래량 순위 조회 실패: {error_msg}")
-                logger.log_system(f"[API] 전체 응답: {result}")
-            
-            return result
-            
-        except Exception as e:
-            logger.log_error(e, f"[API] 거래량 순위 조회 중 예외 발생 (시장: {market})")
-            # 예외 타입과 메시지 로깅
-            logger.log_system(f"[API] 예외 타입: {type(e).__name__}")
-            logger.log_system(f"[API] 예외 메시지: {str(e)}")
-            
-            # 오류 발생 시에도 최소한의 응답 구조 제공
-            return {
-                "rt_cd": "9999",
-                "msg_cd": "ERR",
-                "msg1": str(e),
-                "output": []
             }
 
     def get_market_trading_volume(self, market_code: str = "J", sort_type: str = "1", top_n: int = 100) -> Dict[str, Any]:
