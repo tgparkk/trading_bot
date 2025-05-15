@@ -89,25 +89,62 @@ class GapStrategy:
         try:
             # 일봉 데이터 조회
             price_data = api_client.get_daily_price(symbol)
-            if price_data.get("rt_cd") == "0" and "output" in price_data:
-                daily_data = price_data["output"].get("lst", [])
+            if price_data.get("rt_cd") == "0":
+                # 데이터가 output2 배열에 있음
+                daily_data = price_data.get("output2", [])
                 
                 if daily_data and len(daily_data) > 0:
-                    # 전일 종가 저장
-                    self.gap_data[symbol]['prev_close'] = float(daily_data[0]["stck_clpr"])
+                    logger.log_system(f"{symbol} - 갭 전략 일봉 데이터 {len(daily_data)}개 로드")
+                    
+                    # 전일 종가 저장 - 배열의 첫 번째 항목이 최근 데이터
+                    if "stck_clpr" in daily_data[0]:
+                        self.gap_data[symbol]['prev_close'] = float(daily_data[0]["stck_clpr"])
+                    elif "clos" in daily_data[0]:  # 종가(clos) 필드가 있는 경우
+                        self.gap_data[symbol]['prev_close'] = float(daily_data[0]["clos"])
+                    else:
+                        # 필드명이 다른 경우 추가 대응
+                        for field_name in ["clpr", "close", "closing_price"]:
+                            if field_name in daily_data[0]:
+                                self.gap_data[symbol]['prev_close'] = float(daily_data[0][field_name])
+                                break
+                    
+                    # 종가를 찾지 못한 경우 로그 기록
+                    if 'prev_close' not in self.gap_data[symbol] or self.gap_data[symbol]['prev_close'] == 0:
+                        logger.log_system(f"{symbol} - 전일 종가를 찾을 수 없음, 응답 필드: {list(daily_data[0].keys())}")
+                        # 안전을 위해 이전 종가가 없으면 0으로 설정
+                        self.gap_data[symbol]['prev_close'] = 0
                     
                     # 거래량 데이터 저장
                     volumes = []
                     for item in daily_data[:20]:  # 최근 20일 데이터
-                        volumes.append(int(item.get("acml_vol", 0)))
+                        volume = 0
+                        # 다양한 거래량 필드명 시도
+                        if "acml_vol" in item:
+                            volume = int(item["acml_vol"])
+                        elif "vol" in item:
+                            volume = int(item["vol"])
+                        elif "volume" in item:
+                            volume = int(item["volume"])
+                        elif "trade_volume" in item:
+                            volume = int(item["trade_volume"])
+                        
+                        if volume > 0:
+                            volumes.append(volume)
                     
                     # 평균 거래량 계산
                     if volumes:
                         self.volume_data[symbol]['volumes'].extend(volumes)
                         self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
                         
-                    logger.log_system(f"Loaded historical data for {symbol}: Prev close={self.gap_data[symbol]['prev_close']}")
-                    
+                        logger.log_system(f"Loaded historical data for {symbol}: Prev close={self.gap_data[symbol]['prev_close']}, Avg volume={self.volume_data[symbol]['avg_volume']:.0f}")
+                    else:
+                        logger.log_system(f"{symbol} - 거래량 데이터를 찾을 수 없음")
+                else:
+                    logger.log_system(f"{symbol} - 일봉 데이터가 없거나 비어 있음")
+            else:
+                error_msg = price_data.get("msg1", "Unknown error")
+                logger.log_system(f"{symbol} - 일봉 데이터 조회 실패: {error_msg}")
+            
             # 실시간 뉴스 데이터 확인 (if available)
             news_data = api_client.get_stock_info(symbol)
             if self.params["skip_news_symbols"] and news_data.get("rt_cd") == "0":

@@ -85,29 +85,97 @@ class VolumeStrategy:
         try:
             # 일봉 데이터 조회
             price_data = api_client.get_daily_price(symbol)
-            if price_data.get("rt_cd") == "0" and "output" in price_data:
-                daily_data = price_data["output"].get("lst", [])
-                
+            if price_data.get("rt_cd") == "0":
                 volumes = []
-                for item in daily_data[:self.params["look_back_periods"]]:
-                    volumes.append(int(item.get("acml_vol", 0)))
                 
-                # 평균 거래량 계산
-                if volumes:
-                    self.volume_data[symbol]['historical_volumes'].extend(volumes)
-                    self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
+                # output2가 실제 일봉 데이터 배열임
+                daily_data = price_data.get("output2", [])
+                
+                if daily_data:
+                    logger.log_system(f"{symbol} - 볼륨 전략 일봉 데이터 {len(daily_data)}개 로드")
                     
-                    logger.log_system(f"Loaded historical volume data for {symbol}: Avg={self.volume_data[symbol]['avg_volume']}")
+                    # look_back_periods 개수만큼 필터링
+                    for item in daily_data[:self.params["look_back_periods"]]:
+                        # 거래량 필드 확인 (다양한 필드명에 대응)
+                        volume = 0
+                        if "acml_vol" in item:
+                            volume = int(item["acml_vol"])
+                        elif "vol" in item:
+                            volume = int(item["vol"])
+                        elif "volume" in item:
+                            volume = int(item["volume"])
+                        
+                        if volume > 0:
+                            volumes.append(volume)
+                    
+                    # 평균 거래량 계산
+                    if volumes:
+                        self.volume_data[symbol]['historical_volumes'].extend(volumes)
+                        self.volume_data[symbol]['avg_volume'] = np.mean(volumes)
+                        
+                        logger.log_system(f"일봉 거래량 데이터 로드 완료 - {symbol}: 평균={self.volume_data[symbol]['avg_volume']:.0f}")
+                    else:
+                        logger.log_system(f"{symbol} - 거래량 데이터를 찾을 수 없음")
+                else:
+                    logger.log_system(f"{symbol} - 일봉 데이터가 없음")
+            else:
+                error_msg = price_data.get("msg1", "Unknown error")
+                logger.log_system(f"{symbol} - 일봉 데이터 조회 실패: {error_msg}")
             
             # 분봉 데이터 조회 (당일)
             minute_data = api_client.get_minute_price(symbol)
-            if minute_data.get("rt_cd") == "0" and "output" in minute_data:
-                minute_items = minute_data["output"].get("lst", [])
+            if minute_data.get("rt_cd") == "0":
+                # output2가 실제 분봉 데이터 배열임
+                minute_items = minute_data.get("output2", [])
                 
-                for item in minute_items[:60]:  # 최근 60개 분봉
-                    volume = int(item.get("cntg_vol", 0))
-                    self.volume_data[symbol]['minute_volumes'].append(volume)
-            
+                if minute_items:
+                    logger.log_system(f"{symbol} - 볼륨 전략 분봉 데이터 {len(minute_items)}개 로드")
+                    
+                    # 최근 60개 분봉 처리
+                    for item in minute_items[:60]:
+                        # 거래량 필드 확인
+                        volume = 0
+                        if "cntg_vol" in item:
+                            volume = int(item["cntg_vol"])
+                        elif "vol" in item:
+                            volume = int(item["vol"])
+                        elif "volume" in item:
+                            volume = int(item["volume"])
+                        
+                        # 시간 정보 추출
+                        time_str = ""
+                        if "time" in item:
+                            time_str = item["time"]
+                        elif "bass_tm" in item:
+                            time_str = item["bass_tm"]
+                        
+                        # 유효한 시간 형식인지 확인
+                        timestamp = None
+                        if time_str and len(time_str) >= 6:
+                            try:
+                                hour = int(time_str[:2])
+                                minute = int(time_str[2:4])
+                                timestamp = datetime.now().replace(hour=hour, minute=minute)
+                            except ValueError:
+                                timestamp = datetime.now()
+                        else:
+                            timestamp = datetime.now()
+                        
+                        # 분봉 거래량 데이터 저장
+                        self.volume_data[symbol]['minute_volumes'].append({
+                            'volume': volume,
+                            'minute': timestamp.minute,
+                            'hour': timestamp.hour,
+                            'timestamp': timestamp
+                        })
+                    
+                    logger.log_system(f"{symbol} - 분봉 거래량 데이터 로드 완료: {len(self.volume_data[symbol]['minute_volumes'])}개")
+                else:
+                    logger.log_system(f"{symbol} - 분봉 데이터가 없음")
+            else:
+                error_msg = minute_data.get("msg1", "Unknown error")
+                logger.log_system(f"{symbol} - 분봉 데이터 조회 실패: {error_msg}")
+        
         except Exception as e:
             logger.log_error(e, f"Error loading historical volume data for {symbol}")
     

@@ -94,24 +94,68 @@ class MomentumStrategy:
                 volumes = []
                 timestamps = []
                 
-                # API 응답에서 필요한 데이터 추출
-                for item in reversed(price_data["output"]["lst"]):  # 과거 -> 최근 순으로 처리
-                    prices.append(float(item["stck_prpr"]))
-                    volumes.append(int(item.get("cntg_vol", 0)))
-                    timestamps.append(item.get("bass_tm", ""))
+                # API 응답에서 필요한 데이터 추출 - output2가 실제 차트 데이터
+                chart_data = price_data.get("output2", [])
                 
-                # 가격 데이터 저장
-                for i in range(len(prices)):
-                    self.price_data[symbol].append({
-                        "price": prices[i],
-                        "volume": volumes[i],
-                        "timestamp": datetime.now() - timedelta(minutes=len(prices)-i)
-                    })
-                
-                # 초기 지표 계산
-                self._calculate_indicators(symbol)
-                
-                logger.log_system(f"Loaded initial data for {symbol}: {len(prices)} data points")
+                if chart_data:
+                    logger.log_system(f"{symbol} - 모멘텀 전략 초기 데이터 {len(chart_data)}개 로드 성공")
+                    
+                    # 일반적으로 최신 데이터가 먼저 오므로, 과거->현재 순서로 처리하기 위해 reversed 사용
+                    # API 응답 구조에 따라 달라질 수 있음
+                    for item in reversed(chart_data):
+                        # 가격 데이터 - stck_prpr 또는 clos 필드 사용
+                        if "stck_prpr" in item:
+                            prices.append(float(item["stck_prpr"]))
+                        elif "clos" in item:  # 종가(clos) 필드가 있는 경우
+                            prices.append(float(item["clos"]))
+                        else:
+                            continue  # 가격 데이터가 없으면 건너뜀
+                        
+                        # 거래량 데이터 - cntg_vol 또는 vol 필드 사용
+                        if "cntg_vol" in item:
+                            volumes.append(int(item["cntg_vol"]))
+                        elif "vol" in item:
+                            volumes.append(int(item["vol"]))
+                        else:
+                            volumes.append(0)  # 거래량 데이터가 없으면 0으로 설정
+                        
+                        # 시간 데이터 - bass_tm 또는 time 필드 사용
+                        if "bass_tm" in item:
+                            timestamps.append(item["bass_tm"])
+                        elif "time" in item:
+                            timestamps.append(item["time"])
+                        else:
+                            timestamps.append("")  # 시간 데이터가 없으면 빈 문자열로 설정
+                    
+                    # 가격 데이터 저장
+                    for i in range(len(prices)):
+                        # 시간 정보가 있으면 파싱, 없으면 현재 시간에서 역산
+                        if timestamps[i] and len(timestamps[i]) >= 6:
+                            # 시간 형식에 맞게 파싱 (예: "093000" -> 09:30:00)
+                            try:
+                                hour = int(timestamps[i][:2])
+                                minute = int(timestamps[i][2:4])
+                                second = int(timestamps[i][4:6])
+                                timestamp = datetime.now().replace(hour=hour, minute=minute, second=second)
+                            except ValueError:
+                                # 시간 파싱 실패 시 현재 시간에서 역산
+                                timestamp = datetime.now() - timedelta(minutes=len(prices)-i)
+                        else:
+                            # 시간 정보가 없으면 현재 시간에서 역산
+                            timestamp = datetime.now() - timedelta(minutes=len(prices)-i)
+                        
+                        self.price_data[symbol].append({
+                            "price": prices[i],
+                            "volume": volumes[i],
+                            "timestamp": timestamp
+                        })
+                    
+                    # 초기 지표 계산
+                    self._calculate_indicators(symbol)
+                    
+                    logger.log_system(f"Loaded initial data for {symbol}: {len(prices)} data points")
+                else:
+                    logger.log_system(f"{symbol} - 모멘텀 전략 초기 데이터 없음")
                 
         except Exception as e:
             logger.log_error(e, f"Error loading initial data for {symbol}")

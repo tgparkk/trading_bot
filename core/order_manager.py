@@ -296,19 +296,69 @@ class OrderManager:
             # 변동성 체크
             price_data = api_client.get_daily_price(symbol)
             if price_data.get("rt_cd") == "0":
-                prices = [float(d["stck_clpr"]) for d in price_data["output2"]]
-                volatility = self._calculate_volatility(prices)
-                if volatility > self.trading_config.max_volatility:
-                    logger.log_system(f"Risk check failed: High volatility for {symbol}")
-                    return False
+                try:
+                    daily_data = price_data.get("output2", [])
+                    prices = []
+                    
+                    # 가격 데이터 추출 - 일반적인 필드명 확인
+                    for d in daily_data:
+                        for field in ["stck_clpr", "clos", "close", "clpr"]:
+                            if field in d and float(d[field]) > 0:
+                                prices.append(float(d[field]))
+                                break
+                    
+                    # 변동성 계산 및 검증
+                    if len(prices) >= 2:
+                        volatility = self._calculate_volatility(prices)
+                        if volatility > self.trading_config.max_volatility:
+                            logger.log_system(f"Risk check failed: High volatility for {symbol}")
+                            return False
+                except Exception as e:
+                    logger.log_error(e, f"Volatility check error: {symbol}")
             
             # 거래량 체크
-            volume_data = api_client.get_market_trading_volume()
+            volume_data = api_client.get_market_trading_volume(market_code="J", top_n=100)
             if volume_data.get("rt_cd") == "0":
-                symbol_volume = next((item for item in volume_data["output2"] if item["mksc_shrn_iscd"] == symbol), None)
-                if symbol_volume and int(symbol_volume.get("prdy_vrss_vol", 0)) < self.trading_config.min_daily_volume:
-                    logger.log_system(f"Risk check failed: Low trading volume for {symbol}")
-                    return False
+                volume_items = volume_data.get("output2", [])
+                # 특정 종목 찾기
+                symbol_volume = next((item for item in volume_items if item.get("mksc_shrn_iscd") == symbol), None)
+                
+                if symbol_volume:
+                    # 해당 종목 거래량 확인
+                    volume_field = "prdy_vrss_vol"  # 실제 API 응답의 거래량 필드명으로 수정 필요
+                    
+                    # 다양한 필드명 시도
+                    for field in ["prdy_vrss_vol", "vol", "acml_vol", "cntg_vol", "volume"]:
+                        if field in symbol_volume:
+                            volume_field = field
+                            break
+                            
+                    volume = int(symbol_volume.get(volume_field, 0))
+                    if volume < self.trading_config.min_daily_volume:
+                        logger.log_system(f"Risk check failed: Low trading volume for {symbol} - {volume} < {self.trading_config.min_daily_volume}")
+                        return False
+                else:
+                    # 특정 종목이 상위 거래량 목록에 없는 경우
+                    logger.log_system(f"Risk check: {symbol} not found in top volume list, using alternate check")
+                    
+                    # 대안: 해당 종목의 일봉 데이터에서 거래량 확인
+                    try:
+                        daily_data = api_client.get_daily_price(symbol)
+                        if daily_data.get("rt_cd") == "0" and daily_data.get("output2"):
+                            latest_data = daily_data["output2"][0]  # 최신 데이터
+                            
+                            # 거래량 필드 확인
+                            volume = 0
+                            for field in ["acml_vol", "vol", "volume"]:
+                                if field in latest_data:
+                                    volume = int(latest_data[field])
+                                    break
+                                    
+                            if volume < self.trading_config.min_daily_volume:
+                                logger.log_system(f"Risk check failed: Low trading volume for {symbol} - {volume} < {self.trading_config.min_daily_volume}")
+                                return False
+                    except Exception as e:
+                        logger.log_error(e, f"Failed to check volume for {symbol} from daily data")
             
             return True
             
