@@ -26,92 +26,71 @@ class StockExplorer:
             List[str]: 거래량 상위 종목 목록
         """
         try:
-            # 디버깅: 시장 타입 확인
-            logger.log_system(f"거래량 상위 종목 조회 시작 - 시장 타입: {market_type}")
+            # 1) 시장 코드 변환
+            market_code_map = {
+                "ALL": "J",  # 전체 (API에서는 J로 사용)
+                "KOSPI": "S", # 코스피
+                "KOSDAQ": "K" # 코스닥
+            }
+            market_code = market_code_map.get(market_type, "J")
             
-            # 1) 거래량 순위 API 호출
-            # 시장 코드 변환 (ALL: 전체, KOSPI: 코스피, KOSDAQ: 코스닥)
-            market_code = {
-                "ALL": "ALL", 
-                "KOSPI": "KOSPI", 
-                "KOSDAQ": "KOSDAQ"
-            }.get(market_type, "ALL")
-            
-            logger.log_system(f"API 호출 전 - 시장 코드: {market_code}")
-            
-            try:
-                vol_data = api_client.get_volume_ranking(market=market_code)
-            except Exception as api_error:
-                logger.log_error(api_error, f"API 호출 중 예외 발생")
-                self._log_search_failure(f"API 호출 예외: {str(api_error)}")
-                return []
-            
-            # API 응답 전체 로깅 (디버깅용)
-            logger.log_system(f"API 응답 구조: {list(vol_data.keys())}")
-            logger.log_system(f"API 응답 rt_cd: {vol_data.get('rt_cd')}")
-            logger.log_system(f"API 응답 msg1: {vol_data.get('msg1', 'N/A')}")
-            
-            # API 응답 로깅 (오류 발생 시에만)
-            if vol_data.get("rt_cd") != "0":
-                logger.log_system(f"API 응답 전체 내용: {vol_data}")
-            
-            if vol_data.get("rt_cd") != "0":
-                logger.log_error("거래량 순위 조회 실패: " + vol_data.get("msg_cd", "알 수 없는 오류"))
-                self._log_search_failure("거래량 순위 조회 실패: " + vol_data.get("msg_cd", "알 수 없는 오류"))
-                return []
-
-            # 응답 키 확인 및 데이터 추출
-            output_key = None
-            for key in vol_data.keys():
-                if key.startswith("output"):
-                    output_key = key
-                    break
-                    
-            if not output_key:
-                logger.log_system("API 응답 전체 내용: " + str(vol_data))
-                logger.log_error("거래량 순위 응답에 output 키가 없습니다")
-                self._log_search_failure("거래량 순위 응답에 output 키가 없습니다")
-                return []
-                
-            # 상위 종목 추출
+            # 최대 종목 수 설정
             max_symbols = self.filters.get("max_symbols", 100)
             
-            # 응답 구조에 따라 데이터 추출 방식 변경
-            if isinstance(vol_data[output_key], list):
-                # 리스트 형태인 경우
-                raw_list = vol_data[output_key][:max_symbols]
-                # 심볼 코드 필드명 확인
-                if len(raw_list) > 0:
-                    sample_item = raw_list[0]
-                    symbol_field = None
+            # 2) 거래량 순위 API 호출 (새로운 함수 형식으로 매개변수 맞춤)
+            vol_data = api_client.get_market_trading_volume(
+                market_code=market_code,
+                sort_type="1",  # 1: 거래량상위
+                top_n=max_symbols
+            )
+            
+            # 3) API 응답 검증
+            if vol_data.get("rt_cd") != "0":
+                logger.log_error("거래량 순위 조회 실패: " + vol_data.get("msg1", "알 수 없는 오류"))
+                self._log_search_failure("거래량 순위 조회 실패: " + vol_data.get("msg1", "알 수 없는 오류"))
+                return []
+
+            # 4) 데이터 추출 (고정된 output2 응답 구조 사용)
+            volume_items = vol_data.get("output2", [])
+            if not volume_items:
+                logger.log_error("거래량 순위 데이터가 비어 있습니다")
+                self._log_search_failure("거래량 순위 데이터가 비어 있습니다")
+                return []
+                
+            # 5) 종목 코드 추출 (다양한 필드명 시도)
+            symbols = []
+            symbol_fields = ["mksc_shrn_iscd", "iscd_code", "symbol", "code"]
+            
+            # 첫 항목에서 심볼 필드 이름 찾기
+            symbol_field = None
+            if volume_items:
+                sample_item = volume_items[0]
+                for field in symbol_fields:
+                    if field in sample_item:
+                        symbol_field = field
+                        break
+                        
+                # 필드 이름 없을 경우 모든 키 검사
+                if not symbol_field:
                     for field in sample_item.keys():
                         if "iscd" in field.lower() or "code" in field.lower() or "symbol" in field.lower():
                             symbol_field = field
                             break
-                    
-                    if symbol_field:
-                        symbols = [item[symbol_field] for item in raw_list]
-                    else:
-                        logger.log_system("첫 번째 항목 구조: " + str(sample_item))
-                        logger.log_error("심볼 코드 필드를 찾을 수 없습니다")
-                        self._log_search_failure("심볼 코드 필드를 찾을 수 없습니다")
-                        return []
-                else:
-                    logger.log_error("거래량 순위 데이터가 비어 있습니다")
-                    self._log_search_failure("거래량 순위 데이터가 비어 있습니다")
-                    return []
+            
+            # 심볼 필드 찾았으면 추출
+            if symbol_field:
+                symbols = [item[symbol_field] for item in volume_items if symbol_field in item]
             else:
-                # 리스트가 아닌 경우 (딕셔너리 등)
-                logger.log_system("API 응답 output 구조: " + str(vol_data[output_key]))
-                logger.log_error("예상치 못한 API 응답 구조")
-                self._log_search_failure("예상치 못한 API 응답 구조")
+                logger.log_system("첫 번째 항목 구조: " + str(volume_items[0] if volume_items else "없음"))
+                logger.log_error("심볼 코드 필드를 찾을 수 없습니다")
+                self._log_search_failure("심볼 코드 필드를 찾을 수 없습니다")
                 return []
             
-            # 종목 스캔 결과 요약 기록 - 매번 상세 로그 대신 요약만 남김
+            # 6) 결과 로깅
             scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.log_system(f"거래량 상위 {len(symbols)}개 종목을 선택했습니다. ({market_type})")
             
-            # 전체 스캔 결과 요약 로그 (trade.log에 기록)
+            # 전체 스캔 결과 요약 로그
             logger.log_trade(
                 action="SCAN",
                 symbol="ALL",
@@ -119,16 +98,14 @@ class StockExplorer:
                 quantity=len(symbols),
                 reason=f"[{market_type}] 거래량 기준 종목 스캔",
                 scan_time=scan_time,
-                top_symbols=", ".join(symbols[:5])  # 상위 5개만 기록하여 로그 크기 감소
+                top_symbols=", ".join(symbols[:5])  # 상위 5개만 기록
             )
             
-            # 상위 5개 종목만 로그에 남김 (10개에서 축소)
-            for i, symbol in enumerate(symbols[:5]):
+            # 상위 5개 종목 정보 로깅
+            for symbol in symbols[:5]:
                 try:
-                    logger.log_system(f"종목 정보 조회 {i+1}/5: {symbol}")
                     symbol_info = self.get_symbol_info(symbol)
                     if symbol_info:
-                        # 각 종목별 상세 정보 로그 (trade.log에 기록)
                         logger.log_trade(
                             action="SYMBOL_INFO",
                             symbol=symbol,
@@ -142,8 +119,8 @@ class StockExplorer:
                 except Exception as e:
                     logger.log_error(e, f"종목 {symbol} 정보 로깅 실패")
             
-            # 종목 탐색 로그 저장
-            self._log_search_success(len(raw_list), len(symbols))
+            # 성공 로그
+            self._log_search_success(len(volume_items), len(symbols))
             
             return symbols
             

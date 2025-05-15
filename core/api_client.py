@@ -1249,127 +1249,96 @@ class KISAPIClient:
         return self._make_request("GET", path, headers=headers, params=params)
     
     def get_minute_price(self, symbol: str, time_unit: str = "1") -> Dict[str, Any]:
-        """분 단위 가격 정보 조회
-        
-        Args:
-            symbol (str): 종목 코드
-            time_unit (str): 시간 단위 ("1":1분, "3":3분, "5":5분, "10":10분, "15":15분, "30":30분, "60":60분)
         """
+        분봉 차트 데이터 조회 (한국투자증권 API)
+        Args:
+            symbol: 종목코드
+            time_unit: 분봉 단위 (1, 3, 5, 10, 15, 30, 60)
+        Returns:
+            API 응답 데이터
+        """
+        path = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        headers = {
+            "tr_id": "FHKST03010100",
+            "custtype": "P"
+        }
+        
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",  # 시장구분코드 J:주식, ETF, ETN
+            "FID_INPUT_ISCD": symbol,        # 종목코드
+            "FID_INPUT_HOUR_1": time_unit,   # 분봉단위
+            "FID_PW_DATA_INCU_YN": "Y"       # 과거데이터 포함여부 (Y:포함, N:미포함)
+        }
+        
         try:
-            path = "/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"  # 시간별 체결가 조회
-            
-            # 시간 단위별 FID_PW_DATA_INTP_HOUR_CLS_CODE 설정
-            hour_cls_code_map = {
-                "1": "0",   # 1분
-                "3": "1",   # 3분 (지원 안됨)
-                "5": "2",   # 5분
-                "10": "3",  # 10분
-                "15": "4",  # 15분 
-                "30": "5",  # 30분
-                "60": "6"   # 60분
-            }
-            
-            hour_cls_code = hour_cls_code_map.get(time_unit, "0")
-            
-            headers = {
-                "tr_id": "FHKST01010600"  # 분봉 조회 TR ID 
-            }
-            
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",      # 시장구분 (J: 주식)
-                "FID_INPUT_ISCD": symbol,            # 종목코드
-                "FID_PW_DATA_INTP_HOUR_CLS_CODE": hour_cls_code,  # 시간 클래스 코드
-                "FID_HOUR_CLS_CODE": hour_cls_code   # 시간 구분 코드 (중복인듯하지만 API 문서 따름)
-            }
-            
             result = self._make_request("GET", path, headers=headers, params=params)
             
+            # 성공 로그 기록
             if result.get("rt_cd") == "0":
-                logger.log_system(f"{symbol} {time_unit}분봉 데이터 조회 성공")
-                
-                # 응답 구조 통일화 (output.lst 형태로)
-                if "output" in result and not isinstance(result.get("output"), dict):
-                    # output이 리스트인 경우, lst 키로 변환
-                    output_data = result.get("output", [])
-                    result["output"] = {"lst": output_data}
-                elif "output" not in result:
-                    # output이 아예 없는 경우 빈 구조 생성
-                    result["output"] = {"lst": []}
-                
-                # output1, output2 등의 데이터가 있으면 lst에 통합
-                if "output1" in result and isinstance(result["output1"], list):
-                    result["output"] = {"lst": result["output1"]}
-                elif "output2" in result and isinstance(result["output2"], list):
-                    result["output"] = {"lst": result["output2"]}
-                    
+                output = result.get("output1", {})
+                chart_items = result.get("output2", [])
+                logger.log_system(f"{symbol} 분봉 데이터 조회 성공: {len(chart_items)}개 데이터")
             else:
-                error_msg = result.get("msg1", "알 수 없는 오류")
-                logger.log_system(f"{symbol} {time_unit}분봉 데이터 조회 실패: {error_msg}")
+                error_msg = result.get("msg1", "Unknown error")
+                logger.log_error(Exception(error_msg), f"{symbol} 분봉 데이터 조회 실패")
             
             return result
             
         except Exception as e:
-            logger.log_error(e, f"{symbol} 분봉 데이터 조회 중 오류 발생")
-            # 오류 발생 시에도 최소한의 응답 구조 제공
+            logger.log_error(e, f"{symbol} 분봉 데이터 조회 중 예외 발생")
+            # 오류 발생 시 빈 응답 반환
             return {
-                "rt_cd": "9999",
+                "rt_cd": "9999", 
                 "msg1": str(e),
-                "output": {"lst": []}
+                "output1": {},
+                "output2": []
             }
     
-    def get_daily_price(self, symbol: str, max_days: int = 30) -> Dict[str, Any]:
-        """일별 가격 정보 조회"""
+    def get_daily_price(self, symbol: str, period: str = "D", count: int = 30) -> Dict[str, Any]:
+        """
+        일봉 차트 데이터 조회 (한국투자증권 API)
+        Args:
+            symbol: 종목코드
+            period: 일봉 구분 (D:일봉, W:주봉, M:월봉)
+            count: 요청할 데이터 개수 (최대 100)
+        Returns:
+            API 응답 데이터
+        """
+        path = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = {
+            "tr_id": "FHKST03010100",
+            "custtype": "P"
+        }
+        
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",  # 시장구분코드 J:주식, ETF, ETN
+            "FID_INPUT_ISCD": symbol,        # 종목코드
+            "FID_PERIOD_DIV_CODE": period,   # 기간분류코드 (D:일봉, W:주봉, M:월봉)
+            "FID_ORG_ADJ_PRC": "0",          # 수정주가 원주가 가격 여부 (0:수정주가, 1:원주가)
+            "FID_INPUT_DATE_1": "",          # 입력일자1 (YYYYMMDD)
+            "FID_INPUT_DATE_2": "",          # 입력일자2 (YYYYMMDD)
+            "FID_DAY_1": count               # 요청 데이터 개수 (최대 100)
+        }
+        
         try:
-            path = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
-            headers = {
-                "tr_id": "FHKST01010400"  # 주식 일별 데이터 조회
-            }
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",  # 주식
-                "FID_INPUT_ISCD": symbol,
-                "FID_PERIOD_DIV_CODE": "D",  # 일봉
-                "FID_ORG_ADJ_PRC": "1",  # 수정주가 여부
-                "FID_INPUT_DATE_1": "",  # 조회 시작일 (빈값: 가장 최근)
-                "FID_INPUT_DATE_2": "",  # 조회 종료일 (빈값: 가장 오래된)
-                "FID_INPUT_DATE_PERIODIC_DIV_CODE": "0",  # 기간분류코드
-                "FID_INCL_OPEN_START_PRC_YN": "Y",  # 시가 포함
-            }
-            
             result = self._make_request("GET", path, headers=headers, params=params)
             
+            # 성공 로그 기록
             if result.get("rt_cd") == "0":
-                logger.log_system(f"{symbol} 일별 가격 데이터 조회 성공")
+                output1 = result.get("output1", {})
+                chart_items = result.get("output2", [])
+                logger.log_system(f"{symbol} 일봉 데이터 조회 성공: {len(chart_items)}개 데이터")
             else:
-                error_msg = result.get("msg1", "알 수 없는 오류")
-                logger.log_system(f"{symbol} 일별 가격 데이터 조회 실패: {error_msg}")
-            
-            # 응답 구조 확인 및 데이터 처리
-            if result.get("rt_cd") == "0" and "output1" in result and "output2" not in result:
-                # output2가 누락된 경우, 데이터를 output2 형식으로 변환하여 추가
-                result["output2"] = []
-                if "output1" in result and isinstance(result["output1"], dict):
-                    daily_items = []
-                    # 최근 30일 데이터 생성 (실제 데이터가 없는 경우 대비)
-                    for i in range(max_days):
-                        date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
-                        daily_items.append({
-                            "stck_bsop_date": date,
-                            "stck_clpr": result["output1"].get("stck_prpr", "0"),  # 종가
-                            "acml_vol": result["output1"].get("acml_vol", "0"),  # 거래량
-                            "stck_oprc": result["output1"].get("stck_oprc", "0"),  # 시가
-                            "stck_hgpr": result["output1"].get("stck_hgpr", "0"),  # 고가
-                            "stck_lwpr": result["output1"].get("stck_lwpr", "0")   # 저가
-                        })
-                    result["output2"] = daily_items
-                    logger.log_system(f"{symbol} 일별 데이터 변환 처리 완료 (출력2 형식으로 생성)")
+                error_msg = result.get("msg1", "Unknown error")
+                logger.log_error(Exception(error_msg), f"{symbol} 일봉 데이터 조회 실패: {error_msg}")
             
             return result
             
         except Exception as e:
-            logger.log_error(e, f"{symbol} 일별 가격 데이터 조회 중 오류 발생")
-            # 오류 발생 시에도 최소한의 응답 구조 제공
+            logger.log_error(e, f"{symbol} 일봉 데이터 조회 중 예외 발생")
+            # 오류 발생 시 빈 응답 반환
             return {
-                "rt_cd": "9999",
+                "rt_cd": "9999", 
                 "msg1": str(e),
                 "output1": {},
                 "output2": []
@@ -1490,79 +1459,60 @@ class KISAPIClient:
                 "output": []
             }
 
-    def get_market_trading_volume(self, market: str = "ALL") -> Dict[str, Any]:
-        """시장 거래량 정보 조회"""
+    def get_market_trading_volume(self, market_code: str = "J", sort_type: str = "1", top_n: int = 100) -> Dict[str, Any]:
+        """
+        거래량 상위 종목 조회 (한국투자증권 API)
+        Args:
+            market_code: 시장구분코드 (J:전체, S:코스피, K:코스닥, N:코넥스, ...)
+            sort_type: 정렬구분 (1:거래량상위, 2:거래대금상위, ...)
+            top_n: 조회할 종목 수 (최대 100)
+        Returns:
+            API 응답 데이터
+        """
+        path = "/uapi/domestic-stock/v1/quotations/volume-rank"
+        headers = {
+            "tr_id": "FHPST01710000",
+            "custtype": "P"
+        }
+        
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market_code,  # 시장구분코드
+            "FID_COND_SCR_DIV_CODE": sort_type,     # 정렬구분
+            "FID_INPUT_ISCD": "",                   # 종목코드
+            "FID_DIV_CLS_CODE": "",                 # 업종코드
+            "FID_BLNG_CLS_CODE": "",                # 소속부코드
+            "FID_TRGT_CLS_CODE": "",                # 대상코드
+            "FID_TRGT_EXLS_CLS_CODE": "",           # 제외코드
+            "FID_INPUT_PRICE_1": "",                # 입력가격1
+            "FID_INPUT_PRICE_2": "",                # 입력가격2
+            "FID_VOL_CNT": str(top_n),              # 조회할 종목 수
+            "FID_INPUT_DATE_1": ""                  # 입력일자
+        }
+        
         try:
-            # 로그 추가
-            logger.log_system(f"[API] 시장 거래량 조회 시작: 시장={market}")
+            result = self._make_request("GET", path, headers=headers, params=params)
             
-            # API 경로 및 헤더 설정
-            path = "/uapi/domestic-stock/v1/quotations/inquire-total-market-price"
-            headers = {
-                "tr_id": "FHKST03030100"  # 전체시장시세
-            }
-            
-            # 시장 코드 설정
-            market_code = ""
-            if market == "KOSPI":
-                market_code = "0"
-            elif market == "KOSDAQ":
-                market_code = "1"
-            # 기본값은 전체 시장
-            
-            # 파라미터 설정
-            params = {
-                "FID_COND_MRKT_DIV_CODE": market_code,
-                "FID_COND_SCR_DIV_CODE": "20171",  # 화면번호
-                "FID_INPUT_ISCD": "0",
-                "FID_DIV_CLS_CODE": "0",
-                "FID_BLNG_CLS_CODE": "0",
-                "FID_TRGT_CLS_CODE": "111111111",
-                "FID_TRGT_EXLS_CLS_CODE": "000000",
-                "FID_INPUT_PRICE_1": "0",
-                "FID_INPUT_PRICE_2": "0",
-                "FID_VOL_CNT": "0",
-                "FID_INPUT_DATE_1": ""
-            }
-            
-            try:
-                # API 요청 실행 (1회만 시도, 404 오류 처리를 위해)
-                result = self._make_request("GET", path, headers=headers, params=params, max_retries=1)
-                
-                # 성공 응답 처리
-                if result.get("rt_cd") == "0":
-                    logger.log_system(f"[API] 시장 거래량 조회 성공: 시장={market}")
-                    return result
+            # 성공 로그 기록
+            if result.get("rt_cd") == "0":
+                volume_items = result.get("output2", [])
+                if volume_items:
+                    logger.log_system(f"거래량 상위 종목 조회 성공: {len(volume_items)}개 데이터")
                 else:
-                    error_msg = result.get("msg1", "알 수 없는 오류")
-                    logger.log_warning(f"[API] 시장 거래량 조회 실패: {error_msg}")
-                    # 실패해도 빈 결과 반환하여 다른 처리 진행
-                    
-            except Exception as e:
-                # 일반적인 오류 또는 404 오류 처리
-                logger.log_warning(f"[API] 시장 거래량 조회 오류 발생: {str(e)}")
-                # 오류 발생해도 계속 진행
-            
-            # 실패 시 빈 결과 반환 (기본 구조만 포함)
-            # 실전 환경에서 거래량 체크가 필요한 경우 개별 종목 API로 조회하는 것으로 대체
-            logger.log_system("[API] 시장 거래량 API 호출 실패, 빈 결과 반환")
-            result = {
-                "rt_cd": "0",  # 성공으로 처리하여 다른 처리 계속 진행
-                "msg1": "API 호출 실패, 빈 결과 반환",
-                "output1": {},
-                "output2": []  # 빈 리스트 반환
-            }
+                    logger.log_system("거래량 상위 종목 조회: 데이터 없음")
+            else:
+                error_msg = result.get("msg1", "Unknown error")
+                logger.log_error(Exception(error_msg), f"거래량 상위 종목 조회 실패: {error_msg}")
             
             return result
             
         except Exception as e:
-            logger.log_error(e, "[API] 시장 거래량 데이터 조회 중 오류 발생")
-            # 오류 발생 시에도 최소한의 응답 구조 제공
+            logger.log_error(e, "거래량 상위 종목 조회 중 예외 발생")
+            # 오류 발생 시 빈 응답 반환
             return {
-                "rt_cd": "0",  # 성공으로 처리하여 다른 처리 계속 진행
+                "rt_cd": "9999", 
                 "msg1": str(e),
                 "output1": {},
-                "output2": []  # 빈 리스트 반환
+                "output2": []
             }
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
