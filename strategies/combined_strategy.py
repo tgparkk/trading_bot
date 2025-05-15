@@ -10,6 +10,7 @@ import numpy as np
 import os
 import random
 import threading
+import concurrent.futures
 
 from config.settings import config
 from core.api_client import api_client
@@ -294,17 +295,18 @@ class CombinedStrategy:
                 # API 호출 타임아웃 처리를 위한 Task 생성
                 get_symbol_task = asyncio.create_task(api_client.get_symbol_info(symbol))
                 try:
-                    # 2초 타임아웃 설정
-                    symbol_info = await asyncio.wait_for(get_symbol_task, timeout=2.0)
+                    # 타임아웃 증가: 2초 → 3초
+                    symbol_info = await asyncio.wait_for(get_symbol_task, timeout=3.0)
                     
                     if symbol_info and "current_price" in symbol_info:
                         current_price = float(symbol_info["current_price"])
                         is_test_data = symbol_info.get("is_test_data", False)
                         
+                        # 로그 레벨 조정 (시스템 로그 대신 디버그 로그로 변경)
                         if is_test_data:
-                            logger.log_system(f"[전략] {symbol} - 테스트 데이터 사용: {current_price:,}원")
+                            logger.log_debug(f"[전략] {symbol} - 테스트 데이터 사용: {current_price:,}원")
                         else:
-                            logger.log_system(f"[전략] {symbol} - API에서 가격 가져옴: {current_price:,}원")
+                            logger.log_debug(f"[전략] {symbol} - API에서 가격 가져옴: {current_price:,}원")
                         
                         # 가격 데이터 업데이트
                         if symbol not in self.price_data:
@@ -328,57 +330,81 @@ class CombinedStrategy:
                                 'last_price': current_price
                             }
                     else:
-                        logger.log_system(f"[전략] {symbol} - API 응답에 가격 정보 없음")
+                        logger.log_debug(f"[전략] {symbol} - API 응답에 가격 정보 없음")
                         
                 except asyncio.TimeoutError:
-                    logger.log_system(f"[전략] {symbol} - API 가격 조회 타임아웃 (2초)")
+                    logger.log_debug(f"[전략] {symbol} - API 가격 조회 타임아웃 (3초)")
                     # 타임아웃 발생 시 이전 가격 사용 또는 테스트 데이터 생성
                     await self._handle_price_fallback(symbol)
                 
             except Exception as e:
-                logger.log_error(e, f"{symbol} - API 가격 조회 실패")
+                logger.log_warning(f"[전략] {symbol} - API 가격 조회 실패: {str(e)}")
                 # API 실패 시 이전 가격 사용 또는 대체 데이터 생성
                 await self._handle_price_fallback(symbol)
             
-            # 각 전략별 신호 업데이트
+            # 병렬 처리를 위한 Task 리스트
+            signal_tasks = []
+            
+            # 각 전략별 신호 업데이트 - 병렬 처리
             for strategy_name, strategy in self.strategies.items():
                 if strategy is None:
-                    logger.log_system(f"[전략] {symbol} - {strategy_name} 전략이 None이므로 건너뜀")
+                    logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략이 None이므로 건너뜀")
                     continue
                 
-                try:
-                    logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 요청 시작")
-                    
-                    # 전략별 신호 취득에도 타임아웃 설정
-                    get_signal_task = asyncio.create_task(strategy.get_signal(symbol))
+                # 비동기 Task 생성 (타임아웃 처리가 포함된 내부 함수)
+                async def get_strategy_signal(strat_name, strat_instance):
                     try:
-                        # 각 전략 호출에 2초 타임아웃 설정
-                        signal = await asyncio.wait_for(get_signal_task, timeout=2.0)
-                    except asyncio.TimeoutError:
-                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 호출 타임아웃 (2초)")
-                        signal = {'signal': 0, 'direction': 'NEUTRAL'}
+                        logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 신호 요청 시작")
+                        
+                        # 전략별 신호 취득에도 타임아웃 설정
+                        try:
+                            # 타임아웃 증가: 2초 → 3초
+                            signal = await asyncio.wait_for(strat_instance.get_signal(symbol), timeout=3.0)
+                            
+                            if signal is None:
+                                logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 신호가 None으로 반환됨")
+                                signal = {'signal': 0, 'direction': 'NEUTRAL'}  # None 대신 기본값 사용
+                            
+                            return strat_name, signal
+                        except asyncio.TimeoutError:
+                            logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 호출 타임아웃 (3초)")
+                            return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
+                        except Exception as signal_error:
+                            logger.log_warning(f"[전략] {symbol} - {strat_name} 신호 계산 중 오류: {str(signal_error)}")
+                            return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
+                    except Exception as task_error:
+                        logger.log_warning(f"[전략] {symbol} - {strat_name} Task 실행 중 오류: {str(task_error)}")
+                        return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
+                
+                # Task 생성 및 리스트에 추가
+                task = asyncio.create_task(get_strategy_signal(strategy_name, strategy))
+                signal_tasks.append(task)
+            
+            # 모든 전략의 신호를 병렬로 기다림 (최대 4초 타임아웃)
+            try:
+                strategy_results = await asyncio.wait_for(asyncio.gather(*signal_tasks, return_exceptions=True), timeout=4.0)
+                
+                # signals 딕셔너리 초기화
+                if symbol not in self.signals:
+                    current_price = 0
+                    if symbol in self.price_data and self.price_data[symbol]:
+                        current_price = self.price_data[symbol][-1]["price"]
                     
-                    if signal is None:
-                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호가 None으로 반환됨")
+                    self.signals[symbol] = {
+                        "strategies": {},
+                        "combined_signal": 0,
+                        "direction": "NEUTRAL",
+                        "last_update": datetime.now(),
+                        "last_price": current_price
+                    }
+                
+                # 전략 결과 저장
+                for result in strategy_results:
+                    if isinstance(result, Exception):
+                        logger.log_warning(f"[전략] {symbol} - 일부 전략 신호 계산 중 예외 발생: {str(result)}")
                         continue
                     
-                    # 전략 신호 저장
-                    if symbol not in self.signals:
-                        current_price = 0
-                        if symbol in self.price_data and self.price_data[symbol]:
-                            current_price = self.price_data[symbol][-1]["price"]
-                            
-                        self.signals[symbol] = {
-                            "strategies": {},
-                            "combined_signal": 0,
-                            "direction": "NEUTRAL",
-                            "last_update": datetime.now(),
-                            "last_price": current_price
-                        }
-                    
-                    # 신호, 방향, 가격 정보 저장
-                    if "strategies" not in self.signals[symbol]:
-                        self.signals[symbol]["strategies"] = {}
+                    strategy_name, signal = result
                     
                     # 명시적으로 신호 저장 및 유효성 확인
                     if isinstance(signal, dict) and 'signal' in signal and 'direction' in signal:
@@ -396,53 +422,51 @@ class CombinedStrategy:
                         direction_value = signal['direction']
                         if direction_value not in ["BUY", "SELL", "NEUTRAL"]:
                             direction_value = "NEUTRAL"
-                            
+                        
+                        # 검증된 값으로 저장
+                        if "strategies" not in self.signals[symbol]:
+                            self.signals[symbol]["strategies"] = {}
+                        
                         self.signals[symbol]["strategies"][strategy_name] = {
-                            'signal': signal_value,
+                            'signal': signal_value, 
                             'direction': direction_value
                         }
-                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 저장: 점수={signal_value:.1f}, 방향={direction_value}")
+                        
+                        logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호: {signal_value:.2f}, 방향: {direction_value}")
                     else:
-                        logger.log_system(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
-                        # 기본값 설정
-                        self.signals[symbol]["strategies"][strategy_name] = {'signal': 0, 'direction': 'NEUTRAL'}
-                    
-                except Exception as e:
-                    logger.log_error(e, f"{symbol} - {strategy_name} 전략 신호 가져오기 실패")
-                    # 오류 발생 시 기본값 설정
-                    if symbol in self.signals and "strategies" in self.signals[symbol]:
-                        self.signals[symbol]["strategies"][strategy_name] = {'signal': 0, 'direction': 'NEUTRAL'}
+                        # 유효하지 않은 신호 형식
+                        logger.log_warning(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
+                        
+                        # 기본값으로 저장
+                        if "strategies" not in self.signals[symbol]:
+                            self.signals[symbol]["strategies"] = {}
+                        
+                        self.signals[symbol]["strategies"][strategy_name] = {
+                            'signal': 0, 
+                            'direction': "NEUTRAL"
+                        }
                 
-                # 각 전략 호출 사이에 약간의 지연 추가
-                await asyncio.sleep(0.1)
+            except asyncio.TimeoutError:
+                logger.log_warning(f"[전략] {symbol} - 전체 전략 신호 업데이트 타임아웃 (4초)")
+                # 타임아웃 발생 시 기존 신호 정보 유지
+            except Exception as gather_error:
+                logger.log_warning(f"[전략] {symbol} - 전략 신호 수집 중 오류: {str(gather_error)}")
             
             # 통합 신호 계산
-            if symbol in self.signals and "strategies" in self.signals[symbol]:
-                # 필수 전략이 모두 있는지 확인
-                required_strategies = ['breakout', 'momentum', 'gap', 'vwap', 'volume']
-                for req_strategy in required_strategies:
-                    if req_strategy not in self.signals[symbol]['strategies']:
-                        logger.log_system(f"[전략] {symbol} - {req_strategy} 전략 신호 누락, 기본값으로 설정")
-                        self.signals[symbol]['strategies'][req_strategy] = {'signal': 0, 'direction': 'NEUTRAL'}
-                
-                # 디버그 로그: 계산 전 각 전략별 신호 출력
-                strategy_log = f"[신호계산] {symbol} 전략별 상태: "
-                for strat_name, strat_data in self.signals[symbol]['strategies'].items():
-                    strategy_log += f"{strat_name}={strat_data.get('signal', 0):.1f}({strat_data.get('direction', 'NEUTRAL')}), "
-                logger.log_system(strategy_log)
-                
-                # 통합 신호 계산
-                score, direction, agreements = self._calculate_combined_signal(symbol)
-                self.signals[symbol]["combined_signal"] = score
-                self.signals[symbol]["direction"] = direction
-                self.signals[symbol]["agreements"] = agreements
-                self.signals[symbol]["last_update"] = datetime.now()
-                logger.log_system(f"[전략] {symbol} - 통합 신호 계산 완료: 점수={score:.1f}, 방향={direction}, 동의={agreements}")
-            else:
-                logger.log_system(f"[전략] {symbol} - 통합 신호 계산을 위한 데이터 부족")
-        
+            score, direction, agreements = self._calculate_combined_signal(symbol)
+            
+            # 통합 신호 결과 저장
+            self.signals[symbol]["combined_signal"] = score
+            self.signals[symbol]["score"] = score
+            self.signals[symbol]["direction"] = direction
+            self.signals[symbol]["agreements"] = agreements
+            self.signals[symbol]["last_update"] = datetime.now()
+            
+            logger.log_system(f"[전략] {symbol} - 신호 업데이트 완료: 점수={score:.2f}, 방향={direction}")
+            
         except Exception as e:
-            logger.log_error(e, f"Error updating signals for {symbol}")
+            logger.log_warning(f"[전략] {symbol} - 신호 업데이트 중 오류: {str(e)}")
+            # 기존 신호 정보는 유지
     
     async def _handle_price_fallback(self, symbol: str):
         """API 가격 조회 실패 시 대체 가격 정보 생성"""
@@ -624,15 +648,14 @@ class CombinedStrategy:
                 
                 # 트레이딩 일시 중지 확인
                 try:
-                    is_paused_task = asyncio.create_task(order_manager.is_trading_paused())
-                    is_paused = await asyncio.wait_for(is_paused_task, timeout=2.0)
+                    # is_trading_paused는 코루틴이 아닌 일반 함수이므로 직접 호출
+                    is_paused = order_manager.is_trading_paused()
                     if is_paused:
                         await asyncio.sleep(1)
                         continue
-                except asyncio.TimeoutError:
-                    logger.log_system("is_trading_paused 호출 타임아웃, 기본값으로 진행")
                 except Exception as e:
                     logger.log_error(e, "is_trading_paused 호출 실패")
+                    # 오류 발생 시 기본값으로 계속 진행
                 
                 # 거래 신호 확인 및 실행 (평가 로그 생성)
                 for symbol in self.watched_symbols:
@@ -1229,15 +1252,39 @@ class CombinedStrategy:
                     # 루프가 실행중인지 확인
                     if loop.is_running():
                         # 이미 실행 중인 루프에서는 Future를 생성하여 실행
-                        future = asyncio.run_coroutine_threadsafe(self._update_signals(symbol), loop)
-                        future.result(timeout=2.0)  # 2초 타임아웃 설정
-                        logger.log_system(f"[전략] {symbol} - run_coroutine_threadsafe로 신호 업데이트 완료")
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(self._update_signals(symbol), loop)
+                            # 타임아웃 증가: 2초 → 5초
+                            future.result(timeout=5.0)  # 타임아웃 시간 증가
+                            logger.log_system(f"[전략] {symbol} - run_coroutine_threadsafe로 신호 업데이트 완료")
+                        except concurrent.futures._base.TimeoutError:
+                            # 타임아웃 발생 시 기존 신호 정보 사용
+                            logger.log_system(f"[전략] {symbol} - 신호 업데이트 타임아웃 발생, 기존 신호 정보 사용")
+                            # 오류 대신 경고로 처리
+                            logger.log_warning(f"[전략] {symbol} - 신호 업데이트 타임아웃")
                     else:
-                        # 루프가 실행 중이 아니라면 직접 실행
-                        loop.run_until_complete(self._update_signals(symbol))
-                        logger.log_system(f"[전략] {symbol} - run_until_complete로 신호 업데이트 완료")
+                        try:
+                            # 타임아웃 설정 추가
+                            async def run_with_timeout():
+                                # 비동기 타임아웃을 사용하여 신호 업데이트 실행
+                                try:
+                                    await asyncio.wait_for(self._update_signals(symbol), timeout=5.0)
+                                    return True
+                                except asyncio.TimeoutError:
+                                    logger.log_system(f"[전략] {symbol} - wait_for 타임아웃 발생, 기존 신호 정보 사용")
+                                    return False
+                            
+                            # 타임아웃 설정으로 실행
+                            update_success = loop.run_until_complete(run_with_timeout())
+                            if update_success:
+                                logger.log_system(f"[전략] {symbol} - run_until_complete로 신호 업데이트 완료")
+                            else:
+                                logger.log_warning(f"[전략] {symbol} - 신호 업데이트 타임아웃")
+                        except Exception as timeout_error:
+                            logger.log_warning(f"[전략] {symbol} - 신호 업데이트 중 예외 발생: {str(timeout_error)}")
                 except Exception as loop_error:
-                    logger.log_error(loop_error, f"[전략] {symbol} - 이벤트 루프 처리 중 오류, 신호 업데이트 실패")
+                    # 오류 레벨 변경 (error → warning)
+                    logger.log_warning(f"[전략] {symbol} - 이벤트 루프 처리 중 오류: {str(loop_error)}")
                     # 이벤트 루프 오류가 발생해도 저장된 신호 데이터는 반환
                 
                 # 개별 전략 신호 (없으면 초기화)

@@ -696,6 +696,10 @@ class GapStrategy:
             min_gap = self.params["min_gap_pct"]
             max_gap = self.params["max_gap_pct"]
             
+            # None 값 안전 처리
+            if gap_pct is None:
+                gap_pct = 0
+            
             if abs(gap_pct) < min_gap or abs(gap_pct) > max_gap:
                 return {"signal": 0, "direction": "NEUTRAL", "reason": "gap_size_out_of_range"}
             
@@ -705,6 +709,9 @@ class GapStrategy:
             
             # 갭 방향에 따른 트레이딩 방향
             gap_direction = gap_data.get('direction')
+            if gap_direction is None:
+                return {"signal": 0, "direction": "NEUTRAL", "reason": "direction_not_defined"}
+                
             if gap_direction == "UP":
                 direction = "SELL"  # 갭 업은 매도 신호 (갭 채움 예상)
                 signal_strength = min(10, abs(gap_pct) * 200)  # 갭이 클수록 강한 신호
@@ -714,6 +721,9 @@ class GapStrategy:
             
             # 거래량 요소 고려
             vol_ratio = self.volume_data.get(symbol, {}).get('volume_ratio', 0)
+            if vol_ratio is None:  # None 값 안전 처리
+                vol_ratio = 0
+                
             vol_threshold = self.params["volume_threshold"]
             
             # 거래량이 평균보다 높으면 신호 강화

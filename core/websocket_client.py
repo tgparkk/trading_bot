@@ -61,271 +61,186 @@ class KISWebSocketClient:
             bool: 연결 성공 여부
         """
         # 연결 동시성 제어 - 하나의 연결 시도만 허용
-        async with self.connection_lock:
-            # 연결 상태 확인
-            if self.is_connected():
-                logger.log_system("웹소켓이 이미 연결되어 있습니다.")
-                return True
-            
-            # 연결 시도 간격 관리 - 마지막 연결 시도와의 시간 간격 계산
-            current_time = datetime.now().timestamp()
-            time_since_last_attempt = current_time - self.last_connection_attempt
-            
-            # 너무 빠른 재시도 방지 - 최소 5초 간격 유지
-            if time_since_last_attempt < 5:
-                wait_time = 5 - time_since_last_attempt
-                logger.log_system(f"연결 간격 제한: 마지막 시도 후 {time_since_last_attempt:.1f}초 경과. {wait_time:.1f}초 더 대기합니다...")
-                await asyncio.sleep(wait_time)
-            
-            # 연결 시도 시간 기록 (실제 시도 직전에 기록)
-            self.last_connection_attempt = datetime.now().timestamp()
-            
-            try:
-                logger.log_system(f"웹소켓 연결 시도: {self.ws_url}")
+        try:
+            async with self.connection_lock:
+                # 연결 상태 확인
+                if self.is_connected():
+                    logger.log_system("웹소켓이 이미 연결되어 있습니다.")
+                    return True
                 
-                # 기존 연결이 있다면 완전히 정리
-                if self.ws:
-                    logger.log_system("기존 웹소켓 연결 정리 중...")
-                    try:
-                        await self.close()
-                        await asyncio.sleep(1)  # 자원 정리를 위한 추가 대기
-                    except Exception as close_error:
-                        logger.log_warning(f"기존 연결 정리 중 오류 (무시함): {close_error}")
+                # 연결 시도 간격 관리 - 마지막 연결 시도와의 시간 간격 계산
+                current_time = datetime.now().timestamp()
+                time_since_last_attempt = current_time - self.last_connection_attempt
                 
-                # 모든 상태 초기화
-                self.ws = None
-                self.running = False
-                self.auth_successful = False
+                # 너무 빠른 재시도 방지 - 최소 5초 간격 유지
+                if time_since_last_attempt < 5:
+                    wait_time = 5 - time_since_last_attempt
+                    logger.log_system(f"연결 간격 제한: 마지막 시도 후 {time_since_last_attempt:.1f}초 경과. {wait_time:.1f}초 더 대기합니다...")
+                    await asyncio.sleep(wait_time)
                 
-                # 웹소켓 연결 옵션 설정
-                connection_options = {
-                    "ping_interval": 30,    # 30초마다 ping 전송
-                    "ping_timeout": 10,     # ping 응답 10초 대기
-                    "close_timeout": 5,     # 종료 시 5초 대기
-                    "max_size": 1024 * 1024 * 10,  # 최대 메시지 크기 10MB
-                    "max_queue": 32        # 최대 대기열 크기
-                    # extra_headers 파라미터 제거 - websockets 15.0.1 버전에서 지원하지 않음
-                }
+                # 연결 시도 시간 기록 (실제 시도 직전에 기록)
+                self.last_connection_attempt = datetime.now().timestamp()
                 
-                # 연결 시도 - 타임아웃 처리
                 try:
-                    logger.log_system("웹소켓 연결 시도 시작...")
-                    self.ws = await asyncio.wait_for(
-                        websockets.connect(self.ws_url, **connection_options),
-                        timeout=15.0  # 연결 타임아웃 15초로 증가
-                    )
-                    logger.log_system("웹소켓 초기 연결 성공")
-                except asyncio.TimeoutError:
-                    logger.log_error(Exception("WebSocket connection timeout"), "웹소켓 연결 타임아웃 (15초)")
-                    self.ws = None
-                    return False
-                except websockets.exceptions.InvalidURI as uri_error:
-                    logger.log_error(uri_error, f"웹소켓 URL 오류: {self.ws_url}")
-                    self.ws = None
-                    return False
-                except (websockets.exceptions.InvalidHandshake, 
-                        websockets.exceptions.InvalidState,
-                        websockets.exceptions.ConnectionClosed) as ws_error:
-                    logger.log_error(ws_error, f"웹소켓 프로토콜 오류: {type(ws_error).__name__}")
-                    self.ws = None
-                    return False
-                except OSError as os_error:
-                    logger.log_error(os_error, f"네트워크 오류: {os_error}")
-                    self.ws = None
-                    return False
-                
-                # 웹소켓 연결이 확립된 상태
-                self.running = True
-                self.reconnect_attempts = 0  # 재연결 시도 횟수 초기화
-                
-                # 인증 시도
-                logger.log_system("웹소켓 인증 시도...")
-                try:
-                    # 인증 전 웹소켓 상태 확인
-                    if self.ws is None:
-                        logger.log_system("웹소켓 객체가 없습니다! 인증 시도 전 연결 한 번 더 확인 필요.")
-                        # 한 번 더 연결 시도
+                    logger.log_system(f"웹소켓 연결 시도: {self.ws_url}")
+                    
+                    # 기존 연결이 있다면 완전히 정리
+                    if self.ws:
+                        logger.log_system("기존 웹소켓 연결 정리 중...")
                         try:
-                            self.ws = await asyncio.wait_for(
-                                websockets.connect(self.ws_url, **connection_options),
-                                timeout=15.0
-                            )
-                            logger.log_system("웹소켓 연결 재시도 성공")
-                        except Exception as reconnect_error:
-                            logger.log_error(reconnect_error, "웹소켓 재연결 시도 실패")
-                            raise
+                            await self.close()
+                            await asyncio.sleep(1)  # 자원 정리를 위한 추가 대기
+                        except Exception as close_error:
+                            logger.log_warning(f"기존 연결 정리 중 오류 (무시함): {close_error}")
                     
-                    # 인증 시도
-                    auth_success = await asyncio.wait_for(
-                        self._authenticate(),
-                        timeout=10.0  # 인증 타임아웃 10초
-                    )
+                    # 모든 상태 초기화
+                    self.ws = None
+                    self.running = False
+                    self.auth_successful = False
                     
-                    if not auth_success:
-                        logger.log_error(Exception("WebSocket authentication failed"), "웹소켓 인증 실패")
-                        # 인증 실패 시 연결 정리
+                    # 현재 이벤트 루프 확인
+                    try:
+                        current_loop = asyncio.get_running_loop()
+                        logger.log_debug(f"현재 이벤트 루프 ID: {id(current_loop)}")
+                    except Exception as loop_error:
+                        logger.log_warning(f"이벤트 루프 확인 중 오류: {str(loop_error)}")
+                    
+                    # 웹소켓 연결 옵션 설정 - 타임아웃 값 조정 및 자동 핑 비활성화
+                    connection_options = {
+                        "ping_interval": None,  # 자동 핑을 비활성화 (수동으로 처리)
+                        "ping_timeout": None,   # 자동 핑 타임아웃도 비활성화
+                        "close_timeout": 10,    # 종료 시 대기 시간 증가
+                        "max_size": 1024 * 1024 * 10,  # 최대 메시지 크기 10MB
+                        "max_queue": 32         # 최대 대기열 크기
+                    }
+                    
+                    # 연결 시도 - 타임아웃 처리
+                    try:
+                        logger.log_system("웹소켓 연결 시도 시작...")
+                        self.ws = await asyncio.wait_for(
+                            websockets.connect(self.ws_url, **connection_options),
+                            timeout=20.0  # 연결 타임아웃 증가
+                        )
+                        logger.log_system("웹소켓 초기 연결 성공")
+                    except asyncio.TimeoutError:
+                        logger.log_error(Exception("WebSocket connection timeout"), "웹소켓 연결 타임아웃 (15초)")
+                        self.ws = None
+                        return False
+                    except websockets.exceptions.InvalidURI as uri_error:
+                        logger.log_error(uri_error, f"웹소켓 URL 오류: {self.ws_url}")
+                        self.ws = None
+                        return False
+                    except (websockets.exceptions.InvalidHandshake, 
+                            websockets.exceptions.InvalidState,
+                            websockets.exceptions.ConnectionClosed) as ws_error:
+                        logger.log_error(ws_error, f"웹소켓 프로토콜 오류: {type(ws_error).__name__}")
+                        self.ws = None
+                        return False
+                    except OSError as os_error:
+                        logger.log_error(os_error, f"네트워크 오류: {os_error}")
+                        self.ws = None
+                        return False
+                    
+                    # 웹소켓 연결이 확립된 상태
+                    self.running = True
+                    self.reconnect_attempts = 0  # 재연결 시도 횟수 초기화
+                    
+                    # 인증 과정 간소화 - 접속키만 발급받고 인증 과정 생략
+                    logger.log_system("웹소켓 접속키 발급 시도...")
+                    try:
+                        await self._get_approval_key()
+                        logger.log_system("웹소켓 접속키 발급 성공")
+                        self.auth_successful = True
+                    except Exception as key_error:
+                        logger.log_error(key_error, "웹소켓 접속키 발급 실패")
                         await self.close()
                         return False
+                    
+                    # 메시지 수신 루프 및 핑 태스크 시작
+                    try:
+                        # 태스크 생성 전에 기존 태스크가 있다면 취소
+                        if hasattr(self, '_receive_task') and self._receive_task and not self._receive_task.done():
+                            self._receive_task.cancel()
+                        if hasattr(self, '_ping_task') and self._ping_task and not self._ping_task.done():
+                            self._ping_task.cancel()
                         
-                except asyncio.TimeoutError:
-                    logger.log_error(Exception("WebSocket authentication timeout"), "웹소켓 인증 타임아웃 (10초)")
-                    await self.close()
-                    return False
-                except Exception as auth_error:
-                    logger.log_error(auth_error, f"웹소켓 인증 오류: {type(auth_error).__name__}")
-                    await self.close()
-                    return False
-                
-                logger.log_system("웹소켓 인증 성공")
-                
-                # 메시지 수신 루프 및 핑 태스크 시작
-                try:
-                    # 메시지 수신 루프 시작
-                    self._receive_task = asyncio.create_task(self._receive_messages())
+                        # 메시지 수신 루프 시작
+                        self._receive_task = asyncio.create_task(self._receive_messages())
+                        
+                        # 태스크 예외 처리를 위한 콜백 정의
+                        def handle_exception(task):
+                            if task.done() and not task.cancelled():
+                                try:
+                                    exception = task.exception()
+                                    if exception:
+                                        task_name = "receive_task" if task == self._receive_task else "ping_task"
+                                        logger.log_error(exception, f"웹소켓 {task_name} 예외 발생: {type(exception).__name__}")
+                                        # 재연결 태스크 시작 - 새 태스크로 래핑하여 실행
+                                        try:
+                                            asyncio.create_task(self._handle_reconnect())
+                                        except Exception as reconnect_error:
+                                            logger.log_error(reconnect_error, "재연결 태스크 생성 오류")
+                                except Exception as callback_error:
+                                    logger.log_error(callback_error, "태스크 콜백 처리 오류")
+                        
+                        # 예외 처리 콜백 등록
+                        self._receive_task.add_done_callback(handle_exception)
+                        
+                        # 핑 태스크 시작
+                        self._ping_task = asyncio.create_task(self._ping_loop())
+                        self._ping_task.add_done_callback(handle_exception)
+                        
+                        logger.log_system("웹소켓 관리 태스크 시작 완료")
+                    except Exception as task_error:
+                        logger.log_error(task_error, "웹소켓 태스크 시작 실패")
+                        await self.close()
+                        return False
                     
-                    # 태스크 예외 처리를 위한 콜백 정의
-                    def handle_exception(task):
-                        if task.done() and not task.cancelled():
-                            exception = task.exception()
-                            if exception:
-                                task_name = "receive_task" if task == self._receive_task else "ping_task"
-                                logger.log_error(exception, f"웹소켓 {task_name} 예외 발생: {type(exception).__name__}")
-                                # 재연결 태스크 시작
-                                asyncio.create_task(self._handle_reconnect())
-                    
-                    # 예외 처리 콜백 등록
-                    self._receive_task.add_done_callback(handle_exception)
-                    
-                    # 핑 태스크 시작
-                    self._ping_task = asyncio.create_task(self._ping_loop())
-                    self._ping_task.add_done_callback(handle_exception)
-                    
-                    logger.log_system("웹소켓 관리 태스크 시작 완료")
-                except Exception as task_error:
-                    logger.log_error(task_error, "웹소켓 태스크 시작 실패")
-                    await self.close()
-                    return False
-                
-                return True
-                
-            except Exception as e:
-                self.ws = None
-                self.running = False
-                self.auth_successful = False
-                logger.log_error(e, f"웹소켓 연결 실패: {type(e).__name__}")
-                return False
-    
-    async def _authenticate(self):
-        """웹소켓 인증"""
-        try:
-            # 웹소켓 접속 상태 로그
-            logger.log_system(f"[WEBSOCKET] 인증 시작 - 웹소켓 현재 상태: {self.ws is not None}")
-            
-            # 웹소켓이 없으면 인증 불가
-            if self.ws is None:
-                logger.log_error(Exception("WebSocket object is None"), "웹소켓 객체가 None이라 인증 실패")
-                return False
-            
-            # 접속키 획득 (1년 유효)
-            logger.log_system("접속키 획득 시도 중...")
-            approval_key = await self._get_approval_key()
-            logger.log_system(f"접속키 획득 성공: {approval_key[:5]}...")
-            
-            # 인증 데이터 형식 - 한국투자증권 표준 프로토콜 사용
-            tr_id = "VTTC0802U" # 웹소켓 인증용 tr_id
-            auth_data = {
-                "header": {
-                    "approval_key": approval_key,
-                    "custtype": "P",  # 개인
-                    "tr_type": "1",  # 등록
-                    "comid": "M4",  # 회사 ID
-                    "tr_id": tr_id
-                }
-            }
-            
-            logger.log_system(f"[WEBSOCKET] 인증 데이터 준비 완료: {json.dumps(auth_data, ensure_ascii=False)[:100]}...")
-            
-            await self.ws.send(json.dumps(auth_data))
-            logger.log_system("WebSocket authentication sent")
-            
-            # 인증 응답 대기 (최대 5초)
-            try:
-                response = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
-                auth_response = json.loads(response)
-                
-                # 응답 확인 - 인증 성공 여부
-                # 응답 로깅 추가 (디버깅용)
-                logger.log_system(f"WebSocket 인증 응답: {json.dumps(auth_response, ensure_ascii=False, indent=2)[:500]}")
-                
-                if auth_response.get("header", {}).get("rslt_cd") == "0":
-                    logger.log_system("WebSocket authentication successful")
-                    self.auth_successful = True
                     return True
-                else:
-                    header = auth_response.get("header", {})
-                    error_cd = header.get("rslt_cd", "Unknown")
-                    error_msg = header.get("rslt_msg", "Unknown error")
-                    logger.log_system(f"WebSocket authentication failed: code={error_cd}, message={error_msg}")
                     
-                    # 오류 처리
-                    if error_cd == "40":  # 임의로 40을 예시로 사용, 실제 코드에 따라 조정 필요
-                        logger.log_system("Approval key may be invalid, getting new key...")
-                        # 접속키 강제 갱신
-                        self.approval_key = None
-                        self.approval_key_expire_time = None
-                    
+                except Exception as e:
+                    self.ws = None
+                    self.running = False
                     self.auth_successful = False
+                    logger.log_error(e, f"웹소켓 연결 실패: {type(e).__name__}")
                     return False
-                    
-            except asyncio.TimeoutError:
-                logger.log_system("WebSocket authentication timeout - no response received")
-                self.auth_successful = False
-                return False
-                
-        except Exception as e:
-            logger.log_error(e, "WebSocket authentication error")
-            self.auth_successful = False
+        except Exception as lock_error:
+            logger.log_error(lock_error, "웹소켓 연결 락 획득 중 오류 발생")
             return False
     
     async def _get_approval_key(self) -> str:
-        """웹소켓 접속키 발급 (1년 유효)"""
+        """웹소켓 접속키 발급 (1년 유효)
+        
+        한국투자증권 웹소켓 접속키를 발급받습니다. 접속키는 1년간 유효하며,
+        캐싱하여 재사용합니다.
+        
+        Returns:
+            str: 발급받은 웹소켓 접속키
+        
+        Raises:
+            Exception: 접속키 발급 실패 시 발생
+        """
         import aiohttp
         
         # 현재 시간
         current_time = datetime.now().timestamp()
         
-        # 토큰 정보 확인 - API 클라이언트에서 취득
-        logger.log_system("[WEBSOCKET] API 클라이언트 토큰 정보 확인...")
-        from core.api_client import api_client
-        token_status = api_client.check_token_status()
-        logger.log_system(f"[WEBSOCKET] 토큰 상태: {token_status['status']}, 메시지: {token_status['message']}")
-        
-        # API 클라이언트의 토큰이 유효하지 않으면 강제 갱신
-        if token_status['status'] != 'valid':
-            logger.log_system("[WEBSOCKET] API 클라이언트 토큰 강제 갱신 시도")
-            refresh_result = api_client.force_token_refresh()
-            logger.log_system(f"[WEBSOCKET] API 클라이언트 토큰 강제 갱신 결과: {refresh_result['status']}")
-            await asyncio.sleep(1.0)  # 토큰 갱신 후 잠시 대기
-        
-        # 접속키 강제 재발급 표시가 있는지 확인
-        force_refresh = False  # 접속키 강제 갱신 비활성화
-        
         # 기존 접속키가 유효한지 확인 (1개월 이상 남아있으면 재사용)
-        if self.approval_key and self.approval_key_expire_time and not force_refresh:
+        if self.approval_key and self.approval_key_expire_time:
             remaining_days = (self.approval_key_expire_time - current_time) / (24 * 60 * 60)
             if remaining_days > 30:  # 1개월 이상 남아있으면 재사용
-                logger.log_system(f"웹소켓 접속키 재사용 (만료까지 {remaining_days:.0f}일 남음)")
+                logger.log_debug(f"웹소켓 접속키 재사용 (만료까지 {remaining_days:.0f}일 남음)")
                 return self.approval_key
             else:
                 logger.log_system(f"웹소켓 접속키 만료 임박 ({remaining_days:.0f}일 남음), 새로 발급")
         
-        # 새 접속키 발급 - 재시도 로직 추가
-        logger.log_system("웹소켓 접속키 발급 시작...")
+        # 새 접속키 발급
+        logger.log_system("웹소켓 접속키 발급 시작")
         
         url = f"{self.config.base_url}/oauth2/Approval"
         headers = {
             "content-type": "application/json",
-            "User-Agent": "Mozilla/5.0"  # User-Agent 추가
+            "User-Agent": "Mozilla/5.0"
         }
         body = {
             "grant_type": "client_credentials",
@@ -336,56 +251,49 @@ class KISWebSocketClient:
         # 최대 3회 재시도
         for retry in range(3):
             try:
-                # 타임아웃 추가
-                timeout = aiohttp.ClientTimeout(total=15)  # 타임아웃 증가
+                timeout = aiohttp.ClientTimeout(total=15)
                 
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(url, json=body, headers=headers) as response:
                         if response.status == 200:
                             data = await response.json()
                             
-                            # 응답 검증 - 원하는 필드가 있는지 확인
                             if "approval_key" not in data:
-                                logger.log_warning(f"API 응답에 approval_key 필드가 없습니다: {json.dumps(data)[:200]}")
+                                logger.log_warning(f"API 응답에 approval_key 필드가 없습니다: {data}")
                                 if retry < 2:
-                                    logger.log_system(f"접속키 발급 재시도 ({retry+1}/3)...")
                                     await asyncio.sleep(2)
                                     continue
                                 else:
-                                    raise Exception("API response missing approval_key field")
+                                    raise Exception("접속키 발급 응답에 approval_key 필드가 없습니다")
                                 
+                            # 접속키 저장 및 만료 시간 설정 (1년)
                             self.approval_key = data["approval_key"]
-                            # 접속키 만료 시간 설정 (1년)
                             self.approval_key_expire_time = current_time + (365 * 24 * 60 * 60)
                             
-                            logger.log_system(f"웹소켓 접속키 발급 성공 (1년간 유효)")
+                            logger.log_system("웹소켓 접속키 발급 성공 (1년간 유효)")
                             return self.approval_key
                         else:
                             error_text = await response.text()
-                            logger.log_warning(f"Failed to get approval key: {response.status}, {error_text}")
+                            logger.log_warning(f"접속키 발급 실패: HTTP {response.status}, {error_text}")
                             if retry < 2:
-                                logger.log_system(f"접속키 발급 재시도 ({retry+1}/3)...")
                                 await asyncio.sleep(2)
                                 continue
-                            else:
-                                raise Exception(f"Failed to get approval key: {response.status}")
+                            raise Exception(f"접속키 발급 실패 (HTTP {response.status})")
             except asyncio.TimeoutError:
-                logger.log_warning("Approval key request timed out")
                 if retry < 2:
-                    logger.log_system(f"접속키 발급 타임아웃 후 재시도 ({retry+1}/3)...")
+                    logger.log_warning(f"접속키 발급 요청 타임아웃 (재시도 {retry+1}/3)")
                     await asyncio.sleep(2)
                     continue
-                else:
-                    raise Exception("Approval key request timed out after 3 retries")
+                raise Exception("접속키 발급 요청이 3회 타임아웃되었습니다")
             except Exception as e:
-                logger.log_warning(f"Error getting approval key: {str(e)}")
+                # 마지막 시도가 아니면 재시도
                 if retry < 2:
-                    logger.log_system(f"오류 후 접속키 발급 재시도 ({retry+1}/3)...")
+                    logger.log_warning(f"접속키 발급 오류: {str(e)} (재시도 {retry+1}/3)")
                     await asyncio.sleep(2)
                     continue
-                else:
-                    logger.log_error(e, "Failed to get approval key after 3 retries")
-                    raise
+                # 마지막 시도에서 실패하면 예외 발생
+                logger.log_error(e, "웹소켓 접속키 발급 최종 실패")
+                raise
     
     async def subscribe_price(self, symbol: str, callback: Callable = None) -> bool:
         """실시간 가격 구독
@@ -556,92 +464,173 @@ class KISWebSocketClient:
                 except asyncio.TimeoutError:
                     # 60초 동안 메시지가 없으면 ping 전송
                     logger.log_system("WebSocket message receive timeout, sending ping")
-                    if self.ws:
+                    if self.ws and not getattr(self.ws, 'closed', True):
                         try:
                             pong = await self.ws.ping()
                             await asyncio.wait_for(pong, timeout=5.0)
                             logger.log_system("WebSocket ping successful")
-                        except:
-                            logger.log_system("WebSocket ping failed, reconnecting")
-                            await self._handle_reconnect()
+                        except Exception as ping_error:
+                            logger.log_system(f"WebSocket ping failed: {str(ping_error)}, reconnecting")
+                            # 직접 재연결 함수 호출 (태스크 생성 없이)
+                            await self._safe_reconnect()
                             break
                     else:
+                        logger.log_system("WebSocket connection is not available, breaking receive loop")
                         break
-                        
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.log_system(f"WebSocket connection closed: {str(e)}")
-            self.auth_successful = False
-            await self._handle_reconnect()
-            
+                except websockets.exceptions.ConnectionClosedError as e:
+                    logger.log_system(f"WebSocket connection closed: {str(e)}")
+                    self.auth_successful = False
+                    # 직접 재연결 함수 호출 (태스크 생성 없이)
+                    await self._safe_reconnect()
+                    break
+                except RuntimeError as e:
+                    if "got Future" in str(e) and "attached to a different loop" in str(e):
+                        logger.log_warning("이벤트 루프 불일치 오류 - 수신 루프를 중단합니다.")
+                        break
+                    else:
+                        logger.log_error(e, "메시지 수신 루프에서 런타임 오류 발생")
+                        await self._safe_reconnect()
+                        break
+                except Exception as e:
+                    logger.log_error(e, "Error in message receive loop")
+                    self.auth_successful = False
+                    # 직접 재연결 함수 호출 (태스크 생성 없이)
+                    await self._safe_reconnect()
+                    break
+        except asyncio.CancelledError:
+            logger.log_system("메시지 수신 루프가 취소되었습니다.")
         except Exception as e:
-            logger.log_error(e, "Error in message receive loop")
-            self.auth_successful = False
-            await self._handle_reconnect()
+            logger.log_error(e, "메시지 수신 루프에서 예상치 못한 오류 발생")
     
     async def _process_message(self, message: str):
         """메시지 처리"""
         try:
+            # 서버로부터 받은 메시지 길이 기록 (로그 길이 제한)
+            max_log_length = 100
+            shortened_message = message[:max_log_length] + ('...' if len(message) > max_log_length else '')
+            logger.log_debug(f"수신 메시지: {shortened_message}")
+            
+            # JSON 형식인지 확인
             data = json.loads(message)
             
-            # 시스템 메시지 처리
-            if data.get("header", {}).get("tr_id") == "PINGPONG":
-                await self._handle_ping()
-                return
+            # 오류 메시지 확인
+            # 서버 오류 응답 처리 (rt_cd가 0이 아닌 경우)
+            if "body" in data and "rt_cd" in data["body"] and data["body"]["rt_cd"] != "0":
+                error_code = data["body"].get("rt_cd")
+                error_msg = data["body"].get("msg1", "")
+                error_cd = data["body"].get("msg_cd", "")
+                
+                logger.log_warning(f"서버 오류 응답: code={error_code}, msg_cd={error_cd}, msg={error_msg}")
+                
+                # 특정 오류 코드에 대한 처리
+                if error_code == "9" and "OPSP9997" in error_cd:
+                    logger.log_warning("서버가 메시지 형식을 인식하지 못함 - 무시하고 계속 진행")
+                    return  # 무시하고 계속 진행
+                
+                # 심각한 오류인 경우 연결 재설정
+                if error_code in ["1", "2", "3", "9"]:
+                    logger.log_warning("심각한 서버 오류 발생 - 연결 재설정 필요")
+                    # 연결 상태 유지하고 재연결은 하지 않음
+                    # 다음 상태 체크 루프에서 필요 시 재연결
+                    return
             
-            # 구독 응답 처리
-            header = data.get("header", {})
-            if header.get("rslt_cd") is not None:
-                # 응답 코드가 있으면 응답 메시지
-                if header.get("rslt_cd") == "0":
-                    logger.log_system(f"Subscription operation successful: {message[:100]}...")
-                else:
-                    logger.log_system(f"Subscription operation failed: {message[:100]}...")
-                return
+            # 시스템 메시지 처리
+            if "header" in data and "tr_id" in data["header"]:
+                tr_id = data["header"]["tr_id"]
+                
+                # 핑퐁 메시지 처리
+                if tr_id == "PINGPONG":
+                    logger.log_debug("서버 핑퐁 메시지 수신 - 응답 불필요")
+                    return
+                
+                # 응답 코드가 있는 경우 (구독 응답 등)
+                if "rslt_cd" in data.get("header", {}):
+                    rslt_cd = data["header"]["rslt_cd"]
+                    if rslt_cd == "0":
+                        logger.log_system(f"서버 응답 성공: {shortened_message}")
+                    else:
+                        logger.log_warning(f"서버 응답 실패: {shortened_message}")
+                    return
             
             # 실시간 데이터 처리
-            body = data.get("body", {})
-            
-            tr_id = header.get("tr_id")
-            tr_key = body.get("tr_key")
-            
-            if not tr_id or not tr_key:
-                logger.log_system(f"Invalid message format (missing tr_id or tr_key): {message[:100]}...")
-                return
-            
-            callback_key = f"{tr_id}|{tr_key}"
-            callback = self.callbacks.get(callback_key)
-            
-            if callback:
-                await callback(body)
+            if "body" in data:
+                body = data.get("body", {})
+                tr_id = data.get("header", {}).get("tr_id")
+                tr_key = body.get("tr_key", "")
+                
+                if not tr_id or not tr_key:
+                    logger.log_debug(f"형식 오류 메시지 (tr_id/tr_key 누락) - 처리 스킵: {shortened_message}")
+                    return
+                
+                callback_key = f"{tr_id}|{tr_key}"
+                callback = self.callbacks.get(callback_key)
+                
+                if callback:
+                    await callback(body)
+                else:
+                    logger.log_debug(f"등록된 콜백 없음: {callback_key}")
             
         except json.JSONDecodeError:
-            logger.log_system(f"Non-JSON message received: {message[:100]}...")
+            # 로그 길이 제한
+            shortened = message[:100] + ('...' if len(message) > 100 else '')
+            logger.log_debug(f"JSON 아닌 메시지 수신: {shortened}")
         except Exception as e:
-            logger.log_error(e, f"Error processing message: {message[:100]}...")
+            logger.log_error(e, f"메시지 처리 중 오류 발생")
     
     async def _handle_ping(self):
         """핑퐁 처리"""
         try:
+            if not self.is_connected():
+                logger.log_warning("웹소켓이 연결되지 않은 상태에서 ping 요청을 받았습니다.")
+                return
+                
             pong_data = {
                 "header": {
                     "tr_id": "PINGPONG",
                     "datetime": datetime.now().strftime("%Y%m%d%H%M%S")
                 }
             }
-            await self.ws.send(json.dumps(pong_data))
+            
+            try:
+                await self.ws.send(json.dumps(pong_data))
+            except websockets.exceptions.ConnectionClosedError as e:
+                logger.log_warning(f"Pong 응답 전송 중 연결이 닫힘: {str(e)}")
+                # 연결이 이미 닫혔을 때는 단순히 상태만 업데이트
+                self.running = False
+                self.auth_successful = False
+                # 재연결은 별도 태스크로 시작하지 않고 상태만 업데이트
+            except Exception as e:
+                logger.log_error(e, "Error sending pong response")
+                # 다른 예외의 경우에만 재연결 시도
+                self.running = False
+                self.auth_successful = False
+                try:
+                    # 별도 태스크가 아닌 직접 호출을 통해 이벤트 루프 충돌 회피
+                    await self._safe_reconnect()
+                except Exception as reconnect_error:
+                    logger.log_error(reconnect_error, "Pong 응답 후 재연결 시도 중 오류")
         except Exception as e:
-            logger.log_error(e, "Error sending pong response")
-            await self._handle_reconnect()
-    
-    async def _handle_reconnect(self):
-        """재연결 처리"""
-        async with self.connection_lock:
+            logger.log_error(e, "Pong 처리 중 예상치 못한 오류 발생")
+
+    async def _safe_reconnect(self):
+        """안전한 재연결 처리 - 래핑 함수로 이벤트 루프 문제 방지"""
+        try:
+            logger.log_system("안전한 재연결 프로세스 시작")
+            
+            # 이미 재연결 중인지 확인
+            if not self.running:
+                logger.log_warning("이미 재연결 중이거나 연결이 종료된 상태")
+                return
+                
+            # 상태 먼저 업데이트
+            self.running = False
+            self.auth_successful = False
+            
             if self.reconnect_attempts >= self.max_reconnect_attempts:
                 logger.log_error(
                     Exception("Max reconnection attempts reached"),
                     "WebSocket reconnection failed"
                 )
-                self.running = False
                 return
             
             self.reconnect_attempts += 1
@@ -659,90 +648,112 @@ class KISWebSocketClient:
             if self.ws:
                 try:
                     await self.ws.close()
-                except:
-                    pass
+                except Exception as close_error:
+                    logger.log_warning(f"기존 웹소켓 종료 중 오류 (무시): {str(close_error)}")
                 self.ws = None
-                
-            self.running = False
-            self.auth_successful = False
             
+            # 지연 시간 대기
             await asyncio.sleep(wait_time)
             
-            # 기존 상태 저장 및 초기화
-            saved_callbacks = dict(self.callbacks)
-            saved_subscriptions = dict(self.subscriptions)
-            self.callbacks = {}
-            self.subscriptions = {}
+            # 단일 비동기 함수로 간단하게 구현 - Lock 사용 없이
+            logger.log_system("웹소켓 재연결 시도 - 직접 방식")
+            await self._basic_reconnect()
             
-            # 연결 시도
-            connection_success = await self.connect()
+        except asyncio.CancelledError:
+            logger.log_warning("안전한 재연결 작업이 취소되었습니다.")
+        except Exception as e:
+            logger.log_error(e, "안전한 재연결 중 오류 발생")
+    
+    async def _basic_reconnect(self):
+        """기본 재연결 로직 - 락 없이 동작하는 단순 버전"""
+        try:
+            # 단순 연결 시도
+            logger.log_system("기본 재연결 로직 실행 중...")
             
-            # 연결에 실패한 경우 재시도 중단
-            if not connection_success:
-                logger.log_system("재연결 시도 실패, 다음 재시도를 준비합니다.")
-                return
+            # 웹소켓 연결 옵션 설정 - 타임아웃 값을 더 길게 설정
+            connection_options = {
+                "ping_interval": None,  # 자동 핑을 비활성화 (수동으로 처리)
+                "ping_timeout": None,   # 자동 핑 타임아웃도 비활성화
+                "close_timeout": 10,    # 종료 시 대기 시간 증가
+                "max_size": 1024 * 1024 * 10,  # 최대 메시지 크기 10MB
+                "max_queue": 32        # 최대 대기열 크기
+            }
+            
+            try:
+                # 웹소켓 연결 시도
+                logger.log_system("기본 웹소켓 연결 시도...")
+                self.ws = await asyncio.wait_for(
+                    websockets.connect(self.ws_url, **connection_options),
+                    timeout=20.0  # 연결 타임아웃 증가
+                )
+                logger.log_system("기본 웹소켓 연결 성공")
                 
-            # 연결에 성공했으면 기존 구독 복원 - 실패 시 신경 쓰지 않음
-            if self.is_connected():
-                logger.log_system("WebSocket reconnected. Restoring subscriptions...")
+                # 보안 헤더 설정 (필요한 경우)
+                # 웹소켓 접속키 발급
+                await self._get_approval_key()
                 
-                # 복원 시 지연 시간 추가
-                await asyncio.sleep(2)
+                # 성공적인 연결 설정
+                self.running = True
+                self.auth_successful = True
+                self.reconnect_attempts = 0  # 재연결 성공 시 카운터 초기화
                 
-                # 한 번에 너무 많은 구독 요청을 보내지 않기 위해 
-                # 각 구독 사이에 지연을 두고 순차적으로 처리
+                # 메시지 수신 루프 시작
+                logger.log_system("메시지 수신 루프 재시작...")
+                asyncio.create_task(self._receive_messages())
                 
-                # 먼저 price 구독 복원
-                restored_count = 0
-                for symbol, tr_id in saved_subscriptions.items():
-                    if "_" not in symbol:  # price 구독인 경우
-                        callback = saved_callbacks.get(f"{tr_id}|{symbol}")
-                        if callback:
-                            # 구독 복원 사이에 지연 시간 추가 (서버 부하 방지)
-                            await asyncio.sleep(1)
-                            success = await self.subscribe_price(symbol, callback)
-                            if success:
-                                restored_count += 1
-                            # 구독이 너무 많으면 일부만 복원 (최대 10개로 제한)
-                            if restored_count >= 10:
-                                break
+                # 핑 루프 시작 - 연결 상태 확인용
+                logger.log_system("핑 루프 재시작...")
+                asyncio.create_task(self._ping_loop())
                 
-                # 복원 성공 로그
-                if restored_count > 0:
-                    logger.log_system(f"Successfully restored {restored_count} price subscriptions")
+                logger.log_system("기본 재연결 성공!")
+                return True
+                
+            except Exception as conn_error:
+                logger.log_error(conn_error, "기본 재연결 연결 실패")
+                self.ws = None
+                self.running = False
+                self.auth_successful = False
+                return False
+                
+        except Exception as e:
+            logger.log_error(e, "기본 재연결 로직 실행 중 오류 발생")
+            return False
+            
+    async def _handle_reconnect(self):
+        """재연결 처리 - 레거시 버전 유지 (이전 코드와의 호환성)"""
+        try:
+            # 안전한 재연결 메서드로 리다이렉트
+            await self._safe_reconnect()
+        except Exception as e:
+            logger.log_error(e, "레거시 재연결 핸들러에서 오류 발생")
     
     async def _ping_loop(self):
-        """주기적으로 ping을 발송하여 연결 상태를 확인하는 루프"""
+        """주기적으로 연결 상태를 확인하는 루프 (헬스체크 메시지 없이)"""
         try:
-            while self.running and self.ws:
+            while self.running:
                 try:
-                    # 30초마다 ping 전송
+                    # 30초마다 체크
                     await asyncio.sleep(30)
                     
-                    if self.ws and self.ws.open:
-                        pong_waiter = await self.ws.ping()
-                        try:
-                            await asyncio.wait_for(pong_waiter, timeout=5.0)
-                            logger.log_debug("WebSocket ping-pong successful")
-                        except asyncio.TimeoutError:
-                            logger.log_warning("WebSocket pong timeout - connection may be unstable")
-                            # 연결 불안정하면 재연결 시도
-                            await self._handle_reconnect()
-                            break
-                    else:
-                        logger.log_warning("WebSocket connection lost during ping loop")
-                        await self._handle_reconnect()
+                    # 연결 상태 확인만 수행 (메시지 전송 없음)
+                    if not self.is_connected():
+                        logger.log_warning("연결 상태 확인 - 연결이 끊어진 상태 감지")
+                        await self._safe_reconnect()
                         break
+                    
+                    # 헬스체크 메시지 전송하지 않고 연결 상태만 확인
+                    logger.log_debug("웹소켓 연결 상태 확인 완료 - 연결 유지 중")
                         
                 except Exception as e:
-                    logger.log_error(e, "Error in ping loop")
-                    await self._handle_reconnect()
+                    logger.log_error(e, "연결 상태 확인 루프에서 오류 발생")
+                    if self.running:  # running 상태일 때만 재연결 시도
+                        await self._safe_reconnect()
                     break
                     
         except asyncio.CancelledError:
-            logger.log_system("Ping loop cancelled")
+            logger.log_system("연결 상태 확인 루프가 취소되었습니다")
         except Exception as e:
-            logger.log_error(e, "Unexpected error in ping loop")
+            logger.log_error(e, "연결 상태 확인 루프에서 예상치 못한 오류 발생")
     
     async def close(self):
         """웹소켓 연결 종료"""
@@ -839,7 +850,30 @@ class KISWebSocketClient:
     def is_connected(self) -> bool:
         """웹소켓 연결 상태 확인"""
         # 웹소켓 객체가 존재하고, running 상태이며, 인증이 성공적으로 완료되었는지 확인
-        return self.ws is not None and self.running and self.auth_successful
+        ws_exists = self.ws is not None
+        not_closed = False
+        
+        if ws_exists:
+            try:
+                # ClientConnection 객체의 closed 속성을 안전하게 확인
+                # getattr를 사용하여 속성이 없는 경우 기본값 반환
+                not_closed = not getattr(self.ws, 'closed', True)
+            except Exception as e:
+                logger.log_debug(f"웹소켓 상태 확인 중 오류 (무시): {str(e)}")
+                not_closed = False
+        
+        is_active = ws_exists and not_closed and self.running and self.auth_successful
+        
+        # 디버그 로그가 너무 많은 것을 방지하기 위해 상태 변경 시에만 로깅
+        if hasattr(self, '_last_connection_state') and self._last_connection_state != is_active:
+            state_str = "연결됨" if is_active else "연결 안됨"
+            details = f"ws_exists={ws_exists}, not_closed={not_closed}, running={self.running}, auth={self.auth_successful}"
+            logger.log_debug(f"웹소켓 연결 상태 변경: {state_str} ({details})")
+        
+        # 마지막 상태 저장
+        self._last_connection_state = is_active
+        
+        return is_active
 
 # 싱글톤 인스턴스
 ws_client = KISWebSocketClient()
