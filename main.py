@@ -183,328 +183,14 @@ class TradingBot:
                         # 매도 신호 체크 및 주문 실행 로직 추가
                         now = datetime.now()
                         if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                            logger.log_system("======== 익절 조건 체크 시작 ========")
+                            await self.check_sell_signals()
                             
-                            # 포지션 정보 가져오기
-                            try:
-                                positions = await order_manager.get_positions()
-                                if positions and "output1" in positions:
-                                    position_items = positions.get("output1", {})
-                                    logger.log_system(f"보유 종목 수: {len(position_items)}개")
-                                    
-                                    sell_orders_placed = 0
-                                    
-                                    # 각 보유 종목 체크
-                                    for position in position_items:
-                                        try:
-                                            # 종목 정보 추출
-                                            symbol = position.get("pdno", "")  # 종목코드
-                                            qty = int(position.get("hldg_qty", "0"))  # 보유수량
-                                            avg_price = float(position.get("pchs_avg_pric", "0"))  # 매수 평균가
-                                            current_profit_rate = float(position.get("evlu_pfls_rt", "0"))  # 현재 손익률
-                                            
-                                            # 손익률이 2% 이상인지 확인
-                                            if current_profit_rate >= 2.0 and qty > 0:
-                                                logger.log_system(f"[익절 조건 감지] {symbol}: 보유수량={qty}주, 매수가={avg_price:,.0f}원, 손익률={current_profit_rate:.2f}%")
-                                                
-                                                # 현재가 조회
-                                                symbol_info = await asyncio.wait_for(
-                                                    api_client.get_symbol_info(symbol),
-                                                    timeout=2.0
-                                                )
-                                                
-                                                if symbol_info and "current_price" in symbol_info:
-                                                    current_price = symbol_info["current_price"]
-                                                    # 실제 수익률 계산 (API 응답과 일치여부 확인)
-                                                    calc_profit_rate = ((current_price / avg_price) - 1) * 100
-                                                    
-                                                    logger.log_system(f"[익절 확인] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
-                                                                    f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
-                                                    
-                                                    # 전략 신호 확인 (개선된 익절 로직)
-                                                    should_sell = False
-                                                    sell_reason = "2% 익절 자동 매도"
-                                                    force_sell = False
-                                                    
-                                                    # 1. 고수익 안전장치 - 5% 이상이면 무조건 매도
-                                                    if calc_profit_rate >= 5.0 or current_profit_rate >= 5.0:
-                                                        should_sell = True
-                                                        force_sell = True
-                                                        sell_reason = "5% 이상 고수익 확정 매도"
-                                                        logger.log_system(f"[전략 무관 매도] {symbol}: 5% 이상 고수익으로 전략 신호와 관계없이 매도")
-                                                    
-                                                    # 2. 손익률 기본 검증 - 최소 2% 이상
-                                                    if (calc_profit_rate >= 2.0 or current_profit_rate >= 2.0) and not force_sell:
-                                                        # 3. 전략 신호 확인
-                                                        try:
-                                                            logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
-                                                            strategy_status = combined_strategy.get_strategy_status(symbol)
-                                                            
-                                                            if "signals" in strategy_status and symbol in strategy_status["signals"]:
-                                                                signal_info = strategy_status["signals"][symbol]
-                                                                signal_direction = signal_info.get("direction", "NEUTRAL")
-                                                                signal_score = signal_info.get("score", 0)
-                                                                
-                                                                logger.log_system(f"[전략 결과] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
-                                                                
-                                                                # 전략 신호에 따른 매도 결정
-                                                                if signal_direction == "SELL":
-                                                                    # 매도 신호가 있으면 매도
-                                                                    should_sell = True
-                                                                    sell_reason = f"전략 매도 신호에 따른 익절 (점수: {signal_score:.1f})"
-                                                                    logger.log_system(f"[전략 매도] {symbol}: 매도 신호로 익절")
-                                                                elif signal_direction == "NEUTRAL":
-                                                                    # 중립 신호이고 2% 이상이면 매도
-                                                                    should_sell = True
-                                                                    sell_reason = "중립 신호 상태에서 2% 익절"
-                                                                    logger.log_system(f"[전략 매도] {symbol}: 중립 신호 + 2% 이상으로 익절")
-                                                                elif signal_direction == "BUY":
-                                                                    # 매수 신호면 3.5% 미만일 경우 홀딩 (3.5% 이상이면 매도)
-                                                                    if calc_profit_rate >= 3.5 or current_profit_rate >= 3.5:
-                                                                        should_sell = True
-                                                                        sell_reason = f"매수 신호지만 3.5% 이상 수익 확정 (전략 점수: {signal_score:.1f})"
-                                                                        logger.log_system(f"[전략 매도] {symbol}: 매수 신호지만 3.5% 이상 수익으로 매도")
-                                                                    else:
-                                                                        logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
-                                                            else:
-                                                                # 신호 데이터가 없으면 기본 익절 (안전 장치)
-                                                                should_sell = True
-                                                                sell_reason = "전략 데이터 없음, 2% 익절 진행"
-                                                                logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 기본 익절")
-                                                                
-                                                        except Exception as strategy_error:
-                                                            # 전략 오류 시 기본 익절 진행 (안전 장치)
-                                                            logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
-                                                            should_sell = True
-                                                            sell_reason = "전략 확인 오류, 2% 익절 진행"
-                                                    
-                                                    # 매도 실행 결정되었으면 주문 진행
-                                                    if should_sell:
-                                                        logger.log_system(f"[익절 주문] {symbol} 매도 실행: 수량={qty}주, 가격={current_price:,.0f}원, 사유={sell_reason}")
-                                                        
-                                                        # 매도 주문 실행
-                                                        try:
-                                                            order_result = await asyncio.wait_for(
-                                                                order_manager.place_order(
-                                                                    symbol=symbol,
-                                                                    side="SELL",
-                                                                    quantity=qty,
-                                                                    price=current_price,
-                                                                    order_type="MARKET",
-                                                                    strategy="main_bot",
-                                                                    reason=sell_reason.replace(" ", "_").lower()
-                                                                ),
-                                                                timeout=5.0
-                                                            )
-                                                            
-                                                            if order_result and order_result.get("status") == "success":
-                                                                sell_orders_placed += 1
-                                                                logger.log_system(f"✅ 익절 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
-                                                                
-                                                                # 주문 정보 로깅
-                                                                logger.log_trade(
-                                                                    action="SELL",
-                                                                    symbol=symbol,
-                                                                    price=current_price,
-                                                                    quantity=qty,
-                                                                    reason=sell_reason,
-                                                                    strategy="main_bot",
-                                                                    profit_rate=f"{calc_profit_rate:.2f}%",
-                                                                    time=datetime.now().strftime("%H:%M:%S"),
-                                                                    status="SUCCESS"
-                                                                )
-                                                            else:
-                                                                logger.log_system(f"❌ 익절 주문 실패: {symbol}, 사유={order_result.get('reason')}")
-                                                        except asyncio.TimeoutError:
-                                                            logger.log_system(f"⏱️ 익절 주문 타임아웃: {symbol}")
-                                                        except Exception as order_error:
-                                                            logger.log_error(order_error, f"{symbol} 익절 주문 처리 중 오류")
-                                                    else:
-                                                        logger.log_system(f"[익절 보류] {symbol}: 전략 신호에 따라 매도하지 않고 계속 보유")
-                                                        
-                                                else:
-                                                    logger.log_system(f"[익절 패스] {symbol}: API 손익률과 계산 손익률이 모두 2% 미만입니다.")
-                                            else:
-                                                logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
-                                                
-                                        except Exception as position_error:
-                                            logger.log_error(position_error, f"포지션 {symbol} 처리 중 오류")
-                                    
-                                    # 익절 주문 결과 요약
-                                    logger.log_system(f"익절 주문 실행 결과: {sell_orders_placed}개 주문 실행됨")
-                                else:
-                                    logger.log_system("보유 종목 정보가 없습니다.")
-                            except Exception as positions_error:
-                                logger.log_error(positions_error, "포지션 정보 조회 실패")
-                            
-                            logger.log_system("======== 익절 조건 체크 종료 ========")
-                            
-                        # 매수 신호 체크 및 주문 실행 로직 추가
                         if len(MONITORED_SYMBOLS) > 0:
                             # 2분마다 신호 체크
                             now = datetime.now()
                             if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                                logger.log_system("======== 매수 신호 체크 시작 ========")
-                                
-                                # 모니터링 중인 종목 중 상위 50개만 체크
-                                symbols_to_check = MONITORED_SYMBOLS[:50]
-                                logger.log_system(f"체크할 종목 수: {len(symbols_to_check)}개")
-                                
-                                # 계좌 잔고 조회로 주문 금액 계산
-                                try:
-                                    # 새로운 형식으로 계좌 잔고 조회
-                                    account_balance = await order_manager.get_account_balance()
-                                    
-                                    # 새로운 구조에서 예수금 정보 가져오기
-                                    deposit_balance = account_balance.get("cash_balance", 0.0)
-                                    total_balance = account_balance.get("total_balance", 0.0)
-                                    
-                                    # 계좌 정보 로깅
-                                    logger.log_system(f"계좌 정보: 예수금={deposit_balance:,.0f}원, 총평가금액={total_balance:,.0f}원")
-                                    
-                                    # 예수금이 0인 경우 처리
-                                    if deposit_balance <= 0:
-                                        logger.log_warning(f"예수금이 부족합니다: {deposit_balance:,.0f}원")
-                                        deposit_balance = 0
-                                    
-                                    # 주문 금액은 예수금의 50%
-                                    order_amount = deposit_balance * 0.5
-                                    
-                                    if order_amount <= 0:
-                                        logger.log_system(f"계좌 잔고 부족으로 매수 신호 체크 중단: {deposit_balance:,.0f}원")
-                                        continue
-                                    
-                                    logger.log_system(f"계좌 잔고: {deposit_balance:,.0f}원, 주문 금액: {order_amount:,.0f}원 (50%)")
-                                    
-                                except Exception as balance_error:
-                                    logger.log_error(balance_error, "계좌 잔고 조회 실패")
-                                    # 기본값으로 계속 진행
-                                    order_amount = 1000000  # 100만원 기본값
-                                    logger.log_system(f"계좌 잔고 조회 실패로 기본값 사용: {order_amount:,.0f}원")
-                                
-                                # 종목별 매수 신호 확인
-                                buy_signals_found = 0
-                                orders_placed = 0
-                                
-                                for symbol in symbols_to_check:
-                                    try:
-                                        # 동시에 너무 많은 API 호출 방지를 위한 딜레이
-                                        await asyncio.sleep(0.2)
-                                        
-                                        # 통합 전략에서 신호 얻기
-                                        strategy_status = combined_strategy.get_strategy_status(symbol)
-                                        
-                                        # 신호 정보 유효성 확인
-                                        if (symbol not in strategy_status.get("signals", {}) or 
-                                            "direction" not in strategy_status["signals"][symbol]):
-                                            continue
-                                        
-                                        # 매수 신호 및 점수 확인
-                                        signal_info = strategy_status["signals"][symbol]
-                                        signal_direction = signal_info["direction"]
-                                        signal_score = signal_info.get("score", 0)
-                                        
-                                        # 매수 신호 및 최소 점수(6.0) 확인
-                                        if signal_direction == "BUY" and signal_score >= 6.0:
-                                            buy_signals_found += 1
-                                            logger.log_system(f"[{buy_signals_found}] 매수 신호 발견: {symbol}, 점수={signal_score:.1f}")
-                                            
-                                            # 현재가 조회
-                                            try:
-                                                symbol_info = await asyncio.wait_for(
-                                                    api_client.get_symbol_info(symbol),
-                                                    timeout=2.0
-                                                )
+                                await self.check_buy_signals()
                                                 
-                                                if symbol_info and "current_price" in symbol_info:
-                                                    current_price = symbol_info["current_price"]
-                                                    
-                                                    # 주문 수량 계산 (계좌 잔고의 50%를 사용)
-                                                    quantity = max(1, int(order_amount / current_price))
-                                                    
-                                                    # 주문 금액이 너무 큰 경우 실수 방지를 위한 안전장치
-                                                    max_order_value = 5000000  # 최대 500만원
-                                                    if quantity * current_price > max_order_value:
-                                                        old_quantity = quantity
-                                                        quantity = int(max_order_value / current_price)
-                                                        logger.log_system(f"안전장치 작동: 주문 수량 제한 {old_quantity}→{quantity}주 (최대 {max_order_value:,.0f}원)")
-                                                    
-                                                    # 한국 증권사 최대 주문 수량 제한 (100,000주)
-                                                    max_quantity_limit = 10000  # 1만주로 보수적 설정
-                                                    if quantity > max_quantity_limit:
-                                                        old_quantity = quantity
-                                                        quantity = max_quantity_limit
-                                                        logger.log_system(f"안전장치 작동: 최대 주문 수량 제한 {old_quantity}→{quantity}주 (최대 {max_quantity_limit:,}주)")
-
-                                                    # 최소 주문 확인 - 0이 되면 주문 처리 안함
-                                                    if quantity <= 0:
-                                                        logger.log_system(f"주문 취소: {symbol}, 계산된 주문 수량이 0입니다.")
-                                                        continue
-                                                    
-                                                    # 주문 단위 조정 (일부 종목은 10주 단위 주문)
-                                                    order_unit = 1  # 기본 주문 단위 (1주)
-                                                    if order_unit > 1 and quantity % order_unit != 0:
-                                                        adjusted_quantity = (quantity // order_unit) * order_unit
-                                                        if adjusted_quantity > 0:
-                                                            quantity = adjusted_quantity
-                                                            logger.log_system(f"주문 단위 조정: {symbol}, 수량 {quantity}주 ({order_unit}주 단위)")
-                                                    
-                                                    # 주문 실행
-                                                    logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={current_price * quantity:,.0f}원")
-                                                    
-                                                    try:
-                                                        order_result = await asyncio.wait_for(
-                                                            order_manager.place_order(
-                                                                symbol=symbol,
-                                                                side="BUY",
-                                                                quantity=quantity,
-                                                                price=current_price,
-                                                                order_type="MARKET",
-                                                                strategy="main_bot",
-                                                                reason="strategy_signal"
-                                                            ),
-                                                            timeout=5.0
-                                                        )
-                                                        
-                                                        if order_result and order_result.get("status") == "success":
-                                                            orders_placed += 1
-                                                            logger.log_system(f"✅ 매수 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
-                                                            
-                                                            # 주문 정보 로깅
-                                                            logger.log_trade(
-                                                                action="BUY",
-                                                                symbol=symbol,
-                                                                price=current_price,
-                                                                quantity=quantity,
-                                                                reason="전략 신호에 따른 자동 매수",
-                                                                strategy="main_bot",
-                                                                score=f"{signal_score:.1f}",
-                                                                time=datetime.now().strftime("%H:%M:%S"),
-                                                                status="SUCCESS"
-                                                            )
-                                                            
-                                                            # 한 번에 너무 많은 주문 방지
-                                                            if orders_placed >= 3:
-                                                                logger.log_system("최대 주문 수 도달 (3개), 추가 주문 중단")
-                                                                break
-                                                        else:
-                                                            logger.log_system(f"❌ 매수 주문 실패: {symbol}, 사유={order_result.get('reason')}")
-                                                    except asyncio.TimeoutError:
-                                                        logger.log_system(f"⏱️ 매수 주문 타임아웃: {symbol}")
-                                                    except Exception as order_error:
-                                                        logger.log_error(order_error, f"{symbol} 매수 주문 처리 중 오류")
-                                            except asyncio.TimeoutError:
-                                                logger.log_system(f"현재가 조회 타임아웃: {symbol}")
-                                            except Exception as price_error:
-                                                logger.log_error(price_error, f"{symbol} 현재가 조회 중 오류")
-                                        
-                                    except Exception as signal_error:
-                                        logger.log_error(signal_error, f"{symbol} 매수 신호 처리 중 오류")
-                                
-                                # 종목 신호 체크 결과 요약
-                                logger.log_system(f"매수 신호 체크 완료: 발견={buy_signals_found}개, 주문 실행={orders_placed}개")
-                                logger.log_system("======== 매수 신호 체크 종료 ========")
-                        
                         # 시스템 상태 업데이트
                         database_manager.update_system_status("RUNNING")
                         
@@ -526,6 +212,429 @@ class TradingBot:
         except Exception as e:
             logger.log_error(e, "Trading bot error")
             await self.shutdown(error=str(e))
+
+
+    async def check_sell_signals(self):
+        """익절 조건 체크 및 매도 주문 실행"""
+        logger.log_system("======== 익절 조건 체크 시작 ========")
+        
+        # 포지션 정보 가져오기
+        try:
+            positions = await order_manager.get_positions()
+            if positions and "output1" in positions:
+                position_items = positions.get("output1", {})
+                logger.log_system(f"보유 종목 수: {len(position_items)}개")
+                
+                sell_orders_placed = 0
+                
+                # 각 보유 종목 체크
+                for position in position_items:
+                    try:
+                        # 종목 정보 추출
+                        symbol = position.get("pdno", "")  # 종목코드
+                        qty = int(position.get("hldg_qty", "0"))  # 보유수량
+                        avg_price = float(position.get("pchs_avg_pric", "0"))  # 매수 평균가
+                        current_profit_rate = float(position.get("evlu_pfls_rt", "0"))  # 현재 손익률
+                        
+                        # 손익률이 2% 이상인지 확인
+                        if current_profit_rate >= 2.0 and qty > 0:
+                            logger.log_system(f"[익절 조건 감지] {symbol}: 보유수량={qty}주, 매수가={avg_price:,.0f}원, 손익률={current_profit_rate:.2f}%")
+                            
+                            # 현재가 조회
+                            symbol_info = await asyncio.wait_for(
+                                api_client.get_symbol_info(symbol),
+                                timeout=2.0
+                            )
+                            
+                            if symbol_info and "current_price" in symbol_info:
+                                current_price = symbol_info["current_price"]
+                                # 실제 수익률 계산 (API 응답과 일치여부 확인)
+                                calc_profit_rate = ((current_price / avg_price) - 1) * 100
+                                
+                                logger.log_system(f"[익절 확인] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
+                                                f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
+                                
+                                # 매도 여부 및 이유 결정
+                                sell_decision = self._decide_sell_action(symbol, calc_profit_rate, current_profit_rate)
+                                should_sell = sell_decision["should_sell"]
+                                sell_reason = sell_decision["reason"]
+                                
+                                # 매도 실행 결정되었으면 주문 진행
+                                if should_sell:
+                                    await self._execute_sell_order(symbol, qty, current_price, avg_price, sell_reason, sell_orders_placed)
+                                    sell_orders_placed += 1
+                                else:
+                                    logger.log_system(f"[익절 보류] {symbol}: 전략 신호에 따라 매도하지 않고 계속 보유")
+                                    
+                            else:
+                                logger.log_system(f"[익절 패스] {symbol}: 현재가 조회 실패")
+                        else:
+                            logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
+                            
+                    except Exception as position_error:
+                        logger.log_error(position_error, f"포지션 {symbol} 처리 중 오류")
+                
+                # 익절 주문 결과 요약
+                logger.log_system(f"익절 주문 실행 결과: {sell_orders_placed}개 주문 실행됨")
+            else:
+                logger.log_system("보유 종목 정보가 없습니다.")
+        except Exception as positions_error:
+            logger.log_error(positions_error, "포지션 정보 조회 실패")
+        
+        logger.log_system("======== 익절 조건 체크 종료 ========")
+
+    def _decide_sell_action(self, symbol, calc_profit_rate, current_profit_rate):
+        """매도 결정 및 이유 반환"""
+        should_sell = False
+        sell_reason = "2% 익절 자동 매도"
+        force_sell = False
+        
+        # 1. 고수익 안전장치 - 5% 이상이면 무조건 매도
+        if calc_profit_rate >= 5.0 or current_profit_rate >= 5.0:
+            should_sell = True
+            force_sell = True
+            sell_reason = "5% 이상 고수익 확정 매도"
+            logger.log_system(f"[전략 무관 매도] {symbol}: 5% 이상 고수익으로 전략 신호와 관계없이 매도")
+            return {"should_sell": should_sell, "reason": sell_reason}
+        
+        # 2. 손익률 기본 검증 - 최소 2% 이상
+        if (calc_profit_rate >= 2.0 or current_profit_rate >= 2.0) and not force_sell:
+            # 3. 전략 신호 확인
+            try:
+                logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
+                strategy_status = combined_strategy.get_strategy_status(symbol)
+                
+                if "signals" in strategy_status and symbol in strategy_status["signals"]:
+                    signal_info = strategy_status["signals"][symbol]
+                    signal_direction = signal_info.get("direction", "NEUTRAL")
+                    signal_score = signal_info.get("score", 0)
+                    
+                    logger.log_system(f"[전략 결과] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
+                    
+                    # 전략 신호에 따른 매도 결정
+                    if signal_direction == "SELL":
+                        # 매도 신호가 있으면 매도
+                        should_sell = True
+                        sell_reason = f"전략 매도 신호에 따른 익절 (점수: {signal_score:.1f})"
+                        logger.log_system(f"[전략 매도] {symbol}: 매도 신호로 익절")
+                    elif signal_direction == "NEUTRAL":
+                        # 중립 신호이고 2% 이상이면 매도
+                        should_sell = True
+                        sell_reason = "중립 신호 상태에서 2% 익절"
+                        logger.log_system(f"[전략 매도] {symbol}: 중립 신호 + 2% 이상으로 익절")
+                    elif signal_direction == "BUY":
+                        # 매수 신호면 3.5% 미만일 경우 홀딩 (3.5% 이상이면 매도)
+                        if calc_profit_rate >= 3.5 or current_profit_rate >= 3.5:
+                            should_sell = True
+                            sell_reason = f"매수 신호지만 3.5% 이상 수익 확정 (전략 점수: {signal_score:.1f})"
+                            logger.log_system(f"[전략 매도] {symbol}: 매수 신호지만 3.5% 이상 수익으로 매도")
+                        else:
+                            logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
+                else:
+                    # 신호 데이터가 없으면 기본 익절 (안전 장치)
+                    should_sell = True
+                    sell_reason = "전략 데이터 없음, 2% 익절 진행"
+                    logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 기본 익절")
+                    
+            except Exception as strategy_error:
+                # 전략 오류 시 기본 익절 진행 (안전 장치)
+                logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
+                should_sell = True
+                sell_reason = "전략 확인 오류, 2% 익절 진행"
+        
+        return {"should_sell": should_sell, "reason": sell_reason}
+
+    async def _execute_sell_order(self, symbol, qty, current_price, avg_price, sell_reason, sell_orders_count):
+        """매도 주문 실행"""
+        logger.log_system(f"[익절 주문] {symbol} 매도 실행: 수량={qty}주, 가격={current_price:,.0f}원, 사유={sell_reason}")
+        
+        try:
+            order_result = await asyncio.wait_for(
+                order_manager.place_order(
+                    symbol=symbol,
+                    side="SELL",
+                    quantity=qty,
+                    price=current_price,
+                    order_type="MARKET",
+                    strategy="main_bot",
+                    reason=sell_reason.replace(" ", "_").lower()
+                ),
+                timeout=5.0
+            )
+            
+            if order_result and order_result.get("status") == "success":
+                logger.log_system(f"✅ 익절 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
+                
+                # 주문 정보 로깅
+                logger.log_trade(
+                    action="SELL",
+                    symbol=symbol,
+                    price=current_price,
+                    quantity=qty,
+                    reason=sell_reason,
+                    strategy="main_bot",
+                    profit_rate=f"{((current_price / avg_price) - 1) * 100:.2f}%",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="SUCCESS"
+                )
+                return True
+            else:
+                logger.log_system(f"❌ 익절 주문 실패: {symbol}, 사유={order_result.get('reason')}")
+                return False
+        except asyncio.TimeoutError:
+            logger.log_system(f"⏱️ 익절 주문 타임아웃: {symbol}")
+            return False
+        except Exception as order_error:
+            logger.log_error(order_error, f"{symbol} 익절 주문 처리 중 오류")
+            return False
+
+    async def check_buy_signals(self):
+        """매수 신호 체크 및 주문 실행"""
+        logger.log_system("======== 매수 신호 체크 시작 ========")
+        
+        # 계좌 정보 조회 및 투자 금액 계산
+        investment_info = await self.get_investment_amount()
+        if not investment_info["can_invest"]:
+            logger.log_system("투자 가능 금액 부족으로 매수 체크 중단")
+            return
+        
+        # 모니터링 종목 중 상위 50개만 체크
+        symbols_to_check = MONITORED_SYMBOLS[:50]
+        logger.log_system(f"체크할 종목 수: {len(symbols_to_check)}개")
+        
+        # 매수 신호 체크 및 주문 실행
+        buy_signals_found = 0
+        orders_placed = 0
+        used_investment = 0
+        
+        for symbol in symbols_to_check:
+            # 최대 주문 수 도달 시 중단
+            if orders_placed >= investment_info["max_stocks_to_buy"]:
+                logger.log_system(f"최대 주문 수 도달 ({investment_info['max_stocks_to_buy']}개), 추가 주문 중단")
+                break
+                
+            # 남은 투자 가능 금액 체크
+            remaining_investment = investment_info["total_amount"] - used_investment
+            if remaining_investment < 10000:  # 최소 주문 금액 미만
+                logger.log_system(f"남은 투자 가능 금액 부족: {remaining_investment:,.0f}원, 매수 신호 체크 중단")
+                break
+                
+            # 매수 신호 확인
+            signal_info = self.check_buy_signal(symbol)
+            if not signal_info["has_signal"]:
+                continue
+                
+            buy_signals_found += 1
+            logger.log_system(f"[{buy_signals_found}] 매수 신호 발견: {symbol}, 점수={signal_info['score']:.1f}")
+            
+            # 주문 처리
+            order_result = await self.process_buy_order(
+                symbol=symbol,
+                signal_score=signal_info["score"],
+                remaining_investment=remaining_investment,
+                per_stock_amount=investment_info["per_stock_amount"]
+            )
+            
+            if order_result["success"]:
+                orders_placed += 1
+                used_investment += order_result["order_amount"]
+                logger.log_system(f"남은 투자 가능 금액: {investment_info['total_amount'] - used_investment:,.0f}원")
+                await asyncio.sleep(1.0)  # 주문 간 간격 추가
+        
+        # 결과 요약
+        logger.log_system(f"매수 신호 체크 완료: 발견={buy_signals_found}개, 주문 실행={orders_placed}개")
+        if orders_placed > 0:
+            logger.log_system(f"투자 금액 사용: {used_investment:,.0f}원/{investment_info['total_amount']:,.0f}원")
+        logger.log_system("======== 매수 신호 체크 종료 ========")
+
+    async def get_investment_amount(self):
+        """계좌 정보 조회 및 투자 금액 계산"""
+        try:
+            # 계좌 잔고 조회
+            account_balance = await order_manager.get_account_balance()
+            
+            # 예수금 정보 가져오기
+            cash_balance = account_balance.get("cash_balance", 0.0)
+            total_balance = account_balance.get("total_balance", 0.0)
+            
+            logger.log_system(f"계좌 정보: 예수금={cash_balance:,.0f}원, 총평가금액={total_balance:,.0f}원")
+            
+            # 투자 가능 여부 및 금액 계산
+            if cash_balance <= 0:
+                logger.log_warning(f"예수금이 부족합니다: {cash_balance:,.0f}원")
+                return {"can_invest": False}
+            
+            # 투자 금액 설정 (예수금의 50%)
+            total_amount = cash_balance * 0.5
+            max_stocks_to_buy = 3
+            per_stock_amount = total_amount / max_stocks_to_buy
+            
+            logger.log_system(f"투자 가능 금액: {total_amount:,.0f}원 (예수금의 50%), 종목당 {per_stock_amount:,.0f}원")
+            
+            return {
+                "can_invest": True,
+                "total_amount": total_amount,
+                "per_stock_amount": per_stock_amount,
+                "max_stocks_to_buy": max_stocks_to_buy
+            }
+        except Exception as e:
+            logger.log_error(e, "계좌 잔고 조회 실패")
+            # 기본값으로 계속 진행
+            return {
+                "can_invest": True,
+                "total_amount": 1000000,  # 기본값 100만원
+                "per_stock_amount": 333333,  # 기본 종목당 약 33만원
+                "max_stocks_to_buy": 3
+            }
+
+    def check_buy_signal(self, symbol):
+        """종목의 매수 신호 확인"""
+        try:
+            # 통합 전략에서 신호 얻기
+            strategy_status = combined_strategy.get_strategy_status(symbol)
+            
+            # 신호 정보 유효성 확인
+            if (symbol not in strategy_status.get("signals", {}) or 
+                "direction" not in strategy_status["signals"][symbol]):
+                return {"has_signal": False}
+            
+            # 매수 신호 및 점수 확인
+            signal_info = strategy_status["signals"][symbol]
+            signal_direction = signal_info["direction"]
+            signal_score = signal_info.get("score", 0)
+            
+            # 매수 신호 및 최소 점수(6.0) 확인
+            if signal_direction == "BUY" and signal_score >= 6.0:
+                return {"has_signal": True, "score": signal_score}
+                
+            return {"has_signal": False}
+        except Exception as e:
+            logger.log_error(e, f"{symbol} 매수 신호 확인 중 오류")
+            return {"has_signal": False}
+    
+    def calculate_order_quantity(self, symbol, current_price, available_amount):
+        """주문 수량 및 금액 계산"""
+        try:
+            # 기본 주문 단위 (실제로는 API 조회 필요)
+            order_unit = 1
+            
+            # 기본 주문 수량 계산
+            quantity = max(1, int(available_amount / current_price))
+            
+            # 안전 제한 적용
+            max_order_value = 2000000  # 최대 200만원
+            if quantity * current_price > max_order_value:
+                quantity = int(max_order_value / current_price)
+                
+            # 최대 주문 수량 제한
+            max_quantity_limit = 5000  # 5천주
+            if quantity > max_quantity_limit:
+                quantity = max_quantity_limit
+            
+            # 최소 주문 확인
+            if quantity <= 0:
+                logger.log_system(f"주문 불가: {symbol}, 계산된 주문 수량이 0입니다.")
+                return {"can_order": False}
+            
+            # 주문 단위 조정
+            if order_unit > 1 and quantity % order_unit != 0:
+                quantity = (quantity // order_unit) * order_unit
+                if quantity <= 0:
+                    logger.log_system(f"주문 불가: {symbol}, 주문 단위 조정 후 수량이 0입니다.")
+                    return {"can_order": False}
+            
+            return {
+                "can_order": True,
+                "quantity": quantity,
+                "order_amount": current_price * quantity
+            }
+        except Exception as e:
+            logger.log_error(e, f"주문 수량 계산 중 오류: {symbol}")
+            return {"can_order": False}
+
+    async def process_buy_order(self, symbol, signal_score, remaining_investment, per_stock_amount):
+        """매수 주문 처리"""
+        try:
+            # 현재가 조회
+            symbol_info = await asyncio.wait_for(
+                api_client.get_symbol_info(symbol),
+                timeout=2.0
+            )
+            
+            if not symbol_info or "current_price" not in symbol_info:
+                logger.log_system(f"현재가 조회 실패: {symbol}")
+                return {"success": False}
+            
+            current_price = symbol_info["current_price"]
+            
+            # 가격 급등 확인 (전일 종가 대비)
+            if "prev_close" in symbol_info and symbol_info["prev_close"] > 0:
+                prev_close = symbol_info["prev_close"]
+                price_change_rate = (current_price - prev_close) / prev_close * 100
+                
+                # 급등 종목 필터링 (전일 대비 10% 이상 상승)
+                if price_change_rate > 10.0:
+                    logger.log_system(f"가격 급등으로 매수 제한: {symbol}, 전일대비={price_change_rate:.1f}%")
+                    return {"success": False}
+            
+            # 점수에 따른 투자금액 조정 (6.0-10.0점 범위)
+            score_weight = min(1.0, (signal_score - 6.0) / 4.0 + 0.7)  # 0.7-1.0 범위
+            adjusted_amount = min(per_stock_amount * score_weight, remaining_investment)
+            
+            # 주문 수량 및 금액 계산
+            order_info = self.calculate_order_quantity(symbol, current_price, adjusted_amount)
+            if not order_info["can_order"]:
+                return {"success": False}
+            
+            # 주문 실행
+            quantity = order_info["quantity"]
+            order_amount = current_price * quantity
+            
+            logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={order_amount:,.0f}원")
+            
+            try:
+                order_result = await asyncio.wait_for(
+                    order_manager.place_order(
+                        symbol=symbol,
+                        side="BUY",
+                        quantity=quantity,
+                        price=current_price,
+                        order_type="LIMIT",  # 지정가 주문
+                        strategy="main_bot",
+                        reason="strategy_signal"
+                    ),
+                    timeout=5.0
+                )
+                
+                if order_result and order_result.get("status") == "success":
+                    logger.log_system(f"✅ 매수 주문 성공: {symbol}, 주문ID={order_result.get('order_id')}")
+                    
+                    # 주문 정보 로깅
+                    logger.log_trade(
+                        action="BUY",
+                        symbol=symbol,
+                        price=current_price,
+                        quantity=quantity,
+                        reason="전략 신호에 따른 자동 매수",
+                        strategy="main_bot",
+                        score=f"{signal_score:.1f}",
+                        time=datetime.now().strftime("%H:%M:%S"),
+                        status="SUCCESS"
+                    )
+                    
+                    return {"success": True, "order_amount": order_amount}
+                else:
+                    error_reason = order_result.get("reason", "알 수 없는 오류")
+                    logger.log_system(f"❌ 매수 주문 실패: {symbol}, 사유={error_reason}")
+                    return {"success": False}
+                    
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.log_error(e, f"{symbol} 주문 처리 중 오류")
+                return {"success": False}
+                
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.log_error(e, f"{symbol} 현재가 조회 중 오류")
+            return {"success": False}
     
     async def _initial_symbol_scan(self) -> None:
         """초기 종목 스캔 - 5개 전략 사용하여 상위 100개 선정"""

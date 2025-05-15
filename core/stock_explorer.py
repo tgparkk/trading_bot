@@ -129,41 +129,6 @@ class StockExplorer:
             self._log_search_failure(str(e))
             return []
     
-    async def _check_market_direction(self) -> str:
-        """시장 방향성 체크 (코스피/코스닥)"""
-        try:
-            # 코스피 지수 조회
-            kospi = api_client.get_market_index("0001")
-            if kospi.get("rt_cd") != "0":
-                return "NEUTRAL"
-                
-            # 코스닥 지수 조회
-            kosdaq = api_client.get_market_index("1001")
-            if kosdaq.get("rt_cd") != "0":
-                return "NEUTRAL"
-                
-            # 전일 대비 등락률
-            kospi_change = float(kospi["output"]["prdy_ctrt"])
-            kosdaq_change = float(kosdaq["output"]["prdy_ctrt"])
-            
-            # 가중 평균 (코스피 60%, 코스닥 40%)
-            weighted_change = (kospi_change * 0.6) + (kosdaq_change * 0.4)
-            
-            if weighted_change > 1.0:  # 1% 이상 상승
-                return "STRONG_UP"
-            elif weighted_change > 0.3:  # 0.3% 이상 상승
-                return "UP"
-            elif weighted_change < -1.0:  # 1% 이상 하락
-                return "STRONG_DOWN"
-            elif weighted_change < -0.3:  # 0.3% 이상 하락
-                return "DOWN"
-            else:
-                return "NEUTRAL"
-                
-        except Exception as e:
-            logger.log_error(e, "Error checking market direction")
-            return "NEUTRAL"
-    
     def _log_search_success(self, total_symbols: int, filtered_symbols: int):
         """종목 탐색 성공 로그 저장"""
         database_manager.save_symbol_search_log(

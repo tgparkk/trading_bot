@@ -750,79 +750,71 @@ class OrderManager:
                 - cash_balance: 주문 가능한 현금 잔고
                 - total_balance: 총 평가금액
                 - positions: 보유 종목 목록
+                - status: 처리 상태 ('success' 또는 'error')
+                - message: 상태 메시지
         """
+        # 기본 반환 구조
+        result = {
+            "cash_balance": 0.0,
+            "total_balance": 0.0,
+            "positions": [],
+            "status": "success",
+            "message": ""
+        }
+        
         try:
-            # 비동기 환경에서 동기 함수 호출을 위해 run_in_executor 사용
+            # 비동기 환경에서 동기 함수 호출
             loop = asyncio.get_event_loop()
             raw_result = await loop.run_in_executor(None, api_client.get_account_balance)
             
-            # 기본 반환 구조 초기화
-            result = {
-                "cash_balance": 0.0,  # 현금 잔고
-                "total_balance": 0.0,  # 총 평가금액
-                "positions": []  # 보유 종목 목록
-            }
-            
-            # API 응답이 유효한지 확인
+            # API 응답 유효성 확인
             if raw_result and raw_result.get("rt_cd") == "0":
                 logger.log_system("계좌 잔고 조회 성공")
                 
-                # output1(보유 종목), output2(계좌 요약) 구조 확인
-                
                 # 1. 보유 종목 처리 (output1)
                 if "output1" in raw_result:
-                    # 종목 목록 형식 확인
-                    if isinstance(raw_result["output1"], list):
-                        result["positions"] = raw_result["output1"]
-                    elif isinstance(raw_result["output1"], dict):
-                        # 딕셔너리인 경우 리스트로 변환
-                        result["positions"] = [raw_result["output1"]]
-                
-                # 2. 계좌 요약 정보 처리 (output2 - 예수금 총액 등)
-                if "output2" in raw_result and raw_result["output2"]:
-                    # output2가 리스트인 경우
-                    if isinstance(raw_result["output2"], list) and raw_result["output2"]:
-                        account_summary = raw_result["output2"][0]
-                        if isinstance(account_summary, dict):
-                            # 예수금 총액
-                            result["cash_balance"] = float(account_summary.get("dnca_tot_amt", "0"))
-                            # 총 평가금액
-                            result["total_balance"] = float(account_summary.get("tot_evlu_amt", "0"))
-                    # output2가 딕셔너리인 경우
-                    elif isinstance(raw_result["output2"], dict):
-                        # 예수금 총액
-                        result["cash_balance"] = float(raw_result["output2"].get("dnca_tot_amt", "0"))
-                        # 총 평가금액
-                        result["total_balance"] = float(raw_result["output2"].get("tot_evlu_amt", "0"))
-                
-                # 3. output1에서 계좌 정보 추출 (레거시 대응)
-                if result["cash_balance"] == 0 and "output1" in raw_result and raw_result["output1"]:
-                    logger.log_system("output2가 없거나 예수금이 0입니다. output1에서 정보 추출 시도")
+                    # 단일 항목이든 리스트든 항상 리스트로 변환
+                    output1_items = raw_result["output1"]
+                    if not isinstance(output1_items, list):
+                        output1_items = [output1_items]
                     
-                    if isinstance(raw_result["output1"], list) and raw_result["output1"]:
-                        account_data = raw_result["output1"][0]
-                        if isinstance(account_data, dict):
-                            # 예수금 총액 검색
-                            if "dnca_tot_amt" in account_data:
-                                result["cash_balance"] = float(account_data.get("dnca_tot_amt", "0"))
-                                logger.log_system(f"output1에서 예수금 추출: {result['cash_balance']:,.0f}원")
+                    # 종목 정보 복사
+                    result["positions"] = output1_items
+                
+                # 2. 계좌 요약 정보 처리 (output2)
+                if "output2" in raw_result and raw_result["output2"]:
+                    # 단일 항목이든 리스트든 첫 번째 요소 추출
+                    account_data = raw_result["output2"]
+                    if isinstance(account_data, list) and account_data:
+                        account_data = account_data[0]
+                    
+                    if isinstance(account_data, dict):
+                        # 예수금 및 총 평가금액 추출
+                        try:
+                            result["cash_balance"] = float(account_data.get("dnca_tot_amt", "0"))
+                            result["total_balance"] = float(account_data.get("tot_evlu_amt", "0"))
+                        except (ValueError, TypeError):
+                            # 변환 실패 시 기본값 유지
+                            pass
             else:
                 # API 오류 처리
                 error_msg = raw_result.get("msg1", "알 수 없는 오류")
                 logger.log_system(f"계좌 잔고 조회 실패: {error_msg}", level="WARNING")
+                result["status"] = "error"
+                result["message"] = f"API 오류: {error_msg}"
             
             # 결과 정보 로깅
-            logger.log_system(f"계좌 잔고 정보: 예수금={result['cash_balance']:,.0f}원, 총평가={result['total_balance']:,.0f}원, 보유종목={len(result['positions'])}개")
+            logger.log_system(f"계좌 잔고 정보: 예수금={result['cash_balance']:,.0f}원, "
+                            f"총평가={result['total_balance']:,.0f}원, "
+                            f"보유종목={len(result['positions'])}개")
             
             return result
                 
         except Exception as e:
-            logger.log_error(e, "Failed to get account balance")
-            return {
-                "cash_balance": 0.0,
-                "total_balance": 0.0,
-                "positions": []
-            }
+            logger.log_error(e, "계좌 잔고 조회 중 예외 발생")
+            result["status"] = "error"
+            result["message"] = f"처리 오류: {str(e)}"
+            return result
 
 # 싱글톤 인스턴스
 order_manager = OrderManager()

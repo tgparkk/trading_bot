@@ -366,7 +366,6 @@ class KISWebSocketClient:
             except Exception as e:
                 logger.log_error(e, f"{symbol} 종목 구독 실패")
                 return False
-    
 
     
     async def unsubscribe(self, symbol: str, feed_type: str = "price"):
