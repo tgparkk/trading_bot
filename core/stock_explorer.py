@@ -38,11 +38,14 @@ class StockExplorer:
             max_symbols = self.filters.get("max_symbols", 100)
             
             # 2) 거래량 순위 API 호출 (새로운 함수 형식으로 매개변수 맞춤)
+            logger.log_system(f"거래량 상위 종목 조회 시작: 시장={market_code}, 정렬={1}, 개수={max_symbols}")
             vol_data = api_client.get_market_trading_volume(
                 market_code=market_code,
-                sort_type="1",  # 1: 거래량상위
-                top_n=max_symbols
+                screen_code="20171",  
+                vol_cnt=str(max_symbols)
             )
+            logger.log_system(f"거래량 상위 종목 조회 API 응답: rt_cd={vol_data.get('rt_cd')}, msg_cd={vol_data.get('msg_cd', '없음')}, msg1={vol_data.get('msg1', '없음')}")
+            logger.log_system(f"API 응답 키: {list(vol_data.keys())}")
             
             # 3) API 응답 검증
             if vol_data.get("rt_cd") != "0":
@@ -50,15 +53,18 @@ class StockExplorer:
                 self._log_search_failure("거래량 순위 조회 실패: " + vol_data.get("msg1", "알 수 없는 오류"))
                 return []
 
-            # 4) 데이터 추출 (고정된 output2 응답 구조 사용)
-            volume_items = vol_data.get("output2", [])
+            # 4) 데이터 추출 (수정된 API 응답 구조 사용)
+            # API 응답 구조에 맞게 output 필드에서 데이터 가져오기
+            volume_items = vol_data.get("output", [])
             if not volume_items:
                 logger.log_error("거래량 순위 데이터가 비어 있습니다")
+                logger.log_system(f"전체 응답 구조: {vol_data}")
                 self._log_search_failure("거래량 순위 데이터가 비어 있습니다")
                 return []
                 
-            # 5) 종목 코드 추출 (다양한 필드명 시도)
+            # 5) 종목 코드 추출 (이미지에 표시된 필드명 우선 시도)
             symbols = []
+            # 이미지에 표시된 필드명인 'mksc_shrn_iscd'를 첫 번째로 시도
             symbol_fields = ["mksc_shrn_iscd", "iscd_code", "symbol", "code"]
             
             # 첫 항목에서 심볼 필드 이름 찾기
@@ -76,6 +82,10 @@ class StockExplorer:
                         if "iscd" in field.lower() or "code" in field.lower() or "symbol" in field.lower():
                             symbol_field = field
                             break
+                
+                # 첫번째 항목 구조 로깅 - 디버깅 용도
+                logger.log_system(f"첫 번째 항목 구조: {sample_item}")
+                logger.log_system(f"사용할 심볼 필드명: {symbol_field}")
             
             # 심볼 필드 찾았으면 추출
             if symbol_field:

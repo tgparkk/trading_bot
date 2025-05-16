@@ -104,6 +104,30 @@ class GapStrategy:
         try:
             logger.log_system(f"갭 전략 - {symbol} 초기 데이터 로딩 시작")
             
+            # 초기화되지 않은 경우를 대비한 기본 데이터 구조 설정
+            if symbol not in self.gap_data:
+                self.gap_data[symbol] = {
+                    'gap_pct': None,
+                    'direction': None,
+                    'prev_close': None,
+                    'today_open': None,
+                    'gap_size': None,
+                    'fill_target': None,
+                    'gap_identified': False
+                }
+            
+            # price_data 초기화
+            if symbol not in self.price_data:
+                self.price_data[symbol] = deque(maxlen=300)
+                
+            # volume_data 초기화
+            if symbol not in self.volume_data:
+                self.volume_data[symbol] = {
+                    'avg_volume': None,
+                    'volume_ratio': None,
+                    'volumes': deque(maxlen=20)
+                }
+            
             # 현재가 정보 조회
             price_info = await api_client.get_symbol_info(symbol)
             if price_info and price_info.get("current_price"):
@@ -179,6 +203,26 @@ class GapStrategy:
     async def _load_historical_data(self, symbol: str):
         """과거 데이터 로드 (전일 종가, 거래량 등)"""
         try:
+            # 초기화되지 않은 경우를 대비한 기본 데이터 구조 설정
+            if symbol not in self.gap_data:
+                self.gap_data[symbol] = {
+                    'gap_pct': None,
+                    'direction': None,
+                    'prev_close': None,
+                    'today_open': None,
+                    'gap_size': None,
+                    'fill_target': None,
+                    'gap_identified': False
+                }
+                
+            # volume_data 초기화
+            if symbol not in self.volume_data:
+                self.volume_data[symbol] = {
+                    'avg_volume': None,
+                    'volume_ratio': None,
+                    'volumes': deque(maxlen=20)
+                }
+                
             # 일봉 데이터 조회
             price_data = api_client.get_daily_price(symbol)
             if price_data.get("rt_cd") == "0":
@@ -763,19 +807,20 @@ class GapStrategy:
             
             # 새 종목 초기화
             for symbol in to_add:
-                self.price_data[symbol] = deque(maxlen=100)
-                self.volume_data[symbol] = deque(maxlen=20)
-                self.gap_data[symbol] = {
-                    'prev_close': None,
-                    'open_price': None,
-                    'gap_pct': None,
-                    'gap_identified': False,
-                    'direction': "NEUTRAL",
-                    'fill_target': None,
+                self.price_data[symbol] = deque(maxlen=300)
+                self.volume_data[symbol] = {
                     'avg_volume': None,
-                    'signal_strength': 0,
-                    'signal_direction': "NEUTRAL",
-                    'last_update': None
+                    'volume_ratio': None,
+                    'volumes': deque(maxlen=30)
+                }
+                self.gap_data[symbol] = {
+                    'gap_pct': None,
+                    'direction': None,
+                    'prev_close': None,
+                    'today_open': None,
+                    'gap_size': None,
+                    'fill_target': None,
+                    'gap_identified': False
                 }
             
             # 감시 종목 업데이트

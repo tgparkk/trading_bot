@@ -720,7 +720,7 @@ class VolumeStrategy:
             avg_minute_volume = volume_data['avg_volume'] / 390  # 6.5시간 = 390분
             
             # 최근 거래량 피크 확인
-            max_recent_volume = max(recent_volumes) if recent_volumes else 0
+            max_recent_volume = max(item['volume'] for item in recent_volumes) if recent_volumes else 0
             volume_ratio = max_recent_volume / avg_minute_volume if avg_minute_volume > 0 else 0
             
             logger.log_system(f"{symbol} - 최근 최대 거래량: {max_recent_volume}, 평균: {avg_minute_volume:.0f}, 배수: {volume_ratio:.2f}")

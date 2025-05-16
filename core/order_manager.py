@@ -38,9 +38,10 @@ class OrderManager:
             self.trading_paused = False  # 거래 일시 중지 플래그
             self._async_lock = asyncio.Lock()  # 비동기 작업을 위한 락
             self.order_blacklist = {}  # 블랙리스트 추가: {종목코드: 만료시간}
-            self.order_failures = {}   # 연속 실패 횟수 트래킹: {종목코드: 실패횟수}
+            self.order_failures = {}   # 연속 실패 횟수 트래킹: {종목코드: {"최근_실패_시간": time.time(), "횟수": 0}}
             self.max_consecutive_failures = 3  # 최대 연속 실패 허용 횟수
             self.blacklist_duration = 30 * 60  # 블랙리스트 유지 시간 (초단위, 기본 30분)
+            self.failure_reset_time = 5 * 60  # 실패 횟수 초기화 시간 (5분 이상 가 실패 사이에 시간이 지나면 초기화)
             self._initialized = True
         
     async def initialize(self):
@@ -110,7 +111,7 @@ class OrderManager:
                     # 블랙리스트 만료되면 제거
                     del self.order_blacklist[symbol]
                     if symbol in self.order_failures:
-                        del self.order_failures[symbol]
+                        self.order_failures[symbol] = {"최근_실패_시간": 0, "횟수": 0}  # 완전히 삭제하지 않고 초기화
                     logger.log_system(f"[블랙리스트 해제] {symbol}: 거래 재개 가능")
             
             # 거래 일시 중지 상태 확인 (bypass_pause가 False이고 거래가 일시 중지된 경우)
@@ -336,45 +337,83 @@ class OrderManager:
                 
                 else:
                     # 주문 실패 - 실패 카운터 증가
-                    self.order_failures[symbol] = self.order_failures.get(symbol, 0) + 1
+                    current_time = time.time()
+                    
+                    # 실패 데이터 가져오기 (없으면 초기화)
+                    if symbol not in self.order_failures:
+                        self.order_failures[symbol] = {"최근_실패_시간": current_time, "횟수": 1}
+                    else:
+                        # 이전 실패와 현재 시간 차이 계산
+                        last_failure_time = self.order_failures[symbol]["최근_실패_시간"]
+                        time_diff = current_time - last_failure_time
+                        
+                        # 실패 사이 시간이 길면 초기화, 시간이 짧으면 횟수 증가
+                        if time_diff > self.failure_reset_time:
+                            # 5분 이상 경과했으면 초기화
+                            self.order_failures[symbol] = {"최근_실패_시간": current_time, "횟수": 1}
+                            logger.log_system(f"[실패카운터 초기화] {symbol}: {time_diff/60:.1f}분 경과 후 실패")
+                        else:
+                            # 횟수만 증가
+                            self.order_failures[symbol]["횟수"] += 1
+                            self.order_failures[symbol]["최근_실패_시간"] = current_time
                     
                     # 블랙리스트 조건 체크
-                    if self.order_failures[symbol] >= self.max_consecutive_failures:
+                    if self.order_failures[symbol]["횟수"] >= self.max_consecutive_failures:
                         # 최대 실패 횟수 초과 - 블랙리스트에 추가
+                        failures_count = self.order_failures[symbol]["횟수"]
                         self.order_blacklist[symbol] = time.time() + self.blacklist_duration
-                        logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {self.order_failures[symbol]}회 주문 실패로 {self.blacklist_duration//60}분간 주문 중지")
+                        logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {failures_count}회 주문 실패로 {self.blacklist_duration//60}분간 주문 중지")
                         
                         # 알림 전송 (블랙리스트 추가 알림)
                         try:
                             await alert_system.notify_system_status(
                                 "WARNING",
-                                f"{symbol} 연속 {self.order_failures[symbol]}회 주문 실패로 블랙리스트 등록 ({self.blacklist_duration//60}분간 주문 중지)"
+                                f"{symbol} 연속 {failures_count}회 주문 실패로 블랙리스트 등록 ({self.blacklist_duration//60}분간 주문 중지)"
                             )
                         except Exception as alert_error:
                             logger.log_error(alert_error, f"{symbol} 블랙리스트 알림 전송 실패")
                     
                     error_msg = order_result.get("msg1", "Unknown error")
-                    failure_count = self.order_failures.get(symbol, 0)
-                    logger.log_system(f"[주문실패] {symbol} 주문 실패 ({failure_count}/{self.max_consecutive_failures}회) - 오류: {error_msg}")
+                    failures_count = self.order_failures[symbol]["횟수"]
+                    logger.log_system(f"[주문실패] {symbol} 주문 실패 ({failures_count}/{self.max_consecutive_failures}회) - 오류: {error_msg}")
                     logger.log_error(
                         Exception(error_msg),
                         f"Order failed for {symbol}"
                     )
-                    return {"status": "failed", "reason": error_msg, "failure_count": failure_count}
+                    return {"status": "failed", "reason": error_msg, "failure_count": failures_count}
             except Exception as api_e:
                 # API 호출 예외도 실패 카운터 증가
-                self.order_failures[symbol] = self.order_failures.get(symbol, 0) + 1
-                failure_count = self.order_failures.get(symbol, 0)
+                current_time = time.time()
                 
-                logger.log_system(f"[API호출오류] {symbol} API 호출 중 예외 발생 ({failure_count}/{self.max_consecutive_failures}회): {str(api_e)}")
+                # 실패 데이터 가져오기 (없으면 초기화)
+                if symbol not in self.order_failures:
+                    self.order_failures[symbol] = {"최근_실패_시간": current_time, "횟수": 1}
+                else:
+                    # 이전 실패와 현재 시간 차이 계산
+                    last_failure_time = self.order_failures[symbol]["최근_실패_시간"]
+                    time_diff = current_time - last_failure_time
+                    
+                    # 실패 사이 시간이 길면 초기화, 시간이 짧으면 횟수 증가
+                    if time_diff > self.failure_reset_time:
+                        # 5분 이상 경과했으면 초기화
+                        self.order_failures[symbol] = {"최근_실패_시간": current_time, "횟수": 1}
+                        logger.log_system(f"[API 실패카운터 초기화] {symbol}: {time_diff/60:.1f}분 경과 후 실패")
+                    else:
+                        # 횟수만 증가
+                        self.order_failures[symbol]["횟수"] += 1
+                        self.order_failures[symbol]["최근_실패_시간"] = current_time
+                
+                failures_count = self.order_failures[symbol]["횟수"]
+                
+                logger.log_system(f"[API호출오류] {symbol} API 호출 중 예외 발생 ({failures_count}/{self.max_consecutive_failures}회): {str(api_e)}")
                 logger.log_error(api_e, f"API call error for {symbol}")
                 
                 # 블랙리스트 조건 체크
-                if self.order_failures[symbol] >= self.max_consecutive_failures:
+                if failures_count >= self.max_consecutive_failures:
                     self.order_blacklist[symbol] = time.time() + self.blacklist_duration
-                    logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {self.order_failures[symbol]}회 API 오류로 {self.blacklist_duration//60}분간 주문 중지")
+                    logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {failures_count}회 API 오류로 {self.blacklist_duration//60}분간 주문 중지")
                 
-                return {"status": "error", "reason": f"API call error: {str(api_e)}", "failure_count": failure_count}
+                return {"status": "error", "reason": f"API call error: {str(api_e)}", "failure_count": failures_count}
             
         except Exception as e:
             logger.log_system(f"[주문오류] {symbol} 주문 처리 중 예외 발생: {str(e)}")
@@ -626,28 +665,66 @@ class OrderManager:
     async def check_positions(self):
         """포지션 체크 - 손절/익절"""
         try:
+            # 먼저 API로 최신 보유 종목 정보 조회
+            latest_positions = await self.get_positions()
+            if not latest_positions or "output1" not in latest_positions:
+                logger.log_system("[포지션체크] 현재 보유 종목 정보가 없습니다.")
+                return
+                
+            position_items = latest_positions.get("output1", [])
+            
+            # 보유 수량 > 0인 종목만 필터링
+            valid_positions = {}
+            for position in position_items:
+                symbol = position.get("pdno", "")
+                qty = int(position.get("hldg_qty", "0"))
+                if symbol and qty > 0:
+                    valid_positions[symbol] = {
+                        "quantity": qty,
+                        "avg_price": float(position.get("pchs_avg_pric", "0")),
+                        "current_price": float(position.get("prpr", "0")),
+                        "profit_rate": float(position.get("evlu_pfls_rt", "0")) / 100 if "evlu_pfls_rt" in position else 0
+                    }
+            
+            # 유효한 포지션이 없으면 종료
+            if not valid_positions:
+                logger.log_system("[포지션체크] 유효한 보유 종목(수량 > 0)이 없습니다.")
+                return
+                
+            logger.log_system(f"[포지션체크] 유효한 보유 종목 수: {len(valid_positions)}개, 종목 목록: {', '.join(valid_positions.keys())}")
+            
             # 동시성 문제 방지를 위한 락 사용
             async with self._async_lock:
-                for symbol, position in self.positions.items():
+                # 메모리의 포지션 정보를 API 조회한 최신 정보로 업데이트
+                self.positions = valid_positions
+                
+                for symbol, position in valid_positions.items():
                     try:
-                        # 현재가 조회
-                        price_data = api_client.get_current_price(symbol)
-                        
-                        # 현재가 조회 실패 시 건너뛰기
-                        if price_data.get("rt_cd") != "0" or "output" not in price_data:
-                            logger.log_system(f"[포지션체크] {symbol} 현재가 조회 실패, 건너뜀")
-                            continue
+                        # 현재가 조회 - API 응답에 현재가가 없거나 정확하지 않은 경우 별도 조회
+                        if position["current_price"] <= 0:
+                            price_data = api_client.get_current_price(symbol)
                             
-                        current_price = float(price_data["output"]["stck_prpr"])
+                            # 현재가 조회 실패 시 건너뛰기
+                            if price_data.get("rt_cd") != "0" or "output" not in price_data:
+                                logger.log_system(f"[포지션체크] {symbol} 현재가 조회 실패, 건너뜀")
+                                continue
+                                
+                            current_price = float(price_data["output"]["stck_prpr"])
+                            position["current_price"] = current_price
+                        else:
+                            current_price = position["current_price"]
                         
-                        # 수익률 계산
-                        pnl_rate = (current_price - position["avg_price"]) / position["avg_price"] if position["avg_price"] > 0 else 0
+                        # 수익률 계산 - API 응답의 수익률이 있으면 사용, 없으면 계산
+                        if "profit_rate" in position and position["profit_rate"] != 0:
+                            pnl_rate = position["profit_rate"]
+                        else:
+                            pnl_rate = (current_price - position["avg_price"]) / position["avg_price"] if position["avg_price"] > 0 else 0
                         
                         # 손절/익절 체크
                         max_loss_rate = self.trading_config.risk_params.get("max_loss_rate", 0.02)
                         max_profit_rate = self.trading_config.scalping_params.get("take_profit", 0.015)
                         
-                        # 보유 수량이 0인 경우 처리 건너뜀
+                        # 보유 수량이 0인 경우 처리 건너뜀 (이중 체크)
                         if position["quantity"] <= 0:
                             logger.log_system(f"[포지션체크] {symbol} 보유 수량이 0 이하, 건너뜀")
                             continue
@@ -687,6 +764,7 @@ class OrderManager:
                         # 미실현 손익 업데이트
                         unrealized_pnl = position["quantity"] * (current_price - position["avg_price"])
                         database_manager.save_position({
+                            "symbol": symbol,
                             **position,
                             "current_price": current_price,
                             "unrealized_pnl": unrealized_pnl
@@ -734,13 +812,32 @@ class OrderManager:
             logger.log_error(e, "Failed to get today's orders")
             return []
     
-    async def get_positions(self) -> List[Dict[str, Any]]:
-        """보유 포지션 조회"""
+    async def get_positions(self) -> Dict[str, Any]:
+        """보유 포지션 조회
+        
+        Returns:
+            Dict[str, Any]: API로 조회한 보유 종목 정보. 포함하는 필드는 API 응답에 따르고, 일반적으로 output1과 output2를 포함한다.
+        """
         try:
-            return list(self.positions.values())
+            # API로 포지션 조회
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, api_client.get_account_balance)
+            
+            if result and result.get("rt_cd") == "0":
+                # 로그 확인 추가
+                if "output1" in result:
+                    num_positions = len(result["output1"]) if isinstance(result["output1"], list) else 1
+                    logger.log_system(f"포지션 조회 성공: {num_positions}개 종목 정보 받음")
+                else:
+                    logger.log_system("포지션 조회 성공: 조회할 내용이 없습니다.")
+            else:
+                error_msg = result.get("msg1", "Unknown error") if result else "Unknown error"
+                logger.log_system(f"포지션 조회 실패: {error_msg}")
+                
+            return result
         except Exception as e:
             logger.log_error(e, "Failed to get positions")
-            return []
+            return {"rt_cd": "E", "msg1": str(e)}
             
     async def get_account_balance(self) -> Dict[str, Any]:
         """계좌 잔고 조회

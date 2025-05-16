@@ -183,13 +183,27 @@ class TradingBot:
                         # 매도 신호 체크 및 주문 실행 로직 추가
                         now = datetime.now()
                         if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                            await self.check_sell_signals()
+                            try:
+                                await self.check_sell_signals()
+                            except Exception as sell_error:
+                                logger.log_error(sell_error, "매도 신호 체크 중 예외 발생")
+                                await alert_system.notify_system_status(
+                                    "ERROR", 
+                                    f"매도 신호 체크 중 오류: {str(sell_error)}\n자세한 내용은 로그를 확인하세요."
+                                )
                             
                         if len(MONITORED_SYMBOLS) > 0:
                             # 2분마다 신호 체크
                             now = datetime.now()
                             if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                                await self.check_buy_signals()
+                                try:
+                                    await self.check_buy_signals()
+                                except Exception as buy_error:
+                                    logger.log_error(buy_error, "매수 신호 체크 중 예외 발생")
+                                    await alert_system.notify_system_status(
+                                        "ERROR", 
+                                        f"매수 신호 체크 중 오류: {str(buy_error)}\n자세한 내용은 로그를 확인하세요."
+                                    )
                                                 
                         # 시스템 상태 업데이트
                         database_manager.update_system_status("RUNNING")
@@ -222,19 +236,47 @@ class TradingBot:
         try:
             positions = await order_manager.get_positions()
             if positions and "output1" in positions:
-                position_items = positions.get("output1", {})
+                position_items = positions.get("output1", [])
+                
+                # 보유 종목 수량이 0인 경우 체크 중단
+                if not position_items or len(position_items) == 0:
+                    logger.log_system("보유 종목 정보가 없습니다.")
+                    logger.log_system("======== 익절 조건 체크 종료 ========")
+                    return
+                    
                 logger.log_system(f"보유 종목 수: {len(position_items)}개")
+                
+                # 보유 종목 심볼 목록 생성 (빠른 조회용)
+                held_symbols = {}
+                for position in position_items:
+                    symbol = position.get("pdno", "")
+                    qty = int(position.get("hldg_qty", "0"))
+                    
+                    # 수량이 0 초과인 종목만 저장
+                    if qty > 0 and symbol:
+                        held_symbols[symbol] = {
+                            "qty": qty,
+                            "avg_price": float(position.get("pchs_avg_pric", "0")),
+                            "profit_rate": float(position.get("evlu_pfls_rt", "0"))
+                        }
+                
+                # 보유 종목이 실제로 있는지 다시 확인
+                if not held_symbols:
+                    logger.log_system("실제 보유 중인 종목(수량 > 0)이 없습니다.")
+                    logger.log_system("======== 익절 조건 체크 종료 ========")
+                    return
+                    
+                logger.log_system(f"실제 보유 종목 수: {len(held_symbols)}개, 종목 목록: {', '.join(held_symbols.keys())}")
                 
                 sell_orders_placed = 0
                 
-                # 각 보유 종목 체크
-                for position in position_items:
+                # 각 보유 종목 체크 (보유 수량 0 초과인 종목만)
+                for symbol, position_data in held_symbols.items():
                     try:
                         # 종목 정보 추출
-                        symbol = position.get("pdno", "")  # 종목코드
-                        qty = int(position.get("hldg_qty", "0"))  # 보유수량
-                        avg_price = float(position.get("pchs_avg_pric", "0"))  # 매수 평균가
-                        current_profit_rate = float(position.get("evlu_pfls_rt", "0"))  # 현재 손익률
+                        qty = position_data["qty"]
+                        avg_price = position_data["avg_price"]
+                        current_profit_rate = position_data["profit_rate"]
                         
                         # 손익률이 2% 이상인지 확인
                         if current_profit_rate >= 2.0 and qty > 0:
