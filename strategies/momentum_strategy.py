@@ -94,10 +94,16 @@ class MomentumStrategy:
             await alert_system.notify_error(e, "Momentum strategy start error")
     
     async def _load_initial_data(self, symbol: str):
+        # 현재 시간 가져오기
+        now = datetime.now()
+
+        # HHMMSS 형식으로 변환 (콜론 없이 시분초)
+        current_time_str = now.strftime("%H%M%S")
+
         """초기 데이터 로딩"""
         try:
             # 분봉 데이터 조회
-            price_data = api_client.get_minute_price(symbol, time_unit="1")
+            price_data = api_client.get_minute_price(symbol, time_unit=current_time_str)
             if price_data.get("rt_cd") == "0":
                 prices = []
                 volumes = []
