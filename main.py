@@ -1013,13 +1013,46 @@ class TradingBot:
             summary = await order_manager.get_daily_summary()
             
             # 성과 기록
-            database_manager.save_performance(summary)
+            if summary.get('date') is None:
+                summary['date'] = datetime.now().strftime('%Y-%m-%d')
             
-            # 일일 리포트 전송
+            # 필요한 필드들 기본값 설정
+            if 'win_rate' not in summary:
+                summary['win_rate'] = 0.0
+            if 'total_pnl' not in summary:
+                summary['total_pnl'] = summary.get('daily_pnl', 0)
+            if 'top_gainers' not in summary:
+                summary['top_gainers'] = []
+            if 'top_losers' not in summary:
+                summary['top_losers'] = []
+                
+            # 포트폴리오 가치 추가
+            if 'portfolio_value' not in summary:
+                try:
+                    account_balance = await order_manager.get_account_balance()
+                    summary['portfolio_value'] = account_balance.get('total_balance', 0)
+                except Exception as e:
+                    logger.log_warning(f"포트폴리오 가치 조회 실패: {str(e)}")
+                    summary['portfolio_value'] = 0
+            
+            # 데이터베이스 저장용 데이터 필터링 (performance 테이블에 존재하는 컬럼만 포함)
+            db_summary = {
+                'date': summary.get('date'),
+                'daily_pnl': summary.get('daily_pnl', 0),
+                'daily_trades': summary.get('daily_trades', 0),
+                'win_rate': summary.get('win_rate', 0.0),
+                'total_pnl': summary.get('total_pnl', 0)
+                # top_gainers, top_losers, portfolio_value는 제외
+            }
+            
+            # 필터링된 데이터로 성과 저장
+            database_manager.save_performance(db_summary)
+            
+            # 일일 리포트 전송 (원본 summary 사용 - 모든 데이터 포함)
             await alert_system.send_daily_report(summary)
             
-            # 데이터베이스 백업
-            database_manager.backup_database()
+            # 데이터베이스 백업 제거
+            # database_manager.backup_database()
             
             logger.log_system("Market closed. Daily process completed")
             
