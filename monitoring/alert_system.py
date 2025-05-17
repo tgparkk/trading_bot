@@ -223,12 +223,12 @@ class AlertSystem:
         """일일 리포트"""
         message = f"""
         <b>Daily Trading Report</b>
-        Date: {report_data['date']}
+        Date: {report_data.get('date', datetime.now().strftime('%Y-%m-%d'))}
         
         📊 <b>Performance:</b>
-        Total Trades: {report_data['total_trades']}
-        Win Rate: {report_data['win_rate']:.2%}
-        Total P&L: ₩{report_data['total_pnl']:,.0f}
+        Total Trades: {report_data.get('daily_trades', 0)}
+        Win Rate: {report_data.get('win_rate', 0):.2%}
+        Total P&L: ₩{report_data.get('total_pnl', 0):,.0f}
         
         📈 <b>Top Gainers:</b>
         {self._format_top_movers(report_data.get('top_gainers', []))}

@@ -394,16 +394,21 @@ class DatabaseManager:
         return self._execute_query("SELECT", "system_status", order_by="-created_at", single=True)
     
     def backup_database(self, backup_path: Optional[str] = None):
-        """데이터베이스 백업"""
-        if backup_path is None:
-            backup_path = f"{self.db_path}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        """데이터베이스 백업 (비활성화됨)"""
+        # 백업 기능 비활성화
+        logger.log_system("Database backup is disabled")
+        return
         
-        with self.get_connection() as conn:
-            backup_conn = sqlite3.connect(backup_path)
-            conn.backup(backup_conn)
-            backup_conn.close()
-        
-        logger.log_system(f"Database backed up to {backup_path}")
+        # 아래 코드는 비활성화됨
+        # if backup_path is None:
+        #     backup_path = f"{self.db_path}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # 
+        # with self.get_connection() as conn:
+        #     backup_conn = sqlite3.connect(backup_path)
+        #     conn.backup(backup_conn)
+        #     backup_conn.close()
+        # 
+        # logger.log_system(f"Database backed up to {backup_path}")
     
     def save_token_log(self, event_type: str, token: str = None, 
                       issue_time: datetime = None, expire_time: datetime = None,
