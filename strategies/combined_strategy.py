@@ -288,185 +288,214 @@ class CombinedStrategy:
         try:
             logger.log_system(f"[전략] {symbol} - 신호 업데이트 시작")
             
-            # 현재가 정보 업데이트
-            try:
-                from core.api_client import api_client
-                
-                # API 호출 타임아웃 처리를 위한 Task 생성
-                get_symbol_task = asyncio.create_task(api_client.get_symbol_info(symbol))
-                try:
-                    # 타임아웃 증가: 2초 → 3초
-                    symbol_info = await asyncio.wait_for(get_symbol_task, timeout=3.0)
-                    
-                    if symbol_info and "current_price" in symbol_info:
-                        current_price = float(symbol_info["current_price"])
-                        is_test_data = symbol_info.get("is_test_data", False)
-                        
-                        # 로그 레벨 조정 (시스템 로그 대신 디버그 로그로 변경)
-                        if is_test_data:
-                            logger.log_debug(f"[전략] {symbol} - 테스트 데이터 사용: {current_price:,}원")
-                        else:
-                            logger.log_debug(f"[전략] {symbol} - API에서 가격 가져옴: {current_price:,}원")
-                        
-                        # 가격 데이터 업데이트
-                        if symbol not in self.price_data:
-                            self.price_data[symbol] = deque(maxlen=100)
-                        
-                        self.price_data[symbol].append({
-                            "price": current_price,
-                            "volume": symbol_info.get("volume", 0),
-                            "timestamp": datetime.now()
-                        })
-                        
-                        # signals에도 가격 정보 저장
-                        if symbol in self.signals:
-                            self.signals[symbol]["last_price"] = current_price
-                        else:
-                            self.signals[symbol] = {
-                                'score': 0,
-                                'direction': "NEUTRAL",
-                                'strategies': {},
-                                'last_update': None,
-                                'last_price': current_price
-                            }
-                    else:
-                        logger.log_debug(f"[전략] {symbol} - API 응답에 가격 정보 없음")
-                        
-                except asyncio.TimeoutError:
-                    logger.log_debug(f"[전략] {symbol} - API 가격 조회 타임아웃 (3초)")
-                    # 타임아웃 발생 시 이전 가격 사용 또는 테스트 데이터 생성
-                    await self._handle_price_fallback(symbol)
-                
-            except Exception as e:
-                logger.log_warning(f"[전략] {symbol} - API 가격 조회 실패: {str(e)}")
-                # API 실패 시 이전 가격 사용 또는 대체 데이터 생성
-                await self._handle_price_fallback(symbol)
+            # 1. 현재가 정보 업데이트
+            await self._update_price_data(symbol)
             
-            # 병렬 처리를 위한 Task 리스트
-            signal_tasks = []
+            # 2. 개별 전략 신호 계산 (병렬 처리)
+            await self._calculate_strategy_signals(symbol)
             
-            # 각 전략별 신호 업데이트 - 병렬 처리
-            for strategy_name, strategy in self.strategies.items():
-                if strategy is None:
-                    logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략이 None이므로 건너뜀")
-                    continue
-                
-                # 비동기 Task 생성 (타임아웃 처리가 포함된 내부 함수)
-                async def get_strategy_signal(strat_name, strat_instance):
-                    try:
-                        logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 신호 요청 시작")
-                        
-                        # 전략별 신호 취득에도 타임아웃 설정
-                        try:
-                            # 타임아웃 증가: 2초 → 3초
-                            signal = await asyncio.wait_for(strat_instance.get_signal(symbol), timeout=3.0)
-                            
-                            if signal is None:
-                                logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 신호가 None으로 반환됨")
-                                signal = {'signal': 0, 'direction': 'NEUTRAL'}  # None 대신 기본값 사용
-                            
-                            return strat_name, signal
-                        except asyncio.TimeoutError:
-                            logger.log_debug(f"[전략] {symbol} - {strat_name} 전략 호출 타임아웃 (3초)")
-                            return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
-                        except Exception as signal_error:
-                            logger.log_warning(f"[전략] {symbol} - {strat_name} 신호 계산 중 오류: {str(signal_error)}")
-                            return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
-                    except Exception as task_error:
-                        logger.log_warning(f"[전략] {symbol} - {strat_name} Task 실행 중 오류: {str(task_error)}")
-                        return strat_name, {'signal': 0, 'direction': 'NEUTRAL'}
-                
-                # Task 생성 및 리스트에 추가
-                task = asyncio.create_task(get_strategy_signal(strategy_name, strategy))
-                signal_tasks.append(task)
+            # 3. 통합 신호 계산
+            self._update_combined_signal(symbol)
             
-            # 모든 전략의 신호를 병렬로 기다림 (최대 4초 타임아웃)
-            try:
-                strategy_results = await asyncio.wait_for(asyncio.gather(*signal_tasks, return_exceptions=True), timeout=4.0)
-                
-                # signals 딕셔너리 초기화
-                if symbol not in self.signals:
-                    current_price = 0
-                    if symbol in self.price_data and self.price_data[symbol]:
-                        current_price = self.price_data[symbol][-1]["price"]
-                    
-                    self.signals[symbol] = {
-                        "strategies": {},
-                        "combined_signal": 0,
-                        "direction": "NEUTRAL",
-                        "last_update": datetime.now(),
-                        "last_price": current_price
-                    }
-                
-                # 전략 결과 저장
-                for result in strategy_results:
-                    if isinstance(result, Exception):
-                        logger.log_warning(f"[전략] {symbol} - 일부 전략 신호 계산 중 예외 발생: {str(result)}")
-                        continue
-                    
-                    strategy_name, signal = result
-                    
-                    # 명시적으로 신호 저장 및 유효성 확인
-                    if isinstance(signal, dict) and 'signal' in signal and 'direction' in signal:
-                        # 숫자형으로 변환 확인
-                        signal_value = signal['signal']
-                        try:
-                            if isinstance(signal_value, str):
-                                signal_value = float(signal_value)
-                            elif not isinstance(signal_value, (int, float)):
-                                signal_value = 0
-                        except (ValueError, TypeError):
-                            signal_value = 0
-                            
-                        # 방향 문자열 확인
-                        direction_value = signal['direction']
-                        if direction_value not in ["BUY", "SELL", "NEUTRAL"]:
-                            direction_value = "NEUTRAL"
-                        
-                        # 검증된 값으로 저장
-                        if "strategies" not in self.signals[symbol]:
-                            self.signals[symbol]["strategies"] = {}
-                        
-                        self.signals[symbol]["strategies"][strategy_name] = {
-                            'signal': signal_value, 
-                            'direction': direction_value
-                        }
-                        
-                        logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호: {signal_value:.2f}, 방향: {direction_value}")
-                    else:
-                        # 유효하지 않은 신호 형식
-                        logger.log_warning(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
-                        
-                        # 기본값으로 저장
-                        if "strategies" not in self.signals[symbol]:
-                            self.signals[symbol]["strategies"] = {}
-                        
-                        self.signals[symbol]["strategies"][strategy_name] = {
-                            'signal': 0, 
-                            'direction': "NEUTRAL"
-                        }
-                
-            except asyncio.TimeoutError:
-                logger.log_warning(f"[전략] {symbol} - 전체 전략 신호 업데이트 타임아웃 (4초)")
-                # 타임아웃 발생 시 기존 신호 정보 유지
-            except Exception as gather_error:
-                logger.log_warning(f"[전략] {symbol} - 전략 신호 수집 중 오류: {str(gather_error)}")
-            
-            # 통합 신호 계산
-            score, direction, agreements = self._calculate_combined_signal(symbol)
-            
-            # 통합 신호 결과 저장
-            self.signals[symbol]["combined_signal"] = score
-            self.signals[symbol]["score"] = score
-            self.signals[symbol]["direction"] = direction
-            self.signals[symbol]["agreements"] = agreements
-            self.signals[symbol]["last_update"] = datetime.now()
-            
-            logger.log_system(f"[전략] {symbol} - 신호 업데이트 완료: 점수={score:.2f}, 방향={direction}")
+            logger.log_system(f"[전략] {symbol} - 신호 업데이트 완료: 점수={self.signals[symbol]['score']:.2f}, 방향={self.signals[symbol]['direction']}")
             
         except Exception as e:
             logger.log_warning(f"[전략] {symbol} - 신호 업데이트 중 오류: {str(e)}")
             # 기존 신호 정보는 유지
+        
+    async def _update_price_data(self, symbol: str):
+        """심볼의 현재가 정보 업데이트"""
+        try:
+            from core.api_client import api_client
+            
+            # API 호출 타임아웃 처리
+            get_symbol_task = asyncio.create_task(api_client.get_symbol_info(symbol))
+            try:
+                symbol_info = await asyncio.wait_for(get_symbol_task, timeout=3.0)
+                
+                if symbol_info and "current_price" in symbol_info:
+                    current_price = float(symbol_info["current_price"])
+                    
+                    logger.log_debug(f"[전략] {symbol} - API에서 가격 가져옴: {current_price:,}원")
+                    
+                    # 가격 데이터 업데이트
+                    self._store_price_data(symbol, current_price, symbol_info.get("volume", 0))
+                else:
+                    logger.log_debug(f"[전략] {symbol} - API 응답에 가격 정보 없음")
+                    
+            except asyncio.TimeoutError:
+                logger.log_debug(f"[전략] {symbol} - API 가격 조회 타임아웃 (3초)")
+                await self._handle_price_fallback(symbol)
+                    
+        except Exception as e:
+            logger.log_warning(f"[전략] {symbol} - API 가격 조회 실패: {str(e)}")
+            await self._handle_price_fallback(symbol)
+
+    def _store_price_data(self, symbol: str, price: float, volume: int = 0):
+        """가격 데이터 저장 및 신호 초기화"""
+        # 가격 데이터 저장
+        if symbol not in self.price_data:
+            self.price_data[symbol] = deque(maxlen=100)
+        
+        self.price_data[symbol].append({
+            "price": price,
+            "volume": volume,
+            "timestamp": datetime.now()
+        })
+        
+        # signals 초기화 또는 업데이트
+        if symbol not in self.signals:
+            self.signals[symbol] = {
+                'score': 0,
+                'direction': "NEUTRAL",
+                'strategies': {},
+                'last_update': None,
+                'last_price': price
+            }
+        else:
+            self.signals[symbol]["last_price"] = price
+
+    async def _calculate_strategy_signals(self, symbol: str):
+        """모든 전략에 대해 병렬로 신호 계산"""
+        # 병렬 처리를 위한 Task 리스트
+        signal_tasks = []
+        
+        # 각 전략별 신호 업데이트 태스크 생성
+        for strategy_name, strategy in self.strategies.items():
+            if strategy is None:
+                logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략이 None이므로 건너뜀")
+                continue
+            
+            task = asyncio.create_task(
+                self._get_single_strategy_signal(symbol, strategy_name, strategy)
+            )
+            signal_tasks.append(task)
+        
+        # 모든 전략의 신호를 병렬로 기다림 (최대 4초 타임아웃)
+        try:
+            strategy_results = await asyncio.wait_for(
+                asyncio.gather(*signal_tasks, return_exceptions=True), 
+                timeout=4.0
+            )
+            
+            # signals 딕셔너리 초기화
+            self._ensure_signal_structure(symbol)
+            
+            # 전략 결과 저장
+            self._process_strategy_results(symbol, strategy_results)
+            
+        except asyncio.TimeoutError:
+            logger.log_warning(f"[전략] {symbol} - 전체 전략 신호 업데이트 타임아웃 (4초)")
+        except Exception as gather_error:
+            logger.log_warning(f"[전략] {symbol} - 전략 신호 수집 중 오류: {str(gather_error)}")
+
+    async def _get_single_strategy_signal(self, symbol: str, strategy_name: str, strategy):
+        """단일 전략의 신호 계산 (타임아웃 처리 포함)"""
+        try:
+            logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호 요청 시작")
+            
+            try:
+                # 타임아웃 설정
+                signal = await asyncio.wait_for(strategy.get_signal(symbol), timeout=3.0)
+                
+                if signal is None:
+                    logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호가 None으로 반환됨")
+                    return strategy_name, {'signal': 0, 'direction': 'NEUTRAL'}
+                
+                return strategy_name, signal
+                
+            except asyncio.TimeoutError:
+                logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 호출 타임아웃 (3초)")
+                return strategy_name, {'signal': 0, 'direction': 'NEUTRAL'}
+            except Exception as signal_error:
+                logger.log_warning(f"[전략] {symbol} - {strategy_name} 신호 계산 중 오류: {str(signal_error)}")
+                return strategy_name, {'signal': 0, 'direction': 'NEUTRAL'}
+                
+        except Exception as task_error:
+            logger.log_warning(f"[전략] {symbol} - {strategy_name} Task 실행 중 오류: {str(task_error)}")
+            return strategy_name, {'signal': 0, 'direction': 'NEUTRAL'}
+
+    def _ensure_signal_structure(self, symbol: str):
+        """신호 데이터 구조 초기화 확인"""
+        if symbol not in self.signals:
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            
+            self.signals[symbol] = {
+                "strategies": {},
+                "combined_signal": 0,
+                "direction": "NEUTRAL",
+                "last_update": datetime.now(),
+                "last_price": current_price
+            }
+        
+        # strategies 필드 확인
+        if "strategies" not in self.signals[symbol]:
+            self.signals[symbol]["strategies"] = {}
+
+    def _process_strategy_results(self, symbol: str, strategy_results):
+        """전략 결과 처리 및 저장"""
+        for result in strategy_results:
+            if isinstance(result, Exception):
+                logger.log_warning(f"[전략] {symbol} - 일부 전략 신호 계산 중 예외 발생: {str(result)}")
+                continue
+            
+            strategy_name, signal = result
+            
+            # 신호 데이터 검증 및 저장
+            if isinstance(signal, dict) and 'signal' in signal and 'direction' in signal:
+                # 신호값 검증
+                signal_value = self._validate_signal_value(signal['signal'])
+                
+                # 방향 검증
+                direction_value = signal['direction']
+                if direction_value not in ["BUY", "SELL", "NEUTRAL"]:
+                    direction_value = "NEUTRAL"
+                
+                # 검증된 값 저장
+                self.signals[symbol]["strategies"][strategy_name] = {
+                    'signal': signal_value, 
+                    'direction': direction_value
+                }
+                
+                logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호: {signal_value:.2f}, 방향: {direction_value}")
+            else:
+                # 유효하지 않은 신호 형식
+                logger.log_warning(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
+                
+                # 기본값 저장
+                self.signals[symbol]["strategies"][strategy_name] = {
+                    'signal': 0, 
+                    'direction': "NEUTRAL"
+                }
+
+    def _validate_signal_value(self, signal_value):
+        """신호값 검증 및 변환"""
+        try:
+            if isinstance(signal_value, str):
+                return float(signal_value)
+            elif isinstance(signal_value, (int, float)):
+                return signal_value
+            else:
+                return 0
+        except (ValueError, TypeError):
+            return 0
+
+    def _update_combined_signal(self, symbol: str):
+        """통합 신호 계산 및 업데이트"""
+        # 신호 구조 확인
+        self._ensure_signal_structure(symbol)
+        
+        # 통합 신호 계산
+        score, direction, agreements = self._calculate_combined_signal(symbol)
+        
+        # 결과 저장
+        self.signals[symbol]["combined_signal"] = score
+        self.signals[symbol]["score"] = score
+        self.signals[symbol]["direction"] = direction
+        self.signals[symbol]["agreements"] = agreements
+        self.signals[symbol]["last_update"] = datetime.now()
     
     async def _handle_price_fallback(self, symbol: str):
         """API 가격 조회 실패 시 대체 가격 정보 생성"""

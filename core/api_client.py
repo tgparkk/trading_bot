@@ -85,8 +85,8 @@ class KISAPIClient:
             # 임계값 이상 시간이 남았으면 기존 토큰 재사용
             if remaining_seconds > TOKEN_RENEWAL_THRESHOLD:
                 # 시간당 한번만 로깅하도록 제한
-                if int(remaining_hours) % 2 == 0 or remaining_hours < 1.0:
-                    logger.log_system(f"[토큰재사용] 기존 토큰이 유효하여 재사용합니다. (만료까지 {remaining_hours:.1f}시간 남음)")
+                #if int(remaining_hours) % 2 == 0 or remaining_hours < 1.0:
+                #    logger.log_system(f"[토큰재사용] 기존 토큰이 유효하여 재사용합니다. (만료까지 {remaining_hours:.1f}시간 남음)")
                 return self.access_token
             else:
                 # 만료 임계값 이하로 남았을 때만 갱신
@@ -296,10 +296,10 @@ class KISAPIClient:
                 # 만료 시간이 임계값 이상 남았으면 기존 토큰 사용
                 if remaining_seconds > TOKEN_RENEWAL_THRESHOLD:
                     # 디버깅 과도한 로깅 방지: 1시간마다 또는 30분 미만일 때만 로깅
-                    if int(remaining_hours) % 1 == 0 or remaining_hours < 0.5:
-                        logger.log_system(f"[토큰재사용] 유효한 토큰이 있습니다. 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                         f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
-                                         f"남은시간={remaining_hours:.1f}시간")
+                    # if int(remaining_hours) % 1 == 0 or remaining_hours < 0.5:
+                    #     logger.log_system(f"[토큰재사용] 유효한 토큰이 있습니다. 현재={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                    #                      f"만료={datetime.fromtimestamp(self.token_expire_time).strftime('%Y-%m-%d %H:%M:%S')}, "
+                    #                      f"남은시간={remaining_hours:.1f}시간")
                     return self.access_token
                 else:
                     # 만료 임계값 이내인 경우에만 갱신 시도
@@ -543,7 +543,7 @@ class KISAPIClient:
         is_minute_chart_request = False
         if path == "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice":
             is_minute_chart_request = True
-            logger.log_system("[특수처리] 분봉 데이터 조회 요청 감지")
+            #logger.log_system("[특수처리] 분봉 데이터 조회 요청 감지")
         
         # 상수 정의
         TOKEN_RENEWAL_THRESHOLD = 43200  # 12시간 (43200초)
@@ -551,12 +551,12 @@ class KISAPIClient:
         REQUEST_TIMEOUT = 30  # 요청 타임아웃 (초)
         
         # 상세 로그 추가 - 요청 정보
-        logger.log_system(f"API 요청: method={method}, path={path}, url={url}")
-        if params:
-            logger.log_system(f"API 파라미터: {params}")
-        if headers:
-            safe_headers = {k: v for k, v in headers.items() if k.lower() not in ["appkey", "appsecret", "authorization"]}
-            logger.log_system(f"API 헤더: {safe_headers}")
+        # logger.log_system(f"API 요청: method={method}, path={path}, url={url}")
+        # if params:
+        #     logger.log_system(f"API 파라미터: {params}")
+        # if headers:
+        #     safe_headers = {k: v for k, v in headers.items() if k.lower() not in ["appkey", "appsecret", "authorization"]}
+        #     logger.log_system(f"API 헤더: {safe_headers}")
             
         # 토큰 유효성 확인 (KIS 토큰은 24시간 유효)
         current_time = datetime.now().timestamp()
@@ -587,8 +587,8 @@ class KISAPIClient:
                 }
         else:
             token = self.access_token
-            remaining_hours = (self.token_expire_time - current_time) / 3600
-            logger.log_debug(f"유효한 토큰 사용 (만료까지 {remaining_hours:.1f}시간 남음)")
+            # remaining_hours = (self.token_expire_time - current_time) / 3600
+            # logger.log_debug(f"유효한 토큰 사용 (만료까지 {remaining_hours:.1f}시간 남음)")
         
         # 기본 헤더 설정
         default_headers = {
@@ -608,7 +608,7 @@ class KISAPIClient:
             try:
                 # HTTP 요청 실행 (타임아웃 적용)
                 if method.upper() == "GET":
-                    logger.log_system(f"GET 요청 시도 ({attempt+1}/{max_retries}): {url}")
+                    #logger.log_system(f"GET 요청 시도 ({attempt+1}/{max_retries}): {url}")
                     response = requests.get(
                         url, 
                         headers=default_headers, 
@@ -625,14 +625,14 @@ class KISAPIClient:
                     )
                 
                 # 응답 상태 코드 로그
-                logger.log_system(f"API 응답 상태 코드: {response.status_code}")
+                #logger.log_system(f"API 응답 상태 코드: {response.status_code}")
                 
-                # 응답 내용 로그 (디버깅용)
-                try:
-                    resp_text = response.text[:1000] + "..." if len(response.text) > 1000 else response.text
-                    logger.log_system(f"API 응답 내용: {resp_text}")
-                except Exception as log_e:
-                    logger.log_system(f"응답 내용 로깅 중 오류: {str(log_e)}")
+                # # 응답 내용 로그 (디버깅용)
+                # try:
+                #     resp_text = response.text[:1000] + "..." if len(response.text) > 1000 else response.text
+                #     logger.log_system(f"API 응답 내용: {resp_text}")
+                # except Exception as log_e:
+                #     logger.log_system(f"응답 내용 로깅 중 오류: {str(log_e)}")
                 
                 # 500 에러 처리 (서버 내부 오류)
                 if response.status_code == 500:
@@ -1505,8 +1505,8 @@ class KISAPIClient:
         
         try:
             # 모든 설정 정보 로깅
-            logger.log_system(f"[분봉조회설정] 기본URL: {self.base_url}, 앱키 존재: {bool(self.app_key)}, 계좌번호 존재: {bool(self.account_no)}")
-            logger.log_system(f"[분봉조회설정] 전체 URL: {self.base_url}{path}")
+            # logger.log_system(f"[분봉조회설정] 기본URL: {self.base_url}, 앱키 존재: {bool(self.app_key)}, 계좌번호 존재: {bool(self.account_no)}")
+            # logger.log_system(f"[분봉조회설정] 전체 URL: {self.base_url}{path}")
             
             # 요청 전에 현재 인증 상태 확인
             if hasattr(self, 'access_token'):
@@ -1521,8 +1521,8 @@ class KISAPIClient:
                 self._get_access_token()
             
             # 요청 매개변수 로깅
-            logger.log_system(f"[분봉조회] 요청 헤더: {headers}")
-            logger.log_system(f"[분봉조회] 요청 파라미터: {params}")
+            # logger.log_system(f"[분봉조회] 요청 헤더: {headers}")
+            # logger.log_system(f"[분봉조회] 요청 파라미터: {params}")
             
             # API 요청 실행 - raise_on_error=False로 설정하여 예외 대신 오류 정보 반환
             result = self._make_request("GET", path, headers=headers, params=params, raise_on_error=False)
@@ -1539,7 +1539,7 @@ class KISAPIClient:
             
             # 응답 로깅 (디버깅용)
             if 'output2' in result and isinstance(result['output2'], list):
-                logger.log_system(f"[분봉조회] 분봉 데이터 건수: {len(result['output2'])}")
+                #logger.log_system(f"[분봉조회] 분봉 데이터 건수: {len(result['output2'])}")
                 # 첫 번째 데이터 항목 구조만 로깅
                 if result['output2']:
                     logger.log_system(f"[분봉조회] 첫 번째 데이터 항목: {result['output2'][0] if len(result['output2']) > 0 else '없음'}")
@@ -1548,8 +1548,8 @@ class KISAPIClient:
                 logger.log_system(f"[분봉조회] 응답 구조: {list(result.keys())}")
             
             # 성공 로그 기록
-            chart_items = result.get("output2", [])
-            logger.log_system(f"[분봉조회성공] {symbol} {time_unit}분봉 데이터 조회 성공: {len(chart_items)}개 데이터")
+            #chart_items = result.get("output2", [])
+            #logger.log_system(f"[분봉조회성공] {symbol} {time_unit}분봉 데이터 조회 성공: {len(chart_items)}개 데이터")
             
             # 메타데이터 추가
             result["symbol"] = symbol
@@ -1666,12 +1666,12 @@ class KISAPIClient:
         api_max_retries = 5
         
         try:
-            logger.log_system(f"거래량 상위 조회 API 요청: market_code={market_code}, screen_code={screen_code}, top_n={vol_cnt}")
+            #logger.log_system(f"거래량 상위 조회 API 요청: market_code={market_code}, screen_code={screen_code}, top_n={vol_cnt}")
             result = self._make_request("GET", path, headers=headers, params=params, max_retries=api_max_retries)
             
             # API 응답 구조 로그
-            logger.log_system(f"거래량 상위 API 원본 응답: {json.dumps(result, indent=2, ensure_ascii=False)[:1000]}...")
-            logger.log_system(f"거래량 상위 API 응답 구조: 키={list(result.keys())}")
+            #logger.log_system(f"거래량 상위 API 원본 응답: {json.dumps(result, indent=2, ensure_ascii=False)[:1000]}...")
+            #logger.log_system(f"거래량 상위 API 응답 구조: 키={list(result.keys())}")
             
             # 성공 로그 기록
             if result.get("rt_cd") == "0":
@@ -1707,6 +1707,29 @@ class KISAPIClient:
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """종목 정보 조회"""
+        # 기본 응답 생성 헬퍼 함수
+        def create_default_response(error_suffix="", error_msg=""):
+            return {
+                "symbol": symbol,
+                "name": f"{symbol} ({error_suffix})" if error_suffix else symbol,
+                "current_price": 0,
+                "open_price": 0,
+                "high_price": 0,
+                "low_price": 0,
+                "prev_close": 0,
+                "volume": 0,
+                "change_rate": 0,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error": error_msg
+            }
+        
+        # 안전하게 숫자 변환하는 헬퍼 함수
+        def safe_convert(value, converter, default=0):
+            try:
+                return converter(value) if value else default
+            except (ValueError, TypeError):
+                return default
+        
         try:
             # 디버깅 로그 추가
             logger.log_system(f"[API] 종목 정보 조회 시작: {symbol}")
@@ -1715,12 +1738,10 @@ class KISAPIClient:
             await self._get_access_token_async()
             
             path = "/uapi/domestic-stock/v1/quotations/inquire-price"
-            headers = {
-                "tr_id": "FHKST01010100"
-            }
+            headers = {"tr_id": "FHKST01010100"}
             params = {
-                "FID_COND_MRKT_DIV_CODE": "J",  # 중요: 대문자 파라미터 키 사용
-                "FID_INPUT_ISCD": symbol       # 중요: 대문자 파라미터 키 사용
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol
             }
             
             # 동기 함수를 비동기적으로 실행
@@ -1730,141 +1751,65 @@ class KISAPIClient:
                 lambda: self._make_request("GET", path, headers=headers, params=params, max_retries=3)
             )
             
-            if result.get("rt_cd") == "0":
-                # output 필드 확인
-                if "output" not in result:
-                    logger.log_system(f"[API] {symbol} 응답에 'output' 필드가 없습니다. 응답 키: {list(result.keys())}")
-                    return {
-                        "symbol": symbol,
-                        "name": f"{symbol} (형식오류)",
-                        "current_price": 0,
-                        "open_price": 0,
-                        "high_price": 0,
-                        "low_price": 0,
-                        "prev_close": 0,
-                        "volume": 0,
-                        "change_rate": 0,
-                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "error": "API 응답에 'output' 필드가 없습니다"
-                    }
-                
-                output = result["output"]
-                
-                # 필수 필드 안전하게 추출
-                try:
-                    rprs_mrkt_kor_name = output.get("rprs_mrkt_kor_name", "Unknown")
-                    current_price = float(output.get("stck_prpr", "0"))  # 주식 현재가
-                    open_price = float(output.get("stck_oprc", "0"))     # 주식 시가
-                    high_price = float(output.get("stck_hgpr", "0"))     # 주식 고가
-                    low_price = float(output.get("stck_lwpr", "0"))      # 주식 저가
-                    prev_close = float(output.get("stck_sdpr", "0"))     # 전일 종가
-                    volume = int(output.get("acml_vol", "0"))            # 누적 거래량
-                    change_rate = float(output.get("prdy_ctrt", "0"))    # 전일 대비 변동율
-                except (ValueError, TypeError) as e:
-                    logger.log_error(e, f"[API] {symbol} 가격 데이터 변환 오류")
-                    # 오류 정보 자세히 기록
-                    for field_name, field_value in [
-                        ("rprs_mrkt_kor_name", output.get("rprs_mrkt_kor_name")),
-                        ("stck_prpr", output.get("stck_prpr")),
-                        ("stck_oprc", output.get("stck_oprc")),
-                        ("stck_hgpr", output.get("stck_hgpr")),
-                        ("stck_lwpr", output.get("stck_lwpr")),
-                        ("stck_sdpr", output.get("stck_sdpr")),
-                        ("acml_vol", output.get("acml_vol")),
-                        ("prdy_ctrt", output.get("prdy_ctrt"))
-                    ]:
-                        logger.log_system(f"[API] {field_name}: {field_value} (타입: {type(field_value)})")
-                    
-                    # 기본값 설정
-                    current_price = 0
-                    open_price = 0
-                    high_price = 0
-                    low_price = 0
-                    prev_close = 0
-                    volume = 0
-                    change_rate = 0
-                
-                result_data = {
-                    "symbol": symbol,
-                    "name": rprs_mrkt_kor_name,
-                    "current_price": current_price,
-                    "open_price": open_price,
-                    "high_price": high_price,
-                    "low_price": low_price,
-                    "prev_close": prev_close,
-                    "volume": volume,
-                    "change_rate": change_rate,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                logger.log_system(f"[API] {symbol} 종목 정보 조회 성공: 종목명 '{rprs_mrkt_kor_name}', 현재가 {current_price:,}원")
-                return result_data
-            else:
+            # 응답 검증
+            if result.get("rt_cd") != "0":
                 error_msg = result.get("msg1", "알 수 없는 오류")
                 logger.log_system(f"[API] {symbol} 종목 정보 조회 실패: {error_msg}")
-                
-                # 특정 오류를 정형화된 응답으로 반환 (전략 오류 방지)
-                return {
+                return create_default_response("조회실패", error_msg)
+            
+            # output 필드 확인
+            if "output" not in result:
+                logger.log_system(f"[API] {symbol} 응답에 'output' 필드가 없습니다. 응답 키: {list(result.keys())}")
+                return create_default_response("형식오류", "API 응답에 'output' 필드가 없습니다")
+            
+            output = result["output"]
+            
+            try:
+                # 데이터 안전하게 추출 및 변환
+                response_data = {
                     "symbol": symbol,
-                    "name": f"{symbol} (조회실패)",
-                    "current_price": 0,
-                    "open_price": 0,
-                    "high_price": 0,
-                    "low_price": 0,
-                    "prev_close": 0,
-                    "volume": 0,
-                    "change_rate": 0,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "error": error_msg
+                    "name": output.get("rprs_mrkt_kor_name", "Unknown"),
+                    "current_price": safe_convert(output.get("stck_prpr"), float),
+                    "open_price": safe_convert(output.get("stck_oprc"), float),
+                    "high_price": safe_convert(output.get("stck_hgpr"), float),
+                    "low_price": safe_convert(output.get("stck_lwpr"), float),
+                    "prev_close": safe_convert(output.get("stck_sdpr"), float),
+                    "volume": safe_convert(output.get("acml_vol"), int),
+                    "change_rate": safe_convert(output.get("prdy_ctrt"), float),
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
+                
+                logger.log_system(f"[API] {symbol} 종목 정보 조회 성공: 종목명 '{response_data['name']}', 현재가 {response_data['current_price']:,}원")
+                return response_data
+                
+            except Exception as e:
+                logger.log_error(e, f"[API] {symbol} 가격 데이터 변환 오류")
+                # 오류 정보 자세히 기록
+                for field_name, field_value in [
+                    ("rprs_mrkt_kor_name", output.get("rprs_mrkt_kor_name")),
+                    ("stck_prpr", output.get("stck_prpr")),
+                    ("stck_oprc", output.get("stck_oprc")),
+                    ("stck_hgpr", output.get("stck_hgpr")),
+                    ("stck_lwpr", output.get("stck_lwpr")),
+                    ("stck_sdpr", output.get("stck_sdpr")),
+                    ("acml_vol", output.get("acml_vol")),
+                    ("prdy_ctrt", output.get("prdy_ctrt"))
+                ]:
+                    logger.log_system(f"[API] {field_name}: {field_value} (타입: {type(field_value)})")
+                
+                return create_default_response("변환오류", f"데이터 변환 오류: {str(e)}")
         
         except requests.Timeout:
             logger.log_system(f"[API] {symbol} 종목 정보 조회 타임아웃 발생")
-            # 타임아웃 발생 시에도 정형화된 응답 반환
-            return {
-                "symbol": symbol,
-                "name": f"{symbol} (타임아웃)",
-                "current_price": 0,
-                "open_price": 0,
-                "high_price": 0,
-                "low_price": 0,
-                "prev_close": 0,
-                "volume": 0,
-                "change_rate": 0,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "error": "API 요청 타임아웃"
-            }
+            return create_default_response("타임아웃", "API 요청 타임아웃")
+        
         except requests.RequestException as e:
             logger.log_error(e, f"[API] {symbol} 종목 정보 조회 요청 오류")
-            # 요청 오류 시에도 정형화된 응답 반환
-            return {
-                "symbol": symbol,
-                "name": f"{symbol} (요청오류)",
-                "current_price": 0,
-                "open_price": 0,
-                "high_price": 0,
-                "low_price": 0,
-                "prev_close": 0,
-                "volume": 0,
-                "change_rate": 0,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "error": f"API 요청 오류: {str(e)}"
-            }
+            return create_default_response("요청오류", f"API 요청 오류: {str(e)}")
+        
         except Exception as e:
             logger.log_error(e, f"[API] {symbol} 종목 정보 조회 중 오류 발생")
-            # 예외 발생 시에도 정형화된 응답 반환
-            return {
-                "symbol": symbol,
-                "name": f"{symbol} (오류)",
-                "current_price": 0,
-                "open_price": 0,
-                "high_price": 0,
-                "low_price": 0,
-                "prev_close": 0,
-                "volume": 0,
-                "change_rate": 0,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "error": f"예외 발생: {str(e)}"
-            }
+            return create_default_response("오류", f"예외 발생: {str(e)}")
 
 
 

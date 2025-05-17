@@ -247,6 +247,8 @@ class DatabaseManager:
                     win_rate REAL,
                     sharpe_ratio REAL,
                     max_drawdown REAL,
+                    daily_pnl REAL,
+                    daily_trades INTEGER,
                     created_at TIMESTAMP DEFAULT (kst_datetime()),
                     UNIQUE(date, symbol)
                 )

@@ -659,188 +659,190 @@ class MomentumStrategy:
     async def get_signal(self, symbol: str) -> Dict[str, Any]:
         """전략 신호 반환 (combined_strategy에서 호출)"""
         try:
-            # 가격 데이터 초기화 확인 및 필요 시 초기화
-            if symbol not in self.price_data or len(self.price_data[symbol]) == 0:
-                logger.log_system(f"{symbol} - 모멘텀 데이터 초기화 중...")
-                await self._load_initial_data(symbol)
-            
-            # 충분한 데이터가 없으면 데이터 생성
-            min_required_data = max(self.params["rsi_period"], self.params["ma_long_period"])
-            if len(self.price_data[symbol]) < min_required_data:
-                # 현재가 확인
-                current_price = 0
-                if self.price_data[symbol] and len(self.price_data[symbol]) > 0:
-                    current_price = self.price_data[symbol][-1]["price"]
+            # 1. 데이터 유효성 검증
+            if not await self._ensure_valid_data(symbol):
+                return {"signal": 0, "direction": "NEUTRAL", "reason": "insufficient_data"}
                 
-                # 현재가가 없으면 API에서 가져오기
-                if current_price <= 0:
-                    try:
-                        symbol_info = await api_client.get_symbol_info(symbol)
-                        if symbol_info and "current_price" in symbol_info:
-                            current_price = float(symbol_info["current_price"])
-                            # 가격 데이터에 현재가 추가
-                            self.price_data[symbol].append({
-                                "price": current_price,
-                                "volume": 0,
-                                "timestamp": datetime.now()
-                            })
-                    except Exception as e:
-                        logger.log_error(e, f"{symbol} - 모멘텀 현재가 조회 실패")
-                        return {"signal": 0, "direction": "NEUTRAL", "reason": "price_fetch_error"}
-                
-                # 임시 가격 데이터 생성
-                if current_price > 0:
-                    logger.log_system(f"{symbol} - 모멘텀 전략용 임시 가격 데이터 생성 중...")
-                    
-                    # 현재가 기준으로 약간의 변동이 있는 가격 생성
-                    # 추세를 가진 데이터 생성 (상승 또는 하락)
-                    trend_factor = 0.002  # 0.2% 변동 요소
-                    
-                    # 랜덤 요소가 있는 추세 데이터 생성
-                    base_price = current_price * 0.9  # 현재가보다 10% 낮은 시작점
-                    price_history = []
-                    
-                    for i in range(min_required_data):
-                        # 상승 추세 + 랜덤 요소
-                        trend_value = base_price * (1 + trend_factor * i + 0.005 * (np.random.random() - 0.5))
-                        price_history.append(trend_value)
-                    
-                    # 최종 가격이 현재가와 일치하도록 조정
-                    price_history[-1] = current_price
-                    
-                    # 이력 데이터 추가
-                    now = datetime.now()
-                    for i, price in enumerate(price_history):
-                        timestamp = now - timedelta(minutes=(min_required_data-i))
-                        self.price_data[symbol].append({
-                            "price": price,
-                            "volume": 1000,
-                            "timestamp": timestamp
-                        })
-                    
-                    logger.log_system(f"{symbol} - 임시 가격 데이터 생성 완료: {len(self.price_data[symbol])}개")
-                    
-                    # 지표 계산
-                    self._calculate_indicators(symbol)
-            
-            # 지표 미계산 시 지표 계산
-            indicators = self.indicators.get(symbol, {})
-            if not indicators or indicators.get('rsi') is None or indicators.get('ma_short') is None:
+            # 2. 지표 계산 (필요시에만)
+            if not self._has_valid_indicators(symbol):
                 self._calculate_indicators(symbol)
-                indicators = self.indicators.get(symbol, {})
-            
-            # 현재가 확인
-            current_price = 0
-            if self.price_data[symbol]:
-                current_price = self.price_data[symbol][-1]["price"]
-            
-            # 현재가가 없으면 API에서 가져오기
-            if current_price <= 0:
-                try:
-                    symbol_info = await api_client.get_symbol_info(symbol)
-                    if symbol_info and "current_price" in symbol_info:
-                        current_price = float(symbol_info["current_price"])
-                        # 가격 데이터 업데이트
-                        self.price_data[symbol].append({
-                            "price": current_price,
-                            "volume": 0,
-                            "timestamp": datetime.now()
-                        })
-                        # 지표 재계산
-                        self._calculate_indicators(symbol)
-                except Exception as e:
-                    logger.log_error(e, f"{symbol} - 모멘텀 현재가 조회 실패")
-                    return {"signal": 0, "direction": "NEUTRAL", "reason": "price_fetch_error"}
-            
-            # 지표 확인
-            indicators = self.indicators.get(symbol, {})
-            if not indicators or indicators.get('rsi') is None or indicators.get('ma_short') is None or indicators.get('ma_long') is None:
-                return {"signal": 0, "direction": "NEUTRAL", "reason": "indicators_missing"}
-            
-            # 방향과 신호 강도 계산
-            direction = "NEUTRAL"
-            signal_strength = 0
-            
-            # RSI 기반 신호
-            rsi = indicators['rsi']
-            rsi_buy = self.params["rsi_buy_threshold"]
-            rsi_sell = self.params["rsi_sell_threshold"]
-            
-            # 이동평균 기반 신호
-            ma_short = indicators['ma_short']
-            ma_long = indicators['ma_long']
-            ma_cross = ma_short > ma_long
-            
-            # 매수 신호 (낮은 RSI 또는 골든 크로스)
-            if rsi < rsi_buy or (ma_cross and not indicators.get('prev_ma_cross', False)):
-                direction = "BUY"
                 
-                # RSI 기반 강도 계산
-                if rsi < rsi_buy:
-                    # RSI가 낮을수록 강한 신호 (0~10 범위)
-                    rsi_strength = (rsi_buy - rsi) / rsi_buy * 10
-                    signal_strength = min(10, rsi_strength)
+            # 3. 신호 계산 (별도 함수로 분리)
+            signal_info = self._calculate_signal_strength(symbol)
                 
-                # 골든 크로스 강도 계산
-                if ma_cross and not indicators.get('prev_ma_cross', False):
-                    cross_strength = (ma_short - ma_long) / ma_long * 100
-                    cross_score = min(10, cross_strength * 10)
-                    signal_strength = max(signal_strength, cross_score)
-            
-            # 매도 신호 (높은 RSI 또는 데드 크로스)
-            elif rsi > rsi_sell or (not ma_cross and indicators.get('prev_ma_cross', True)):
-                direction = "SELL"
-                
-                # RSI 기반 강도 계산
-                if rsi > rsi_sell:
-                    # RSI가 높을수록 강한 매도 신호 (0~10 범위)
-                    rsi_strength = (rsi - rsi_sell) / (100 - rsi_sell) * 10
-                    signal_strength = min(10, rsi_strength)
-                
-                # 데드 크로스 강도 계산
-                if not ma_cross and indicators.get('prev_ma_cross', True):
-                    cross_strength = (ma_long - ma_short) / ma_long * 100
-                    cross_score = min(10, cross_strength * 10)
-                    signal_strength = max(signal_strength, cross_score)
-            
-            # MACD 신호 고려 (보조 지표)
-            if indicators.get('macd') is not None and indicators.get('macd_signal') is not None:
-                macd = indicators['macd']
-                macd_signal = indicators['macd_signal']
-                
-                # MACD가 시그널 라인을 상향 돌파
-                if macd > macd_signal and direction == "BUY":
-                    # 돌파 강도에 따라 신호 강화
-                    macd_strength = (macd - macd_signal) / abs(macd_signal) * 5 if abs(macd_signal) > 0 else 1
-                    signal_strength = max(signal_strength, min(10, macd_strength))
-                
-                # MACD가 시그널 라인을 하향 돌파
-                elif macd < macd_signal and direction == "SELL":
-                    # 돌파 강도에 따라 신호 강화
-                    macd_strength = (macd_signal - macd) / abs(macd_signal) * 5 if abs(macd_signal) > 0 else 1
-                    signal_strength = max(signal_strength, min(10, macd_strength))
-            
-            # 신호 정보 저장
+            # 4. 신호 정보 저장 및 반환
             self.signals[symbol] = {
-                "strength": signal_strength,
-                "direction": direction,
+                "strength": signal_info["signal"],
+                "direction": signal_info["direction"],
                 "last_update": datetime.now()
             }
-            
-            # 상세 정보 포함하여 반환
-            result = {
-                "signal": signal_strength, 
-                "direction": direction,
-                "rsi": round(rsi, 1),
-                "ma_cross": "GOLDEN" if ma_cross else "DEAD",
-                "ma_diff_pct": f"{((ma_short/ma_long)-1)*100:.2f}%" if ma_long > 0 else "N/A"
-            }
-            
-            return result
-            
+                
+            return signal_info
+                
         except Exception as e:
             logger.log_error(e, f"{symbol} - 모멘텀 신호 계산 오류")
             return {"signal": 0, "direction": "NEUTRAL", "reason": "error"}
+            
+    async def _ensure_valid_data(self, symbol: str) -> bool:
+        """종목의 데이터가 유효한지 확인하고 필요시 초기화"""
+        # 가격 데이터 초기화 확인
+        if symbol not in self.price_data or not self.price_data[symbol]:
+            # 데이터 로드 시도
+            await self._load_initial_data(symbol)
+                
+        # 최소 필요 데이터 확인
+        min_required_data = max(self.params["rsi_period"], self.params["ma_long_period"])
+        if len(self.price_data[symbol]) < min_required_data:
+            # 실제 데이터가 부족하면 신호 생성을 안 함 (임시 데이터 생성 대신)
+            logger.log_system(f"{symbol} - 모멘텀 전략에 필요한 충분한 데이터가 없음")
+            return False
+                
+        # 현재가 확인
+        if not await self._ensure_current_price(symbol):
+            return False
+                
+        return True
+            
+    async def _ensure_current_price(self, symbol: str) -> bool:
+        """현재가가 있는지 확인하고 없으면 조회"""
+        current_price = 0
+        if self.price_data[symbol]:
+            current_price = self.price_data[symbol][-1]["price"]
+                
+        # 현재가가 없으면 API에서 가져오기
+        if current_price <= 0:
+            try:
+                symbol_info = await api_client.get_symbol_info(symbol)
+                if symbol_info and "current_price" in symbol_info:
+                    current_price = float(symbol_info["current_price"])
+                    # 가격 데이터 업데이트
+                    self.price_data[symbol].append({
+                        "price": current_price,
+                        "volume": 0,
+                        "timestamp": datetime.now()
+                    })
+                    return True
+                return False
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - 모멘텀 현재가 조회 실패")
+                return False
+        return True
+            
+    def _has_valid_indicators(self, symbol: str) -> bool:
+        """유효한 지표가 있는지 확인"""
+        indicators = self.indicators.get(symbol, {})
+        return (indicators and 
+                indicators.get('rsi') is not None and 
+                indicators.get('ma_short') is not None and 
+                indicators.get('ma_long') is not None)
+            
+    def _calculate_signal_strength(self, symbol: str) -> Dict[str, Any]:
+        """모멘텀 신호 강도 및 방향 계산"""
+        indicators = self.indicators[symbol]
+        
+        # 기본 변수 설정
+        direction = "NEUTRAL"
+        signal_strength = 0
+        
+        # 지표 추출
+        rsi = indicators['rsi']
+        rsi_buy = self.params["rsi_buy_threshold"]
+        rsi_sell = self.params["rsi_sell_threshold"]
+        ma_short = indicators['ma_short']
+        ma_long = indicators['ma_long']
+        ma_cross = ma_short > ma_long
+        
+        # 가중치 설정 (각 지표의 중요도)
+        weights = {
+            "rsi": 0.4,      # RSI 가중치 40%
+            "ma_cross": 0.3, # 이동평균 교차 가중치 30%
+            "macd": 0.3      # MACD 가중치 30%
+        }
+        
+        # 1. RSI 신호 계산
+        rsi_signal = 0
+        rsi_direction = "NEUTRAL"
+        
+        if rsi < rsi_buy:
+            rsi_direction = "BUY"
+            rsi_signal = (rsi_buy - rsi) / rsi_buy * 10  # 0-10 점수
+        elif rsi > rsi_sell:
+            rsi_direction = "SELL"
+            rsi_signal = (rsi - rsi_sell) / (100 - rsi_sell) * 10  # 0-10 점수
+        
+        # 2. 이동평균 신호 계산
+        ma_signal = 0
+        ma_direction = "NEUTRAL"
+        
+        if ma_cross:  # 골든 크로스
+            ma_direction = "BUY"
+            ma_diff_pct = ((ma_short/ma_long)-1)*100 if ma_long > 0 else 0
+            ma_signal = min(10, ma_diff_pct * 5)  # 0-10 점수
+        else:  # 데드 크로스
+            ma_direction = "SELL"
+            ma_diff_pct = ((ma_long/ma_short)-1)*100 if ma_short > 0 else 0
+            ma_signal = min(10, ma_diff_pct * 5)  # 0-10 점수
+        
+        # 3. MACD 신호 계산
+        macd_signal = 0
+        macd_direction = "NEUTRAL"
+        
+        if indicators.get('macd') is not None and indicators.get('macd_signal') is not None:
+            macd = indicators['macd']
+            macd_sig = indicators['macd_signal']
+            
+            if macd > macd_sig:
+                macd_direction = "BUY"
+                macd_diff = abs(macd - macd_sig)
+                macd_signal = min(10, macd_diff * 20 if abs(macd_sig) > 0 else 2)
+            else:
+                macd_direction = "SELL"
+                macd_diff = abs(macd_sig - macd)
+                macd_signal = min(10, macd_diff * 20 if abs(macd_sig) > 0 else 2)
+        
+        # 4. 종합 신호 계산 (가중 평균)
+        # 각 지표의 방향이 일치하는 경우 신호 강화
+        if rsi_direction == ma_direction == macd_direction:
+            # 방향 일치 시 보너스
+            direction = rsi_direction
+            # 가중 평균 + 보너스
+            signal_strength = (
+                rsi_signal * weights["rsi"] +
+                ma_signal * weights["ma_cross"] +
+                macd_signal * weights["macd"]
+            ) * 1.2  # 20% 보너스
+        else:
+            # 가장 강한 신호의 방향 선택
+            signals = [
+                (rsi_signal * weights["rsi"], rsi_direction),
+                (ma_signal * weights["ma_cross"], ma_direction),
+                (macd_signal * weights["macd"], macd_direction)
+            ]
+            
+            max_signal = max(signals, key=lambda x: x[0])
+            if max_signal[0] > 0:
+                direction = max_signal[1]
+                # 가중 평균
+                signal_strength = (
+                    rsi_signal * weights["rsi"] +
+                    ma_signal * weights["ma_cross"] +
+                    macd_signal * weights["macd"]
+                )
+        
+        # 5. 최종 신호 강도 제한 (0-10)
+        signal_strength = min(10, max(0, signal_strength))
+        
+        # 상세 정보 포함하여 반환
+        return {
+            "signal": signal_strength, 
+            "direction": direction,
+            "rsi": round(rsi, 1),
+            "rsi_signal": round(rsi_signal, 1),
+            "ma_cross": "GOLDEN" if ma_cross else "DEAD",
+            "ma_signal": round(ma_signal, 1),
+            "ma_diff_pct": f"{((ma_short/ma_long)-1)*100:.2f}%" if ma_long > 0 else "N/A",
+            "macd_signal": round(macd_signal, 1) if indicators.get('macd') is not None else "N/A"
+        }
     
     async def update_symbols(self, new_symbols: List[str]):
         """종목 목록 업데이트"""
