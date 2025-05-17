@@ -1013,6 +1013,10 @@ class TradingBot:
             summary = await order_manager.get_daily_summary()
             
             # 성과 기록
+            if not hasattr(summary, 'date') or summary.date is None:
+                import datetime
+                summary.date = datetime.datetime.now().strftime('%Y-%m-%d')
+
             database_manager.save_performance(summary)
             
             # 일일 리포트 전송

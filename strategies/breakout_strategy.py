@@ -40,6 +40,12 @@ class BreakoutStrategy:
         self.positions = {}           # {position_id: position_data}
         self.initialization_complete = {} # {symbol: bool} - 초기화 완료 여부
         
+        # 성능 최적화를 위한 캐시 및 세마포어 미리 초기화
+        self._symbol_positions_cache = {}
+        self._setup_semaphore = asyncio.Semaphore(5)   # 레벨 설정용 세마포어
+        self._analysis_semaphore = asyncio.Semaphore(10)  # 분석용 세마포어
+        self._exit_semaphore = asyncio.Semaphore(5)    # 포지션 청산용 세마포어
+        
     async def start(self, symbols: List[str]):
         """전략 시작"""
         try:
@@ -63,6 +69,9 @@ class BreakoutStrategy:
                 await ws_client.subscribe_price(symbol, self._handle_price_update)
             
             logger.log_system(f"Breakout strategy started for {len(symbols)} symbols")
+            
+            # 초기 데이터 로드 (병렬 처리)
+            asyncio.create_task(self._load_initial_data_for_all_symbols(symbols))
             
             # 전략 실행 루프
             asyncio.create_task(self._strategy_loop())
@@ -96,91 +105,125 @@ class BreakoutStrategy:
         return True
     
     async def _handle_price_update(self, data: Dict[str, Any]):
-        """실시간 체결가 업데이트 처리"""
+        """실시간 체결가 업데이트 처리 - 성능 최적화 버전"""
         try:
+            # 필수 데이터 추출
             symbol = data.get("tr_key")
             price = float(data.get("stck_prpr", 0))
             
-            if symbol in self.price_data:
-                self.price_data[symbol].append({
-                    "price": price,
-                    "timestamp": datetime.now()
-                })
-                
-                # 장 시작 시간에 초기 데이터 수집
-                current_time = datetime.now().time()
-                if time(9, 0) <= current_time <= time(9, 30) and not self.initialization_complete[symbol]:
-                    # 초기화 중 최고가/최저가 업데이트
-                    breakout_data = self.breakout_levels[symbol]
-                    if breakout_data['init_high'] is None or price > breakout_data['init_high']:
-                        breakout_data['init_high'] = price
-                    if breakout_data['init_low'] is None or price < breakout_data['init_low']:
-                        breakout_data['init_low'] = price
-                
-                # 9:30에 돌파 레벨 설정
-                if current_time >= time(9, 30) and not self.initialization_complete[symbol]:
-                    await self._set_breakout_levels(symbol)
-                    
-        except Exception as e:
-            logger.log_error(e, "Error handling price update in breakout strategy")
-    
-    async def _set_breakout_levels(self, symbol: str):
-        """돌파 레벨 설정 (9:30에 실행)"""
-        try:
-            if self.initialization_complete[symbol]:
+            # 유효성 검사 (빠른 실패)
+            if symbol not in self.price_data or price <= 0:
                 return
                 
+            # 현재 시간 한 번만 계산
+            now = datetime.now()
+            current_time = now.time()
+            
+            # 가격 데이터 저장
+            self.price_data[symbol].append({
+                "price": price,
+                "timestamp": now
+            })
+            
+            # 초기화 완료 상태에 따라 분기 (불필요한 체크 최소화)
+            if self.initialization_complete.get(symbol, False):
+                # 이미 초기화 완료된 경우 더 이상의 처리 불필요
+                return
+                
+            # 시장 시간대 확인 (9:00-9:30 사이)
+            is_collection_period = time(9, 0) <= current_time < time(9, 30)
+            is_setup_time = current_time >= time(9, 30)
+            
+            if is_collection_period:
+                # 초기화 중 최고가/최저가 업데이트 - 인라인 처리로 호출 오버헤드 감소
+                breakout_data = self.breakout_levels[symbol]
+                if breakout_data['init_high'] is None or price > breakout_data['init_high']:
+                    breakout_data['init_high'] = price
+                if breakout_data['init_low'] is None or price < breakout_data['init_low']:
+                    breakout_data['init_low'] = price
+                    
+            elif is_setup_time:
+                # 레벨 설정 태스크 생성 (비동기 처리)
+                asyncio.create_task(self._setup_breakout_levels_with_timeout(symbol))
+                    
+        except Exception as e:
+            logger.log_error(e, f"Error handling price update for {symbol}")
+    
+    async def _setup_breakout_levels_with_timeout(self, symbol: str):
+        """타임아웃이 설정된 브레이크아웃 레벨 설정 함수 (중첩 함수 분리)"""
+        async with self._setup_semaphore:
+            try:
+                await asyncio.wait_for(self._set_breakout_levels(symbol), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.log_warning(f"{symbol} - 브레이크아웃 레벨 설정 타임아웃")
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - 브레이크아웃 레벨 설정 중 오류")
+    
+    async def _set_breakout_levels(self, symbol: str):
+        """돌파 레벨 설정 (9:30에 실행) - 성능 최적화 버전"""
+        try:
+            if self.initialization_complete.get(symbol, False):
+                return
+                    
             breakout_data = self.breakout_levels[symbol]
             
             # 9:00~9:30 데이터에서 고가/저가 계산
             if breakout_data['init_high'] is None or breakout_data['init_low'] is None:
-                # 실시간 데이터 부족한 경우 API로 조회
-                price_data = api_client.get_minute_price(symbol)
-                if price_data.get("rt_cd") == "0":
-                    prices = []
-                    # output2가 실제 차트 데이터를 담고 있음
-                    chart_data = price_data.get("output2", [])
+                # 실시간 데이터 부족한 경우 API로 조회 (비동기 처리)
+                try:
+                    # API 호출을 비동기로 처리하고 타임아웃 설정
+                    price_data_task = asyncio.create_task(api_client.get_minute_price(symbol))
+                    price_data = await asyncio.wait_for(price_data_task, timeout=3.0)
                     
-                    # 데이터가 있는지 확인
-                    if chart_data:
-                        logger.log_system(f"{symbol} - 차트 데이터 {len(chart_data)}개 로드 성공")
+                    if price_data.get("rt_cd") == "0":
+                        # 데이터가 있는지 확인
+                        chart_data = price_data.get("output2", [])
                         
-                        # 일반적으로 가장 최근 데이터가 배열의 첫 번째에 옴 - 역순으로 처리해야 할 수 있음
-                        for item in chart_data:
-                            # stck_prpr 또는 그에 상응하는 가격 필드 사용
-                            if "stck_prpr" in item:
-                                prices.append(float(item["stck_prpr"]))
-                            elif "clos" in item:  # 종가(clos) 필드가 있는 경우
-                                prices.append(float(item["clos"]))
-                            # 필요에 따라 다른 필드 처리 (고가/저가 등)
-                        
-                        if prices:
-                            # 시간 정보를 확인하여 9:00~9:30 데이터만 필터링 (옵션)
-                            # 실제 API 응답 구조에 따라 시간 필드 이름 조정 필요
-                            filtered_prices = []
-                            for i, item in enumerate(chart_data):
-                                if "time" in item:
-                                    time_str = item["time"]
-                                    # 시간 형식에 맞게 파싱해야 함
-                                    # 예: "090000"부터 "093000"까지의 데이터만 처리
-                                    if "090000" <= time_str <= "093000":
-                                        if i < len(prices):
-                                            filtered_prices.append(prices[i])
+                        if chart_data:
+                            logger.log_system(f"{symbol} - 차트 데이터 {len(chart_data)}개 로드 성공")
                             
-                            # 필터링된 데이터가 있으면 사용, 없으면 모든 데이터 사용
+                            # 리스트 컴프리헨션 사용하여 필터링과 변환을 한 번에 처리
+                            prices = []
+                            times = []
+                            
+                            # 데이터 형식에 따라 적절한 필드 추출
+                            for item in chart_data:
+                                price_value = None
+                                if "stck_prpr" in item:
+                                    price_value = float(item["stck_prpr"])
+                                elif "clos" in item:  # 종가(clos) 필드가 있는 경우
+                                    price_value = float(item["clos"])
+                                
+                                time_value = item.get("time", "")
+                                
+                                if price_value is not None:
+                                    prices.append(price_value)
+                                    times.append(time_value)
+                            
+                            # 9:00~9:30 데이터만 필터링 (더 효율적인 방식)
+                            filtered_prices = [
+                                price for price, time_str in zip(prices, times)
+                                if "090000" <= time_str <= "093000"
+                            ]
+                            
                             if filtered_prices:
-                                breakout_data['init_high'] = max(filtered_prices)
-                                breakout_data['init_low'] = min(filtered_prices)
+                                # NumPy 이미 임포트되어 있으므로 중복 임포트 제거
+                                breakout_data['init_high'] = np.max(filtered_prices)
+                                breakout_data['init_low'] = np.min(filtered_prices)
                             else:
                                 # 필터링된 데이터가 없으면 받아온 모든 데이터에서 처리
-                                breakout_data['init_high'] = max(prices[:min(30, len(prices))])
-                                breakout_data['init_low'] = min(prices[:min(30, len(prices))])
+                                data_limit = min(30, len(prices))
+                                if data_limit > 0:
+                                    breakout_data['init_high'] = max(prices[:data_limit])
+                                    breakout_data['init_low'] = min(prices[:data_limit])
                             
                             logger.log_system(f"{symbol} - 초기 브레이크아웃 레벨: 고가={breakout_data['init_high']}, 저가={breakout_data['init_low']}")
                         else:
-                            logger.log_system(f"{symbol} - 가격 데이터를 추출할 수 없음")
-                    else:
-                        logger.log_system(f"{symbol} - 차트 데이터 없음")
+                            logger.log_system(f"{symbol} - 차트 데이터 없음")
+                except asyncio.TimeoutError:
+                    logger.log_warning(f"{symbol} - 차트 데이터 조회 타임아웃 (3초)")
+                except Exception as api_error:
+                    logger.log_error(api_error, f"{symbol} - 차트 데이터 조회 중 오류")
             
             # 고가/저가가 설정되었는지 확인
             if breakout_data['init_high'] is None or breakout_data['init_low'] is None:
@@ -203,8 +246,22 @@ class BreakoutStrategy:
         except Exception as e:
             logger.log_error(e, f"Error setting breakout levels for {symbol}")
     
+    async def _analyze_with_semaphore(self, symbol: str):
+        """세마포어로 제한된 분석 함수 (중첩 함수 분리)"""
+        async with self._analysis_semaphore:
+            try:
+                # 각 종목 분석에 타임아웃 설정
+                await asyncio.wait_for(
+                    self._analyze_and_trade(symbol),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logger.log_warning(f"{symbol} - 분석 타임아웃 (2초)")
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - 분석 중 오류")
+    
     async def _strategy_loop(self):
-        """전략 실행 루프"""
+        """전략 실행 루프 - 성능 최적화 버전"""
         while self.running:
             try:
                 # 장 시간 체크
@@ -220,12 +277,27 @@ class BreakoutStrategy:
                 
                 # 9:30 이후에만 트레이딩 실행
                 if current_time >= time(9, 30):
+                    # 병렬 분석 태스크 생성 (중첩 함수 제거)
+                    analysis_tasks = []
+                    
                     for symbol in self.watched_symbols:
                         # 초기화 완료된 종목만 분석
                         if self.initialization_complete.get(symbol, False):
-                            await self._analyze_and_trade(symbol)
+                            # 태스크 생성 및 추가
+                            task = asyncio.create_task(self._analyze_with_semaphore(symbol))
+                            analysis_tasks.append(task)
+                    
+                    # 모든 분석 태스크가 완료될 때까지 대기 (최대 10초)
+                    if analysis_tasks:
+                        try:
+                            # 그룹으로 대기
+                            await asyncio.wait_for(asyncio.gather(*analysis_tasks), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            logger.log_warning("종목 분석 전체 타임아웃 (10초)")
+                        except Exception as e:
+                            logger.log_error(e, "종목 분석 중 오류 발생")
                 
-                # 포지션 모니터링
+                # 포지션 모니터링 - 개선된 버전 사용
                 await self._monitor_positions()
                 
                 await asyncio.sleep(1)  # 1초 대기
@@ -235,35 +307,53 @@ class BreakoutStrategy:
                 await asyncio.sleep(5)  # 에러 시 5초 대기
     
     async def _analyze_and_trade(self, symbol: str):
-        """종목 분석 및 거래"""
+        """종목 분석 및 거래 - 성능 최적화 버전"""
         try:
-            # 전략이 일시 중지 상태인지 확인
+            # 빠른 검증 (일시 중지 상태 확인)
             if self.paused or order_manager.is_trading_paused():
                 return
-                
-            # 충분한 데이터 있는지 확인
-            if not self.price_data[symbol]:
+                    
+            # 필요한 데이터 확인 (빠른 실패)
+            if (not self.price_data.get(symbol) or
+                not self.breakout_levels.get(symbol) or
+                not self.initialization_complete.get(symbol, False)):
                 return
                 
-            # 현재가
+            # 현재가 및 돌파 레벨 확인
             current_price = self.price_data[symbol][-1]["price"]
-            
-            # 돌파 레벨
             breakout_data = self.breakout_levels[symbol]
+            
             if not breakout_data.get('high_level') or not breakout_data.get('low_level'):
                 return
             
-            # 이미 포지션 있는지 확인
-            symbol_positions = self._get_symbol_positions(symbol)
+            # 이미 포지션 있는지 확인 (캐싱 단순화)
+            now = datetime.now()
+            cache_entry = self._symbol_positions_cache.get(symbol, {})
+            
+            # 캐시가 없거나 1초 이상 지났으면 업데이트
+            if not cache_entry or 'last_update' not in cache_entry or (now - cache_entry.get('last_update', now - timedelta(seconds=2))).total_seconds() > 1:
+                symbol_positions = self._get_symbol_positions(symbol)
+                # 캐시 업데이트
+                self._symbol_positions_cache[symbol] = {
+                    'positions': symbol_positions,
+                    'last_update': now
+                }
+            else:
+                # 캐시 사용
+                symbol_positions = cache_entry['positions']
+                
             if len(symbol_positions) >= self.params["max_positions"]:
                 return
             
-            # 돌파 확인
-            if current_price > breakout_data['high_level']:
+            # 돌파 확인 및 포지션 진입 - 함수 호출 최소화
+            high_level = breakout_data['high_level']
+            low_level = breakout_data['low_level']
+            
+            if current_price > high_level:
                 # 상방 돌파 (매수 신호)
                 await self._enter_position(symbol, "BUY", current_price, breakout_data)
                 
-            elif current_price < breakout_data['low_level']:
+            elif current_price < low_level:
                 # 하방 돌파 (매도 신호)
                 await self._enter_position(symbol, "SELL", current_price, breakout_data)
                 
@@ -331,9 +421,26 @@ class BreakoutStrategy:
         except Exception as e:
             logger.log_error(e, f"Breakout entry error for {symbol}")
     
+    async def _exit_with_semaphore(self, pos_id: str, reason: str):
+        """세마포어로 제한된 포지션 청산 함수 (중첩 함수 분리)"""
+        async with self._exit_semaphore:
+            try:
+                # 청산 처리에 타임아웃 설정
+                await asyncio.wait_for(
+                    self._exit_position(pos_id, reason),
+                    timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                logger.log_warning(f"포지션 {pos_id} 청산 타임아웃 (3초)")
+            except Exception as e:
+                logger.log_error(e, f"포지션 {pos_id} 청산 중 오류")
+    
     async def _monitor_positions(self):
-        """포지션 모니터링"""
+        """포지션 모니터링 - 성능 최적화 버전"""
         try:
+            # 청산할 포지션 식별
+            positions_to_exit = []
+            
             for position_id, position in list(self.positions.items()):
                 symbol = position["symbol"]
                 
@@ -366,9 +473,25 @@ class BreakoutStrategy:
                         should_exit = True
                         exit_reason = "take_profit"
                 
-                # 청산 실행
+                # 청산 대상 포지션 추가
                 if should_exit:
-                    await self._exit_position(position_id, exit_reason)
+                    positions_to_exit.append((position_id, exit_reason))
+            
+            # 청산 대상이 있으면 병렬 처리
+            if positions_to_exit:
+                # 청산 태스크 생성 및 실행 (중첩 함수 제거)
+                exit_tasks = [
+                    asyncio.create_task(self._exit_with_semaphore(pos_id, reason))
+                    for pos_id, reason in positions_to_exit
+                ]
+                
+                # 모든 청산 태스크 완료 대기 (최대 10초)
+                try:
+                    await asyncio.wait_for(asyncio.gather(*exit_tasks), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.log_warning("포지션 청산 전체 타임아웃 (10초)")
+                except Exception as e:
+                    logger.log_error(e, "포지션 청산 중 오류 발생")
                     
         except Exception as e:
             logger.log_error(e, "Breakout position monitoring error")
@@ -559,6 +682,8 @@ class BreakoutStrategy:
                     del self.price_data[symbol]
                 if symbol in self.breakout_levels:
                     del self.breakout_levels[symbol]
+                if symbol in self._symbol_positions_cache:
+                    del self._symbol_positions_cache[symbol]
             
             # 새 종목 초기화
             for symbol in to_add:
@@ -570,14 +695,82 @@ class BreakoutStrategy:
                     'init_high': None,
                     'init_low': None
                 }
+                self.initialization_complete[symbol] = False
             
             # 감시 종목 업데이트
             self.watched_symbols = list(new_set)
             
             logger.log_system(f"브레이크아웃 전략: 감시 종목 {len(self.watched_symbols)}개로 업데이트됨")
+            
+            # 초기 데이터 로드 시작 (추가된 종목만)
+            if to_add:
+                asyncio.create_task(self._load_initial_data_for_all_symbols(list(to_add)))
         
         except Exception as e:
             logger.log_error(e, "브레이크아웃 전략 종목 업데이트 오류")
 
+    async def _load_initial_data_for_all_symbols(self, symbols: List[str], batch_size: int = 5):
+        """여러 종목의 초기 데이터를 효율적으로 로드하는 헬퍼 함수"""
+        logger.log_system(f"브레이크아웃 전략: {len(symbols)}개 종목 초기 데이터 로드 시작")
+        
+        # 세마포어로 동시 API 호출 수 제한
+        semaphore = asyncio.Semaphore(batch_size)
+        
+        async def _load_with_semaphore(symbol):
+            async with semaphore:
+                try:
+                    # API 호출을 타임아웃과 함께 처리
+                    price_data_task = asyncio.create_task(api_client.get_minute_price(symbol))
+                    price_data = await asyncio.wait_for(price_data_task, timeout=3.0)
+                    
+                    if price_data.get("rt_cd") == "0":
+                        chart_data = price_data.get("output2", [])
+                        if not chart_data:
+                            logger.log_system(f"{symbol} - 차트 데이터 없음")
+                            return False
+                        
+                        # 가격 데이터 추출 및 필터링
+                        prices = []
+                        for item in chart_data:
+                            price_value = None
+                            if "stck_prpr" in item:
+                                price_value = float(item["stck_prpr"])
+                            elif "clos" in item:
+                                price_value = float(item["clos"])
+                            
+                            if price_value is not None:
+                                prices.append(price_value)
+                        
+                        if not prices:
+                            logger.log_system(f"{symbol} - 가격 데이터 추출 실패")
+                            return False
+                        
+                        # 데이터 저장
+                        self.breakout_levels[symbol]['init_high'] = max(prices[:min(30, len(prices))])
+                        self.breakout_levels[symbol]['init_low'] = min(prices[:min(30, len(prices))])
+                        
+                        logger.log_system(f"{symbol} - 초기 데이터 로드 성공: 고가={self.breakout_levels[symbol]['init_high']}, 저가={self.breakout_levels[symbol]['init_low']}")
+                        return True
+                    else:
+                        logger.log_warning(f"{symbol} - API 응답 오류: {price_data.get('msg1', '알 수 없는 오류')}")
+                        return False
+                        
+                except asyncio.TimeoutError:
+                    logger.log_warning(f"{symbol} - 초기 데이터 로드 타임아웃")
+                    return False
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} - 초기 데이터 로드 실패")
+                    return False
+        
+        # 병렬 처리 실행
+        tasks = [_load_with_semaphore(symbol) for symbol in symbols]
+        results = await asyncio.gather(*tasks)
+        
+        # 성공/실패 카운트
+        success_count = sum(1 for result in results if result)
+        
+        logger.log_system(f"브레이크아웃 전략: 초기 데이터 로드 완료 ({success_count}/{len(symbols)}개 성공)")
+        return success_count
+
 # 싱글톤 인스턴스
-breakout_strategy = BreakoutStrategy() 
+breakout_strategy = BreakoutStrategy()
