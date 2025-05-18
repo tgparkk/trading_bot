@@ -7,9 +7,10 @@ import sys
 import os
 import json
 import time
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime, time as datetime_time, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 # Windows에서 asyncio 관련 경고 해결을 위한 패치
 if sys.platform.startswith('win'):
@@ -268,53 +269,82 @@ class TradingBot:
                     
                 logger.log_system(f"실제 보유 종목 수: {len(held_symbols)}개, 종목 목록: {', '.join(held_symbols.keys())}")
                 
-                sell_orders_placed = 0
-                
-                # 각 보유 종목 체크 (보유 수량 0 초과인 종목만)
-                for symbol, position_data in held_symbols.items():
+                # 병렬 처리를 위한 함수 정의
+                async def process_sell_position(symbol, position_data):
+                    """종목별 매도 조건 체크 및 주문 실행 함수"""
                     try:
                         # 종목 정보 추출
                         qty = position_data["qty"]
                         avg_price = position_data["avg_price"]
                         current_profit_rate = position_data["profit_rate"]
+                        sell_result = {"symbol": symbol, "executed": False}
                         
                         # 손익률이 2% 이상인지 확인
-                        if current_profit_rate >= 2.0 and qty > 0:
-                            logger.log_system(f"[익절 조건 감지] {symbol}: 보유수량={qty}주, 매수가={avg_price:,.0f}원, 손익률={current_profit_rate:.2f}%")
+                        if current_profit_rate < 2.0 or qty <= 0:
+                            logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
+                            return sell_result
                             
-                            # 현재가 조회
+                        logger.log_system(f"[익절 조건 감지] {symbol}: 보유수량={qty}주, 매수가={avg_price:,.0f}원, 손익률={current_profit_rate:.2f}%")
+                        
+                        # 현재가 조회
+                        try:
                             symbol_info = await asyncio.wait_for(
                                 api_client.get_symbol_info(symbol),
                                 timeout=2.0
                             )
                             
-                            if symbol_info and "current_price" in symbol_info:
-                                current_price = symbol_info["current_price"]
-                                # 실제 수익률 계산 (API 응답과 일치여부 확인)
-                                calc_profit_rate = ((current_price / avg_price) - 1) * 100
-                                
-                                logger.log_system(f"[익절 확인] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
-                                                f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
-                                
-                                # 매도 여부 및 이유 결정
-                                sell_decision = self._decide_sell_action(symbol, calc_profit_rate, current_profit_rate)
-                                should_sell = sell_decision["should_sell"]
-                                sell_reason = sell_decision["reason"]
-                                
-                                # 매도 실행 결정되었으면 주문 진행
-                                if should_sell:
-                                    await self._execute_sell_order(symbol, qty, current_price, avg_price, sell_reason, sell_orders_placed)
-                                    sell_orders_placed += 1
-                                else:
-                                    logger.log_system(f"[익절 보류] {symbol}: 전략 신호에 따라 매도하지 않고 계속 보유")
-                                    
-                            else:
+                            if not symbol_info or "current_price" not in symbol_info:
                                 logger.log_system(f"[익절 패스] {symbol}: 현재가 조회 실패")
-                        else:
-                            logger.log_system(f"[익절 대기] {symbol}: 현재 손익률={current_profit_rate:.2f}% (목표: 2.0% 이상)")
+                                return sell_result
+                                
+                            current_price = symbol_info["current_price"]
+                            # 실제 수익률 계산 (API 응답과 일치여부 확인)
+                            calc_profit_rate = ((current_price / avg_price) - 1) * 100
                             
-                    except Exception as position_error:
-                        logger.log_error(position_error, f"포지션 {symbol} 처리 중 오류")
+                            logger.log_system(f"[익절 확인] {symbol}: 매수가={avg_price:,.0f}원, 현재가={current_price:,.0f}원, "
+                                            f"계산 손익률={calc_profit_rate:.2f}%, API 손익률={current_profit_rate:.2f}%")
+                            
+                            # 매도 여부 및 이유 결정
+                            sell_decision = self._decide_sell_action(symbol, calc_profit_rate, current_profit_rate)
+                            
+                            # 매도 실행 결정되었으면 바로 주문 진행
+                            if sell_decision["should_sell"]:
+                                # 이 함수 내에서 바로 매도 주문 실행
+                                sell_success = await self._execute_sell_order(
+                                    symbol, 
+                                    qty, 
+                                    current_price, 
+                                    avg_price, 
+                                    sell_decision["reason"], 
+                                    0  # 개별 처리이므로 orders_count는 의미 없음
+                                )
+                                sell_result["executed"] = sell_success
+                                return sell_result
+                            else:
+                                logger.log_system(f"[익절 보류] {symbol}: 전략 신호에 따라 매도하지 않고 계속 보유")
+                                return sell_result
+                                
+                        except asyncio.TimeoutError:
+                            logger.log_system(f"[익절 패스] {symbol}: 현재가 조회 타임아웃")
+                            return sell_result
+                        except Exception as e:
+                            logger.log_error(e, f"{symbol} 현재가 조회 중 오류")
+                            return sell_result
+                            
+                    except Exception as e:
+                        logger.log_error(e, f"{symbol} 매도 조건 체크 중 오류")
+                        return {"symbol": symbol, "executed": False}
+                
+                # 각 종목에 대해 비동기 태스크 생성
+                tasks = []
+                for symbol, position_data in held_symbols.items():
+                    tasks.append(process_sell_position(symbol, position_data))
+                
+                # 모든 태스크 완료 대기 및 결과 수집
+                results = await asyncio.gather(*tasks)
+                
+                # 매도 실행 결과 집계
+                sell_orders_placed = sum(1 for result in results if result.get("executed", False))
                 
                 # 익절 주문 결과 요약
                 logger.log_system(f"익절 주문 실행 결과: {sell_orders_placed}개 주문 실행됨")
@@ -441,7 +471,7 @@ class TradingBot:
             return
         
         # 모니터링 종목 중 상위 50개만 체크
-        symbols_to_check = MONITORED_SYMBOLS[:50]
+        symbols_to_check = MONITORED_SYMBOLS[:30]
         logger.log_system(f"체크할 종목 수: {len(symbols_to_check)}개")
         
         # 매수 신호 체크 및 주문 실행
@@ -449,7 +479,46 @@ class TradingBot:
         orders_placed = 0
         used_investment = 0
         
-        for symbol in symbols_to_check:
+        # 멀티스레드 처리를 위한 함수 정의
+        def check_symbol_signal(symbol: str) -> Tuple[str, bool, Dict]:
+            """스레드에서 실행할 매수 신호 체크 함수"""
+            try:
+                # 매수 신호 확인
+                signal_info = self.check_buy_signal(symbol)
+                has_signal = signal_info["has_signal"]
+                return symbol, has_signal, signal_info
+            except Exception as e:
+                logger.log_error(e, f"{symbol} 매수 신호 체크 중 스레드 오류")
+                return symbol, False, {"has_signal": False}
+        
+        # 스레드풀 설정 
+        max_workers = min(30, len(symbols_to_check))  # 최대 20개 스레드까지만 사용
+        logger.log_system(f"매수 신호 체크에 {max_workers}개 스레드 병렬 사용")
+        
+        # 신호가 있는 종목들을 저장할 리스트
+        buy_signal_symbols = []
+        
+        # 멀티스레드 실행 블록
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 모든 종목에 대해 동시에 신호 체크 요청
+            futures = [
+                loop.run_in_executor(executor, check_symbol_signal, symbol) 
+                for symbol in symbols_to_check
+            ]
+            
+            # 결과 수집
+            for future in await asyncio.gather(*futures):
+                symbol, has_signal, signal_info = future
+                if has_signal:
+                    buy_signals_found += 1
+                    logger.log_system(f"[{buy_signals_found}] 매수 신호 발견: {symbol}, 점수={signal_info['score']:.1f}")
+                    buy_signal_symbols.append((symbol, signal_info))
+        
+        logger.log_system(f"매수 신호 체크 완료: {buy_signals_found}개 발견")
+        
+        # 매수 신호가 있는 종목에 대해 순차적으로 주문 처리
+        for symbol, signal_info in buy_signal_symbols:
             # 최대 주문 수 도달 시 중단
             if orders_placed >= investment_info["max_stocks_to_buy"]:
                 logger.log_system(f"최대 주문 수 도달 ({investment_info['max_stocks_to_buy']}개), 추가 주문 중단")
@@ -460,14 +529,6 @@ class TradingBot:
             if remaining_investment < 10000:  # 최소 주문 금액 미만
                 logger.log_system(f"남은 투자 가능 금액 부족: {remaining_investment:,.0f}원, 매수 신호 체크 중단")
                 break
-                
-            # 매수 신호 확인
-            signal_info = self.check_buy_signal(symbol)
-            if not signal_info["has_signal"]:
-                continue
-                
-            buy_signals_found += 1
-            logger.log_system(f"[{buy_signals_found}] 매수 신호 발견: {symbol}, 점수={signal_info['score']:.1f}")
             
             # 주문 처리
             order_result = await self.process_buy_order(
