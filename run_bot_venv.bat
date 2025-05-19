@@ -67,7 +67,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 REM Set environment variables
 set TEST_MODE=False
 set USE_FAKE_ACCOUNT=False
-set SKIP_WEBSOCKET=True
+set SKIP_WEBSOCKET=False
 set LOGGING_LEVEL=DEBUG
 set PYTHONDONTWRITEBYTECODE=1
 

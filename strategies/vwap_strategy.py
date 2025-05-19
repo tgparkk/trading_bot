@@ -54,6 +54,7 @@ class VWAPStrategy:
             self.vwap_data = {}               # {symbol: {'vwap': float, 'upper_band': float, 'lower_band': float}}
             self.positions = {}               # {position_id: position_data}
             self.last_reset_day = datetime.now().date()
+            self.initialization_complete = {}  # {symbol: bool}
             self._initialized = True
         
     async def start(self, symbols: List[str]):
@@ -66,16 +67,8 @@ class VWAPStrategy:
             # 각 종목별 데이터 초기화
             for symbol in symbols:
                 self.price_data[symbol] = deque(maxlen=2000)  # 충분히 많은 데이터 저장
-                self.vwap_data[symbol] = {
-                    'vwap': None,
-                    'upper_band': None, 
-                    'lower_band': None,
-                    'std_dev': None,
-                    'cumulative_volume': 0,
-                    'cumulative_volume_price': 0,
-                    'price_volume_squared': 0,  # 표준편차 계산용
-                    'last_calculation_time': None
-                }
+                self.vwap_data[symbol] = deque(maxlen=2000)
+                self.initialization_complete[symbol] = False
                 
                 # 웹소켓 구독
                 await ws_client.subscribe_price(symbol, self._handle_price_update)
@@ -95,99 +88,75 @@ class VWAPStrategy:
     async def _load_initial_data(self, symbol: str):
         """초기 데이터 로딩"""
         try:
-            logger.log_system(f"VWAP 전략 - {symbol} 초기 데이터 로딩 시작")
+            # 기존 데이터 초기화
+            self.price_data[symbol] = deque(maxlen=2000)
+            self.vwap_data[symbol] = deque(maxlen=2000)
+            self.initialization_complete[symbol] = False
             
-            # 현재가 정보 조회
-            price_info = await api_client.get_symbol_info(symbol)
-            if price_info and price_info.get("current_price"):
-                current_price = float(price_info["current_price"])
-                current_volume = int(price_info.get("volume", 0))
+            # 초기 데이터 요청
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=30)  # 30분 데이터
+            
+            # API로 데이터 요청
+            data = api_client.get_minute_price(
+                symbol=symbol,
+                time_unit="1"
+            )
+            
+            if not data or data.get("rt_cd") != "0":
+                logger.log_warning(f"{symbol} - VWAP 전략 초기 데이터 부족")
+                return
+            
+            # output2가 실제 차트 데이터를 담고 있음
+            chart_data = data.get("output2", [])
+            if not chart_data or len(chart_data) < 20:  # 최소 20개 데이터 필요
+                logger.log_warning(f"{symbol} - VWAP 전략 초기 데이터 부족")
+                return
+            
+            # 데이터 저장 및 VWAP 계산
+            cumulative_pv = 0
+            cumulative_volume = 0
+            
+            for item in chart_data:
+                price = float(item["stck_prpr"])
+                volume = int(item.get("cntg_vol", 0))
                 
-                # 가격 데이터에 추가
-                self.price_data[symbol].append({
-                    "price": current_price,
-                    "volume": current_volume if current_volume > 0 else 1,  # 0 방지
-                    "timestamp": datetime.now()
-                })
-                logger.log_system(f"VWAP 전략 - {symbol} 현재가 로드: {current_price:,.0f}원")
-            
-            # 오늘 분봉 데이터 로드 (VWAP 계산에 필요)
-            minute_data = api_client.get_minute_price(symbol, time_unit="1")
-            if minute_data.get("rt_cd") == "0":
-                # API 응답 구조에 맞게 처리
-                if "output" in minute_data and isinstance(minute_data["output"], dict) and "lst" in minute_data["output"]:
-                    data_list = minute_data["output"]["lst"]
-                elif "output1" in minute_data and isinstance(minute_data["output1"], list):
-                    data_list = minute_data["output1"]
-                elif "output2" in minute_data and isinstance(minute_data["output2"], list):
-                    data_list = minute_data["output2"]
+                # 시간 정보 파싱
+                time_str = item.get("bass_tm", "")
+                if time_str and len(time_str) >= 6:
+                    try:
+                        hour = int(time_str[:2])
+                        minute = int(time_str[2:4])
+                        second = int(time_str[4:6])
+                        timestamp = datetime.now().replace(hour=hour, minute=minute, second=second)
+                    except ValueError:
+                        timestamp = datetime.now()
                 else:
-                    data_list = []
+                    timestamp = datetime.now()
                 
-                if data_list:
-                    # 오늘 데이터만 사용
-                    today = datetime.now().date()
-                    volume_sum = 0
-                    volume_price_sum = 0
-                    volume_price_squared_sum = 0
-                    data_count = 0
-                    
-                    for item in data_list:
-                        try:
-                            # 날짜 필드 확인
-                            trade_date_str = item.get("stck_bsop_date", "")
-                            trade_time = item.get("stck_cntg_hour", "")
-                            
-                            # 날짜 파싱
-                            if trade_date_str:
-                                trade_date = datetime.strptime(trade_date_str, "%Y%m%d").date()
-                                
-                                # 오늘 데이터만 처리
-                                if trade_date == today:
-                                    price = float(item.get("stck_prpr", 0))
-                                    volume = int(item.get("cntg_vol", 0))
-                                    
-                                    if price > 0 and volume > 0:
-                                        # 가격 데이터 추가
-                                        self.price_data[symbol].append({
-                                            "price": price,
-                                            "volume": volume,
-                                            "timestamp": datetime.now()
-                                        })
-                                        
-                                        # VWAP 계산을 위한 누적값
-                                        volume_sum += volume
-                                        volume_price_sum += volume * price
-                                        volume_price_squared_sum += volume * (price ** 2)
-                                        data_count += 1
-                        except Exception as item_error:
-                            logger.log_error(item_error, f"VWAP 전략 - {symbol} 분봉 데이터 항목 처리 오류")
-                            continue
-                    
-                    # 초기 VWAP 계산
-                    if volume_sum > 0:
-                        vwap = volume_price_sum / volume_sum
-                        self.vwap_data[symbol]['vwap'] = vwap
-                        self.vwap_data[symbol]['cumulative_volume'] = volume_sum
-                        self.vwap_data[symbol]['cumulative_volume_price'] = volume_price_sum
-                        self.vwap_data[symbol]['price_volume_squared'] = volume_price_squared_sum
-                        
-                        # 표준편차 계산
-                        if volume_sum > 1:
-                            variance = (volume_price_squared_sum / volume_sum) - (vwap ** 2)
-                            std_dev = max(0, variance) ** 0.5
-                            self.vwap_data[symbol]['std_dev'] = std_dev
-                            
-                            # 밴드 계산
-                            multiplier = self.params['std_dev_multiplier']
-                            self.vwap_data[symbol]['upper_band'] = vwap + (std_dev * multiplier)
-                            self.vwap_data[symbol]['lower_band'] = vwap - (std_dev * multiplier)
-                        
-                        logger.log_system(f"VWAP 전략 - {symbol} 초기 VWAP 계산 완료: {vwap:,.0f}원")
-                        logger.log_system(f"데이터 개수: {data_count}, 누적 거래량: {volume_sum:,}")
-                    
+                self.price_data[symbol].append({
+                    "timestamp": timestamp,
+                    "price": price,
+                    "volume": volume
+                })
+                
+                # VWAP 계산
+                cumulative_pv += price * volume
+                cumulative_volume += volume
+                vwap = cumulative_pv / cumulative_volume if cumulative_volume > 0 else price
+                
+                self.vwap_data[symbol].append({
+                    "timestamp": timestamp,
+                    "vwap": vwap
+                })
+            
+            if len(self.vwap_data[symbol]) >= 20:
+                self.initialization_complete[symbol] = True
+                logger.log_system(f"{symbol} - VWAP 전략 초기화 완료")
+                logger.log_system(f"초기 VWAP: {self.vwap_data[symbol][-1]['vwap']:,.0f}")
+            
         except Exception as e:
-            logger.log_error(e, f"VWAP 전략 - {symbol} 초기 데이터 로딩 오류")
+            logger.log_error(e, f"{symbol} - VWAP 전략 초기 데이터 로딩 오류")
     
     async def stop(self):
         """전략 중지"""
@@ -235,8 +204,8 @@ class VWAPStrategy:
                     self.last_reset_day = current_date
                 
                 # VWAP 계산 업데이트 (일정 간격마다)
-                if self.vwap_data[symbol]['last_calculation_time'] is None or \
-                   (timestamp - self.vwap_data[symbol]['last_calculation_time']).total_seconds() >= 3:
+                if self.vwap_data[symbol][-1]["vwap"] is None or \
+                   (timestamp - self.vwap_data[symbol][-1]["timestamp"]).total_seconds() >= 3:
                     self._update_vwap(symbol, price, volume)
                 
         except Exception as e:
@@ -245,16 +214,7 @@ class VWAPStrategy:
     def _reset_vwap_data(self):
         """일일 VWAP 데이터 리셋"""
         for symbol in self.watched_symbols:
-            self.vwap_data[symbol] = {
-                'vwap': None,
-                'upper_band': None, 
-                'lower_band': None,
-                'std_dev': None,
-                'cumulative_volume': 0,
-                'cumulative_volume_price': 0,
-                'price_volume_squared': 0,  # 표준편차 계산용
-                'last_calculation_time': None
-            }
+            self.vwap_data[symbol] = deque(maxlen=2000)
             
             # 가격 데이터는 유지하되 당일 데이터만 남기기
             today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -271,30 +231,29 @@ class VWAPStrategy:
             vwap_data = self.vwap_data[symbol]
             
             # 누적 거래량 및 누적 거래대금 업데이트
-            vwap_data['cumulative_volume'] += volume
-            vwap_data['cumulative_volume_price'] += volume * price
-            
-            # 제곱항 업데이트 (표준편차 계산용)
-            vwap_data['price_volume_squared'] += volume * (price ** 2)
+            vwap_data.append({
+                "timestamp": datetime.now(),
+                "vwap": price
+            })
             
             # VWAP 계산
-            if vwap_data['cumulative_volume'] > 0:
-                vwap = vwap_data['cumulative_volume_price'] / vwap_data['cumulative_volume']
-                vwap_data['vwap'] = vwap
+            if len(vwap_data) > 0:
+                vwap = vwap_data[-1]["vwap"]
                 
                 # 표준편차 계산
-                if vwap_data['cumulative_volume'] > 1:
+                if len(self.price_data[symbol]) > 1:
                     mean_price_squared = vwap ** 2
-                    variance = vwap_data['price_volume_squared'] / vwap_data['cumulative_volume'] - mean_price_squared
+                    variance = (price ** 2) - mean_price_squared
                     std_dev = max(0, variance) ** 0.5  # 음수일 경우 0으로 처리
-                    vwap_data['std_dev'] = std_dev
                     
                     # 밴드 계산
                     multiplier = self.params['std_dev_multiplier']
-                    vwap_data['upper_band'] = vwap + (std_dev * multiplier)
-                    vwap_data['lower_band'] = vwap - (std_dev * multiplier)
-            
-            vwap_data['last_calculation_time'] = datetime.now()
+                    upper_band = vwap + (std_dev * multiplier)
+                    lower_band = vwap - (std_dev * multiplier)
+                
+                else:
+                    upper_band = vwap
+                    lower_band = vwap
             
         except Exception as e:
             logger.log_error(e, f"Error updating VWAP for {symbol}")
@@ -317,7 +276,7 @@ class VWAPStrategy:
                 # 데이터가 충분히 쌓였을 때만 (9:20 이후) 트레이딩 실행
                 if current_time >= time(9, 20):
                     for symbol in self.watched_symbols:
-                        if self.vwap_data[symbol]['vwap'] is not None:
+                        if self.vwap_data[symbol][-1]["vwap"] is not None:
                             await self._analyze_and_trade(symbol)
                 
                 # 포지션 모니터링
@@ -353,9 +312,9 @@ class VWAPStrategy:
             if len(symbol_positions) >= self.params["max_positions"]:
                 return
             
-            vwap = vwap_data['vwap']
-            upper_band = vwap_data['upper_band']
-            lower_band = vwap_data['lower_band']
+            vwap = vwap_data[-1]["vwap"]
+            upper_band = vwap_data[-1]["upper_band"]
+            lower_band = vwap_data[-1]["lower_band"]
             entry_threshold = self.params['entry_threshold']
             
             # 이전 가격 확인 (방향성 확인용)
@@ -446,7 +405,7 @@ class VWAPStrategy:
                     "stop_price": stop_price,
                     "target_price": target_price,
                     "reason": reason,
-                    "vwap_at_entry": self.vwap_data[symbol]['vwap']
+                    "vwap_at_entry": vwap
                 }
                 
                 logger.log_system(
@@ -473,7 +432,7 @@ class VWAPStrategy:
                 vwap_at_entry = position.get("vwap_at_entry")
                 
                 # 현재 VWAP 확인
-                current_vwap = self.vwap_data[symbol].get('vwap')
+                current_vwap = self.vwap_data[symbol][-1]["vwap"]
                 exit_threshold = self.params['exit_threshold']
                 
                 # 손절/익절 확인
@@ -544,64 +503,43 @@ class VWAPStrategy:
             if symbol not in self.price_data or not self.price_data[symbol]:
                 return 0
                 
-            # VWAP 데이터 있는지 확인
-            vwap_data = self.vwap_data.get(symbol, {})
-            if not vwap_data.get('vwap') or not vwap_data.get('upper_band') or not vwap_data.get('lower_band'):
+            # 초기화 안 된 경우 초기화 시도
+            if not self.initialization_complete.get(symbol, False):
+                # 비동기 초기화를 동기적으로 실행
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._load_initial_data(symbol))
                 return 0
             
-            # 현재가와 이전가
-            if len(self.price_data[symbol]) < 2:
-                return 0
-                
             current_price = self.price_data[symbol][-1]["price"]
-            prev_price = self.price_data[symbol][-2]["price"]
+            current_vwap = self.vwap_data[symbol][-1]["vwap"]
             
-            vwap = vwap_data['vwap']
-            upper_band = vwap_data['upper_band']
-            lower_band = vwap_data['lower_band']
+            # VWAP 대비 가격 편차 계산
+            price_deviation = (current_price - current_vwap) / current_vwap
             
-            # 점수 계산
-            score = 0
-            
-            # 1. VWAP 크로싱 점수 (0-5점)
-            vwap_distance = abs(current_price - vwap) / vwap
-            
-            # VWAP 크로싱 감지 (상향/하향)
-            if (prev_price < vwap and current_price > vwap) or (prev_price > vwap and current_price < vwap):
-                # 크로싱 발생 - 기본 3점
-                cross_score = 3
+            # 상단 밴드 돌파 점수
+            if price_deviation > self.params["upper_band"]:
+                # 얼마나 많이 돌파했는지 계산 (최대 2%)
+                breakout_pct = (price_deviation - self.params["upper_band"]) / self.params["upper_band"]
+                return min(10, breakout_pct * 500)  # 최대 2% 돌파 시 10점
                 
-                # 크로싱 후 거리에 따라 추가 점수
-                distance_score = min(2, vwap_distance * 100)
-                
-                score += cross_score + distance_score
-            else:
-                # 크로싱이 아닌 경우, VWAP와의 거리에 반비례하는 점수
-                proximity_score = max(0, 1 - (vwap_distance * 100))
-                score += proximity_score
+            # 하단 밴드 돌파 점수
+            elif price_deviation < -self.params["lower_band"]:
+                # 얼마나 많이 돌파했는지 계산 (최대 2%)
+                breakout_pct = (abs(price_deviation) - self.params["lower_band"]) / self.params["lower_band"]
+                return min(10, breakout_pct * 500)  # 최대 2% 돌파 시 10점
             
-            # 2. 밴드 관련 점수 (0-5점)
-            band_width = (upper_band - lower_band) / vwap  # 밴드 폭 (상대적)
+            # VWAP 근접도 점수 (밴드까지 남은 거리, 최대 0.5%)
+            upper_proximity = (self.params["upper_band"] - price_deviation) / self.params["upper_band"]
+            lower_proximity = (price_deviation + self.params["lower_band"]) / self.params["lower_band"]
             
-            # 밴드 터치 또는 접근
-            if current_price >= upper_band or current_price <= lower_band:
-                # 밴드 극단에 위치 - 반전 가능성
-                band_score = 3
+            if upper_proximity < 0.005:  # 상단 밴드에 0.5% 내로 근접
+                return min(5, (0.005 - upper_proximity) * 1000)  # 최대 5점
                 
-                # 밴드 폭이 넓을수록 신호 강도 증가
-                width_score = min(2, band_width * 50)
-                
-                score += band_score + width_score
-            else:
-                # 밴드 내부에 위치한 경우, 밴드 가장자리 접근도에 따른 점수
-                band_distance = min(
-                    abs(current_price - upper_band) / (upper_band - vwap),
-                    abs(current_price - lower_band) / (vwap - lower_band)
-                )
-                proximity_score = max(0, 3 * (1 - band_distance))
-                score += proximity_score
+            if lower_proximity < 0.005:   # 하단 밴드에 0.5% 내로 근접
+                return min(5, (0.005 - lower_proximity) * 1000)  # 최대 5점
             
-            return min(10, score)  # 최대 10점
+            return 0  # 신호 없음
             
         except Exception as e:
             logger.log_error(e, f"Error calculating VWAP signal strength for {symbol}")
@@ -617,9 +555,9 @@ class VWAPStrategy:
             
         current_price = self.price_data[symbol][-1]["price"]
         vwap_data = self.vwap_data[symbol]
-        vwap = vwap_data['vwap']
-        upper_band = vwap_data['upper_band']
-        lower_band = vwap_data['lower_band']
+        vwap = vwap_data[-1]["vwap"]
+        upper_band = vwap_data[-1]["upper_band"]
+        lower_band = vwap_data[-1]["lower_band"]
         
         # 밴드 돌파로 신호 판단
         if upper_band and current_price > upper_band:
@@ -645,40 +583,27 @@ class VWAPStrategy:
                 logger.log_system(f"VWAP 전략: {symbol} 가격 데이터 구조 초기화됨")
                 
             if symbol not in self.vwap_data:
-                self.vwap_data[symbol] = {
-                    'vwap': None,
-                    'upper_band': None,
-                    'lower_band': None,
-                    'std_dev': None,
-                    'cumulative_volume': 0,
-                    'cumulative_volume_price': 0,
-                    'price_volume_squared': 0,
-                    'last_calculation_time': None
-                }
+                self.vwap_data[symbol] = deque(maxlen=2000)
                 logger.log_system(f"VWAP 전략: {symbol} VWAP 데이터 구조 초기화됨")
             
             # VWAP 데이터가 없으면 초기화
-            if self.vwap_data[symbol].get('vwap') is None:
+            if self.vwap_data[symbol][-1]["vwap"] is None:
                 # 적극적인 초기화 시도
                 await self._load_initial_data(symbol)
                 
                 # 초기화 후에도 데이터가 없으면 임시 VWAP 설정 (빠른 초기화용)
                 if (symbol in self.price_data and len(self.price_data[symbol]) > 0 and 
-                    symbol in self.vwap_data and self.vwap_data[symbol].get('vwap') is None):
+                    symbol in self.vwap_data and self.vwap_data[symbol][-1]["vwap"] is None):
                     current_price = self.price_data[symbol][-1]["price"]
                     if current_price > 0:
                         # 임시 VWAP 데이터 설정
                         band_factor = self.params["band_factor"]
-                        self.vwap_data[symbol] = {
-                            'vwap': current_price,
-                            'upper_band': current_price * (1 + band_factor),
-                            'lower_band': current_price * (1 - band_factor),
-                            'std_dev': current_price * band_factor,
-                            'cumulative_volume': 1000,
-                            'cumulative_volume_price': current_price * 1000,
-                            'price_volume_squared': 0,
-                            'last_calculation_time': datetime.now()
-                        }
+                        self.vwap_data[symbol].append({
+                            "timestamp": datetime.now(),
+                            "vwap": current_price,
+                            "upper_band": current_price * (1 + band_factor),
+                            "lower_band": current_price * (1 - band_factor)
+                        })
                         logger.log_system(f"{symbol} - VWAP 임시 데이터 설정 완료 (현재가 기준): {current_price:,.0f}원")
             
             # 충분한 데이터가 있는지 확인
@@ -686,9 +611,14 @@ class VWAPStrategy:
                 return {"signal": 0, "direction": "NEUTRAL", "reason": "no_price_data"}
             
             # VWAP 데이터 확인
-            vwap_data = self.vwap_data.get(symbol, {})
-            if not vwap_data.get('vwap'):
+            vwap_data = self.vwap_data.get(symbol)
+            if not vwap_data or len(vwap_data) == 0:
                 return {"signal": 0, "direction": "NEUTRAL", "reason": "no_vwap_data"}
+            
+            # 현재 VWAP 값 확인
+            current_vwap = vwap_data[-1]["vwap"] if vwap_data else None
+            if not current_vwap:
+                return {"signal": 0, "direction": "NEUTRAL", "reason": "no_vwap_value"}
             
             # 현재가 확인
             current_price = 0
@@ -712,30 +642,29 @@ class VWAPStrategy:
                     return {"signal": 0, "direction": "NEUTRAL", "reason": "price_fetch_error"}
             
             # VWAP 데이터
-            vwap = vwap_data['vwap']
-            upper_band = vwap_data.get('upper_band')
-            lower_band = vwap_data.get('lower_band')
+            vwap = current_vwap
+            upper_band = vwap * (1 + self.params["std_dev_multiplier"] * self.params["band_factor"])
+            lower_band = vwap * (1 - self.params["std_dev_multiplier"] * self.params["band_factor"])
             
             # 방향과 신호 강도 계산
             direction = "NEUTRAL"
             signal_strength = 0
             
             # 밴드 돌파 확인
-            if upper_band and lower_band:
-                if current_price > upper_band:
-                    # 상단 밴드 돌파 - 매도 신호
-                    direction = "SELL"
-                    band_diff_pct = (current_price - upper_band) / upper_band
-                    signal_strength = min(10, band_diff_pct * 200)  # 0.5% 돌파 시 최대 강도
-                    
-                elif current_price < lower_band:
-                    # 하단 밴드 돌파 - 매수 신호
-                    direction = "BUY"
-                    band_diff_pct = (lower_band - current_price) / lower_band
-                    signal_strength = min(10, band_diff_pct * 200)  # 0.5% 돌파 시 최대 강도
+            if current_price > upper_band:
+                # 상단 밴드 돌파 - 매도 신호
+                direction = "SELL"
+                band_diff_pct = (current_price - upper_band) / upper_band
+                signal_strength = min(10, band_diff_pct * 200)  # 0.5% 돌파 시 최대 강도
+                
+            elif current_price < lower_band:
+                # 하단 밴드 돌파 - 매수 신호
+                direction = "BUY"
+                band_diff_pct = (lower_band - current_price) / lower_band
+                signal_strength = min(10, band_diff_pct * 200)  # 0.5% 돌파 시 최대 강도
             
             # VWAP 레벨 확인 (밴드 돌파가 없을 경우)
-            if direction == "NEUTRAL" and vwap:
+            if direction == "NEUTRAL":
                 price_diff_pct = (current_price - vwap) / vwap
                 
                 # VWAP 대비 위치로 방향 결정
@@ -807,16 +736,7 @@ class VWAPStrategy:
             # 새 종목 초기화
             for symbol in to_add:
                 self.price_data[symbol] = deque(maxlen=2000)
-                self.vwap_data[symbol] = {
-                    'vwap': None,
-                    'upper_band': None,
-                    'lower_band': None,
-                    'std_dev': None,
-                    'cumulative_volume': 0,
-                    'cumulative_volume_price': 0,
-                    'price_volume_squared': 0,
-                    'last_calculation_time': None
-                }
+                self.vwap_data[symbol] = deque(maxlen=2000)
             
             # 감시 종목 업데이트
             self.watched_symbols = list(new_set)
