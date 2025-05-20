@@ -470,7 +470,7 @@ class TradingBot:
             logger.log_system("투자 가능 금액 부족으로 매수 체크 중단")
             return
         
-        # 모니터링 종목 중 상위 50개만 체크
+        # 모니터링 종목 중 상위 30개만 체크
         symbols_to_check = MONITORED_SYMBOLS[:30]
         logger.log_system(f"체크할 종목 수: {len(symbols_to_check)}개")
         
@@ -492,7 +492,7 @@ class TradingBot:
                 return symbol, False, {"has_signal": False}
         
         # 스레드풀 설정 
-        max_workers = min(30, len(symbols_to_check))  # 최대 20개 스레드까지만 사용
+        max_workers = min(30, len(symbols_to_check))  # 최대 30개 스레드까지만 사용
         logger.log_system(f"매수 신호 체크에 {max_workers}개 스레드 병렬 사용")
         
         # 신호가 있는 종목들을 저장할 리스트
@@ -847,8 +847,8 @@ class TradingBot:
                 logger.log_warning("사용 가능한 전략이 없습니다")
                 return []
             
-            # 분석 시간 고려하여 상위 200개만 분석
-            analysis_symbols = all_symbols[:200]
+            # 분석 시간 고려하여 상위 30개만 분석
+            analysis_symbols = all_symbols[:30]
             
             # *** 전략들이 데이터를 준비하도록 초기화 ***
             logger.log_system("전략 데이터 준비 시작...")
@@ -860,7 +860,7 @@ class TradingBot:
                         logger.log_system(f"{strategy_name} 전략 초기 데이터 로딩 중...")
                         
                         # 각 심볼에 대해 초기 데이터 로딩
-                        for symbol in analysis_symbols[:50]:  # 부하 분산을 위해 50개씩
+                        for symbol in analysis_symbols[:30]:
                             try:
                                 # 전략의 price_data 초기화
                                 if not hasattr(strategy, 'price_data'):
@@ -974,8 +974,8 @@ class TradingBot:
                 reverse=True
             )
             
-            # 4. 상위 100개 종목만 반환
-            top_symbols = [item[0] for item in sorted_symbols[:100]]
+            # 4. 상위 30개 종목만 반환
+            top_symbols = [item[0] for item in sorted_symbols[:30]]
             
             logger.log_system(f"전략 분석 완료: {len(top_symbols)}개 종목 선정")
             logger.log_system(f"상위 5개 종목 상세:")
@@ -1029,7 +1029,7 @@ class TradingBot:
             
             # 전역 변수 업데이트
             old_symbols = MONITORED_SYMBOLS.copy()
-            MONITORED_SYMBOLS = new_symbols[:100]
+            MONITORED_SYMBOLS = new_symbols[:30]
             LAST_SYMBOL_UPDATE = datetime.now()
             
             # 변경된 종목 로깅
@@ -1040,9 +1040,9 @@ class TradingBot:
             logger.log_system(f"추가된 종목: {len(added_symbols)}개")
             logger.log_system(f"제거된 종목: {len(removed_symbols)}개")
             
-            # 통합 전략 업데이트 및 재시작 (50개만 사용)
-            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:50])
-            await combined_strategy.start(MONITORED_SYMBOLS[:50])
+            # 통합 전략 업데이트 및 재시작 (30개만 사용)
+            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:30])
+            await combined_strategy.start(MONITORED_SYMBOLS[:30])
             
             # 재스캔 결과 로그
             logger.log_trade(
@@ -1060,7 +1060,7 @@ class TradingBot:
         except Exception as e:
             logger.log_error(e, "종목 재스캔 중 오류 발생")
             # 오류 발생 시 기존 종목으로 전략 재시작
-            await combined_strategy.start(MONITORED_SYMBOLS[:50])
+            await combined_strategy.start(MONITORED_SYMBOLS[:30])
     
     def _is_market_open(self, current_time: datetime_time) -> bool:
         """장 시간 확인"""

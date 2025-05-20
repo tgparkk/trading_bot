@@ -310,6 +310,15 @@ class KISWebSocketClient:
                         }
                     }
                     
+                    # 연결 상태 재확인 (중간에 연결이 끊겼을 수 있음)
+                    if self.ws is None:
+                        logger.log_system(f"{symbol} 종목 구독 시도 중 웹소켓 연결이 끊어졌습니다. 재연결 시도... (시도 {attempt + 1}/3)")
+                        if not await self.connect():
+                            if attempt < 2:
+                                await asyncio.sleep(2)
+                                continue
+                            return False
+                    
                     # 구독 요청 전송
                     await self.ws.send(json.dumps(subscribe_data))
                     logger.log_system(f"{symbol} 종목 실시간 가격 구독 요청")
@@ -780,39 +789,50 @@ class KISWebSocketClient:
         
         logger.log_system(f"{total_symbols}개 종목 실시간 가격 구독 시작")
         
+        # 웹소켓 연결 확인
+        if not self.is_connected():
+            logger.log_system(f"웹소켓 연결이 없습니다. 구독 전 연결 시도...")
+            if not await self.connect():
+                logger.log_system("웹소켓 연결 실패, 종목 구독 작업 중단")
+                # 모든 종목에 대해 실패 결과 설정
+                for symbol in symbols:
+                    results[symbol] = False
+                return results
+        
         # 배치 처리를 위해 종목을 나눕니다
-        batch_size = 10  # 한 번에 10개씩 처리
+        batch_size = 5  # 한 번에 5개씩 처리 (더 적게 설정)
         
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             
-            # 병렬 처리
-            tasks = []
+            # 배치 내 종목들을 순차적으로 처리
             for symbol in batch:
                 if symbol in self.subscriptions:
                     results[symbol] = True  # 이미 구독 중
                     success_count += 1
-                else:
-                    task = self.subscribe_price(symbol, callback)
-                    tasks.append((symbol, task))
-            
-            # 배치 내 종목들 동시 처리
-            for symbol, task in tasks:
+                    continue
+                
                 try:
-                    result = await task
+                    # 동기적으로 구독 실행 (Task 생성 없이)
+                    result = await self.subscribe_price(symbol, callback)
                     results[symbol] = result
                     if result:
                         success_count += 1
                     else:
                         failure_count += 1
+                        logger.log_warning(f"{symbol} 구독 실패")
                 except Exception as e:
                     logger.log_error(e, f"{symbol} 구독 중 오류 발생")
                     results[symbol] = False
                     failure_count += 1
+                
+                # 종목 간 짧은 지연 추가 (100ms)
+                await asyncio.sleep(0.1)
             
             # 배치 간 지연시간 (서버 부하 방지)
             if i + batch_size < len(symbols):
-                await asyncio.sleep(1.0)
+                # 2초로 배치 간 지연 증가
+                await asyncio.sleep(2.0)
                 logger.log_system(f"구독 진행중: {min(i + batch_size, total_symbols)}/{total_symbols} 종목 완료")
         
         logger.log_system(

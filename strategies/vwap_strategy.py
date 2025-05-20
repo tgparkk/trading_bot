@@ -145,9 +145,16 @@ class VWAPStrategy:
                 cumulative_volume += volume
                 vwap = cumulative_pv / cumulative_volume if cumulative_volume > 0 else price
                 
+                # 밴드 계산
+                band_factor = self.params.get('band_factor', 0.005)
+                upper_band = vwap * (1 + band_factor)
+                lower_band = vwap * (1 - band_factor)
+                
                 self.vwap_data[symbol].append({
                     "timestamp": timestamp,
-                    "vwap": vwap
+                    "vwap": vwap,
+                    "upper_band": upper_band,
+                    "lower_band": lower_band
                 })
             
             if len(self.vwap_data[symbol]) >= 20:
@@ -230,30 +237,40 @@ class VWAPStrategy:
         try:
             vwap_data = self.vwap_data[symbol]
             
-            # 누적 거래량 및 누적 거래대금 업데이트
-            vwap_data.append({
-                "timestamp": datetime.now(),
-                "vwap": price
-            })
-            
             # VWAP 계산
-            if len(vwap_data) > 0:
-                vwap = vwap_data[-1]["vwap"]
-                
+            if len(vwap_data) > 0 and len(self.price_data[symbol]) > 0:
                 # 표준편차 계산
                 if len(self.price_data[symbol]) > 1:
-                    mean_price_squared = vwap ** 2
+                    mean_price_squared = price ** 2
                     variance = (price ** 2) - mean_price_squared
                     std_dev = max(0, variance) ** 0.5  # 음수일 경우 0으로 처리
                     
                     # 밴드 계산
                     multiplier = self.params['std_dev_multiplier']
-                    upper_band = vwap + (std_dev * multiplier)
-                    lower_band = vwap - (std_dev * multiplier)
-                
+                    upper_band = price + (std_dev * multiplier)
+                    lower_band = price - (std_dev * multiplier)
                 else:
-                    upper_band = vwap
-                    lower_band = vwap
+                    # 초기 데이터가 부족한 경우 고정 비율 사용
+                    band_factor = self.params.get('band_factor', 0.005)
+                    upper_band = price * (1 + band_factor)
+                    lower_band = price * (1 - band_factor)
+                
+                # 누적 거래량 및 누적 거래대금 업데이트
+                vwap_data.append({
+                    "timestamp": datetime.now(),
+                    "vwap": price,
+                    "upper_band": upper_band,
+                    "lower_band": lower_band
+                })
+            else:
+                # 초기 데이터가 없는 경우 단순 추가
+                band_factor = self.params.get('band_factor', 0.005)
+                vwap_data.append({
+                    "timestamp": datetime.now(),
+                    "vwap": price,
+                    "upper_band": price * (1 + band_factor),
+                    "lower_band": price * (1 - band_factor)
+                })
             
         except Exception as e:
             logger.log_error(e, f"Error updating VWAP for {symbol}")
@@ -296,8 +313,12 @@ class VWAPStrategy:
                 return
                 
             # VWAP 데이터 있는지 확인
-            vwap_data = self.vwap_data.get(symbol, {})
-            if not vwap_data.get('vwap') or not vwap_data.get('upper_band') or not vwap_data.get('lower_band'):
+            if not self.vwap_data.get(symbol) or len(self.vwap_data[symbol]) == 0:
+                return
+                
+            # 마지막 VWAP 데이터 항목 확인
+            last_vwap_data = self.vwap_data[symbol][-1]
+            if not last_vwap_data.get('vwap') or not last_vwap_data.get('upper_band') or not last_vwap_data.get('lower_band'):
                 return
             
             # 충분한 데이터 있는지 확인
@@ -312,9 +333,9 @@ class VWAPStrategy:
             if len(symbol_positions) >= self.params["max_positions"]:
                 return
             
-            vwap = vwap_data[-1]["vwap"]
-            upper_band = vwap_data[-1]["upper_band"]
-            lower_band = vwap_data[-1]["lower_band"]
+            vwap = last_vwap_data['vwap']
+            upper_band = last_vwap_data['upper_band']
+            lower_band = last_vwap_data['lower_band']
             entry_threshold = self.params['entry_threshold']
             
             # 이전 가격 확인 (방향성 확인용)
