@@ -35,7 +35,7 @@ class StockExplorer:
             market_code = market_code_map.get(market_type, "J")
             
             # 최대 종목 수 설정
-            max_symbols = self.filters.get("max_symbols", 100)
+            max_symbols = self.filters.get("max_symbols", 30)
             
             # 2) 거래량 순위 API 호출 (새로운 함수 형식으로 매개변수 맞춤)
             logger.log_system(f"거래량 상위 종목 조회 시작: 시장={market_code}, 정렬={1}, 개수={max_symbols}")
@@ -44,8 +44,8 @@ class StockExplorer:
                 screen_code="20171",  
                 vol_cnt=str(max_symbols)
             )
-            logger.log_system(f"거래량 상위 종목 조회 API 응답: rt_cd={vol_data.get('rt_cd')}, msg_cd={vol_data.get('msg_cd', '없음')}, msg1={vol_data.get('msg1', '없음')}")
-            logger.log_system(f"API 응답 키: {list(vol_data.keys())}")
+            #logger.log_system(f"거래량 상위 종목 조회 API 응답: rt_cd={vol_data.get('rt_cd')}, msg_cd={vol_data.get('msg_cd', '없음')}, msg1={vol_data.get('msg1', '없음')}")
+            #logger.log_system(f"API 응답 키: {list(vol_data.keys())}")
             
             # 3) API 응답 검증
             if vol_data.get("rt_cd") != "0":

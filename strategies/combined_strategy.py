@@ -44,16 +44,16 @@ class CombinedStrategy:
             # get 메서드 대신 직접 속성 접근 또는 기본값 설정
             self.params = {
                 # 각 전략별 가중치 (0~1 사이 값, 합계 1.0)
-                "breakout_weight": 0.2,     # 브레이크아웃 전략 가중치
-                "momentum_weight": 0.25,    # 모멘텀 전략 가중치
-                "gap_weight": 0.2,          # 갭 트레이딩 전략 가중치
-                "vwap_weight": 0.2,         # VWAP 전략 가중치
-                "volume_weight": 0.15,      # 볼륨 스파이크 전략 가중치
+                "breakout_weight": 0.1,     # 브레이크아웃 전략 가중치 (0.2→0.1)
+                "momentum_weight": 0.2,     # 모멘텀 전략 가중치 (0.25→0.2)
+                "gap_weight": 0.3,          # 갭 트레이딩 전략 가중치 (0.2→0.3)
+                "vwap_weight": 0.15,        # VWAP 전략 가중치 (0.2→0.15)
+                "volume_weight": 0.25,      # 볼륨 스파이크 전략 가중치 (0.15→0.25)
                 
                 # 매매 신호 기준
-                "buy_threshold": 5.0,       # 매수 신호 임계값 (0~10) - 5.0으로 낮춤 (원래 6.0)
+                "buy_threshold": 4.0,       # 매수 신호 임계값 (0~10) - 4.0으로 낮춤 (원래 5.0)
                 "sell_threshold": 6.0,      # 매도 신호 임계값 (0~10)
-                "min_agreement": 2,         # 최소 몇 개 전략이 일치해야 하는지
+                "min_agreement": 3,         # 최소 몇 개 전략이 일치해야 하는지
                 
                 # 포지션 관리
                 "stop_loss_pct": 0.015,     # 손절 비율 (1.5%)
