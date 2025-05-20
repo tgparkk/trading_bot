@@ -166,7 +166,7 @@ class AlertSystem:
 주문번호: {trade_data.get('order_id', 'N/A')}
         """
         
-        await self.send_alert(message, "TRADE", "telegram")
+        #await self.send_alert(message, "TRADE", "telegram")
     
     async def notify_error(self, error: Exception, context: str = None):
         """에러 알림"""
@@ -181,7 +181,7 @@ class AlertSystem:
         Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
         
-        await self.send_alert(message, "ERROR")
+        #await self.send_alert(message, "ERROR")
     
     async def notify_large_movement(self, symbol: str, price_change: float, 
                                   volume_surge: float = None):
@@ -203,7 +203,7 @@ class AlertSystem:
         if volume_surge:
             message += f"\nVolume Surge: {volume_surge:.1f}x"
         
-        await self.send_alert(message, "WARNING")
+        #await self.send_alert(message, "WARNING")
     
     async def notify_system_status(self, status: str, details: str = None):
         """시스템 상태 알림"""
@@ -217,7 +217,7 @@ class AlertSystem:
             message += f"\nDetails: {details}"
         
         level = "ERROR" if status == "ERROR" else "INFO"
-        await self.send_alert(message, level)
+        #await self.send_alert(message, level)
     
     async def send_daily_report(self, report_data: Dict[str, Any]):
         """일일 리포트"""
@@ -239,7 +239,7 @@ class AlertSystem:
         💰 Portfolio Value: ₩{report_data.get('portfolio_value', 0):,.0f}
         """
         
-        await self.send_alert(message, "INFO")
+        #await self.send_alert(message, "INFO")
     
     def _format_top_movers(self, movers: list) -> str:
         """상승/하락 종목 포맷팅"""
