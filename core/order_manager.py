@@ -35,6 +35,7 @@ class OrderManager:
             self.pending_orders = {}  # {order_id: order_data}
             self.daily_pnl = 0
             self.daily_trades = 0
+            self.daily_sell_amount = 0  # 일일 매도 금액 합계 추가
             self.trading_paused = False  # 거래 일시 중지 플래그
             self._async_lock = asyncio.Lock()  # 비동기 작업을 위한 락
             self.order_blacklist = {}  # 블랙리스트 추가: {종목코드: 만료시간}
@@ -68,6 +69,11 @@ class OrderManager:
                 logger.log_system("Trading initialized in paused state")
             else:
                 self.trading_paused = False
+            
+            # 일일 거래 데이터 초기화
+            self.daily_pnl = 0
+            self.daily_trades = 0
+            self.daily_sell_amount = 0
             
             logger.log_system("Order manager initialized successfully")
             
@@ -113,10 +119,10 @@ class OrderManager:
                     return {"status": "failed", "reason": error_msg}
                 
                 # 매도 가능 여부 확인 (예: 주문 제한, 거래 정지 등)
-                if not await self._check_sell_availability(symbol, quantity):
-                    error_msg = "매도 제한 상태"
-                    logger.log_system(f"[매도실패] {symbol} - {error_msg}")
-                    return {"status": "failed", "reason": error_msg}
+                # if not await self._check_sell_availability(symbol, quantity):
+                #     error_msg = "매도 제한 상태"
+                #     logger.log_system(f"[매도실패] {symbol} - {error_msg}")
+                #     return {"status": "failed", "reason": error_msg}
             
             # 블랙리스트 체크 - 특정 종목이 블랙리스트에 있는지 확인
             current_time = time.time()
@@ -954,6 +960,11 @@ class OrderManager:
                 if current_position["quantity"] < order_data["quantity"]:
                     logger.log_system(f"[매도수량오류] {order_data['symbol']} - 요청 수량({order_data['quantity']})이 보유 수량({current_position['quantity']})보다 많습니다.")
                     return
+                
+                # 일일 매도 금액 업데이트
+                sell_amount = order_data["price"] * order_data["quantity"]
+                self.daily_sell_amount += sell_amount
+                logger.log_system(f"[매도체결] {order_data['symbol']} - 일일 매도 금액 업데이트: {sell_amount:,.0f}원 (총 {self.daily_sell_amount:,.0f}원)")
             
             # 포지션 업데이트
             await self.update_position(

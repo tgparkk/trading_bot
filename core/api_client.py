@@ -5,7 +5,7 @@ import requests
 import json
 import hashlib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as time_class
 from typing import Dict, Any, Optional, List
 from config.settings import config, APIConfig
 from utils.logger import logger
@@ -1249,12 +1249,11 @@ class KISAPIClient:
             logger.log_error(e, "TEST_MODE 환경 변수 확인 중 오류")
         
         # 매수/매도 구분 (모의투자/실거래 TR_ID 구분)
+        # https://apiportal.koreainvestment.com/apiservice-apiservice?/uapi/domestic-stock/v1/trading/order-cash
         if side.upper() == "BUY":
-            # 매수 (모의투자:VTTC0802U / 실거래:TTTC0802U)
-            tr_id = "TTTC0802U" if not is_dev else "VTTC0802U"  
+            tr_id = "TTTC0012U"
         else:
-            # 매도 (모의투자:VTTC0801U / 실거래:TTTC0801U)
-            tr_id = "TTTC0801U" if not is_dev else "VTTC0801U"  
+            tr_id = "TTTC0011U"
         
         # 주문 유형 (00: 지정가, 01: 시장가)
         ord_dvsn = "01" if order_type.upper() == "MARKET" else "00"
@@ -1707,6 +1706,277 @@ class KISAPIClient:
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """종목 정보 조회"""
+        # 기본 응답 생성 헬퍼 함수
+        def create_default_response(error_suffix="", error_msg=""):
+            return {
+                "symbol": symbol,
+                "name": f"{symbol} ({error_suffix})" if error_suffix else symbol,
+                "current_price": 0,
+                "open_price": 0,
+                "high_price": 0,
+                "low_price": 0,
+                "prev_close": 0,
+                "volume": 0,
+                "change_rate": 0,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error": error_msg
+            }
+        
+        # 안전하게 숫자 변환하는 헬퍼 함수
+        def safe_convert(value, converter, default=0):
+            try:
+                return converter(value) if value else default
+            except (ValueError, TypeError):
+                return default
+        
+        try:
+            # 디버깅 로그 추가
+            logger.log_system(f"[API] 종목 정보 조회 시작: {symbol}")
+            
+            # 비동기로 토큰 확보
+            await self._get_access_token_async()
+            
+            path = "/uapi/domestic-stock/v1/quotations/inquire-price"
+            headers = {"tr_id": "FHKST01010100"}
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol
+            }
+            
+            # 동기 함수를 비동기적으로 실행
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, 
+                lambda: self._make_request("GET", path, headers=headers, params=params, max_retries=3)
+            )
+            
+            # 응답 검증
+            if result.get("rt_cd") != "0":
+                error_msg = result.get("msg1", "알 수 없는 오류")
+                logger.log_system(f"[API] {symbol} 종목 정보 조회 실패: {error_msg}")
+                return create_default_response("조회실패", error_msg)
+            
+            # output 필드 확인
+            if "output" not in result:
+                logger.log_system(f"[API] {symbol} 응답에 'output' 필드가 없습니다. 응답 키: {list(result.keys())}")
+                return create_default_response("형식오류", "API 응답에 'output' 필드가 없습니다")
+            
+            output = result["output"]
+            
+            try:
+                # 데이터 안전하게 추출 및 변환
+                response_data = {
+                    "symbol": symbol,
+                    "name": output.get("rprs_mrkt_kor_name", "Unknown"),
+                    "current_price": safe_convert(output.get("stck_prpr"), float),
+                    "open_price": safe_convert(output.get("stck_oprc"), float),
+                    "high_price": safe_convert(output.get("stck_hgpr"), float),
+                    "low_price": safe_convert(output.get("stck_lwpr"), float),
+                    "prev_close": safe_convert(output.get("stck_sdpr"), float),
+                    "volume": safe_convert(output.get("acml_vol"), int),
+                    "change_rate": safe_convert(output.get("prdy_ctrt"), float),
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                logger.log_system(f"[API] {symbol} 종목 정보 조회 성공: 종목명 '{response_data['name']}', 현재가 {response_data['current_price']:,}원")
+                return response_data
+                
+            except Exception as e:
+                logger.log_error(e, f"[API] {symbol} 가격 데이터 변환 오류")
+                # 오류 정보 자세히 기록
+                for field_name, field_value in [
+                    ("rprs_mrkt_kor_name", output.get("rprs_mrkt_kor_name")),
+                    ("stck_prpr", output.get("stck_prpr")),
+                    ("stck_oprc", output.get("stck_oprc")),
+                    ("stck_hgpr", output.get("stck_hgpr")),
+                    ("stck_lwpr", output.get("stck_lwpr")),
+                    ("stck_sdpr", output.get("stck_sdpr")),
+                    ("acml_vol", output.get("acml_vol")),
+                    ("prdy_ctrt", output.get("prdy_ctrt"))
+                ]:
+                    logger.log_system(f"[API] {field_name}: {field_value} (타입: {type(field_value)})")
+                
+                return create_default_response("변환오류", f"데이터 변환 오류: {str(e)}")
+        
+        except requests.Timeout:
+            logger.log_system(f"[API] {symbol} 종목 정보 조회 타임아웃 발생")
+            return create_default_response("타임아웃", "API 요청 타임아웃")
+        
+        except requests.RequestException as e:
+            logger.log_error(e, f"[API] {symbol} 종목 정보 조회 요청 오류")
+            return create_default_response("요청오류", f"API 요청 오류: {str(e)}")
+        
+        except Exception as e:
+            logger.log_error(e, f"[API] {symbol} 종목 정보 조회 중 오류 발생")
+            return create_default_response("오류", f"예외 발생: {str(e)}")
+
+    def get_trading_status(self, symbol: str) -> Dict[str, Any]:
+        """종목의 거래 정지 여부 확인
+        
+        Args:
+            symbol: 종목 코드
+            
+        Returns:
+            Dict[str, Any]: API 응답 결과. 주요 필드:
+                - rt_cd: 응답 코드 ("0": 정상)
+                - output: 종목 거래 상태 정보
+                    - status: 거래 상태 ("NORMAL": 정상, "SUSPENDED": 거래 정지)
+        """
+        try:
+            # 토큰 확인
+            self._ensure_token()
+            
+            # 종목 정보 API로 거래 정지 여부 확인
+            stock_info = self.get_stock_info(symbol)
+            
+            # 응답 코드 확인
+            if stock_info.get("rt_cd") != "0":
+                # API 요청 자체가 실패한 경우
+                return {
+                    "rt_cd": stock_info.get("rt_cd", "9999"),
+                    "msg1": stock_info.get("msg1", "종목 정보 조회 실패"),
+                    "output": {"status": "UNKNOWN"}
+                }
+            
+            # 종목 정보에서 거래 정지 여부 확인
+            output = stock_info.get("output", {})
+            
+            # 거래 정지 관련 필드들 확인 (다양한 필드명으로 시도)
+            is_suspended = False
+            
+            # 가능한 필드명들 시도
+            suspend_fields = [
+                "hts_kor_isnm", "prdt_status", "stck_sdpr", "temp_stop_yn", "trade_status", "is_trading_suspended"
+            ]
+            
+            # 주식 상태 텍스트 확인 (필드에 "거래정지" 등의 텍스트가 있는지)
+            for field in suspend_fields:
+                if field in output:
+                    field_value = str(output[field]).lower()
+                    if any(kw in field_value for kw in ["정지", "suspend", "halt", "stop"]):
+                        is_suspended = True
+                        break
+            
+            # 현재가 데이터로 추가 확인
+            try:
+                price_data = self.get_current_price(symbol)
+                if price_data.get("rt_cd") == "0":
+                    price_output = price_data.get("output", {})
+                    # 거래 정지 관련 추가 필드 확인
+                    for field in ["tempStopYn", "tradeStopYn", "trdSuspStop"]:
+                        if field in price_output:
+                            field_value = str(price_output[field]).lower()
+                            if field_value in ["y", "1", "true", "yes"]:
+                                is_suspended = True
+                                break
+                else:
+                    # 현재가 조회 자체가 실패하면 매도 위험 회피를 위해 정지 간주
+                    logger.log_warning(f"{symbol} 현재가 조회 실패, 안전을 위해 거래 정지로 간주")
+                    is_suspended = True
+            except Exception as price_err:
+                logger.log_error(price_err, f"{symbol} 현재가 조회 중 오류")
+                # 조회 오류 시 안전을 위해 거래 정지로 간주
+                is_suspended = True
+            
+            # 최종 결과 반환
+            return {
+                "rt_cd": "0",
+                "msg1": "정상 처리되었습니다.",
+                "output": {
+                    "status": "SUSPENDED" if is_suspended else "NORMAL",
+                    "symbol": symbol
+                }
+            }
+            
+        except Exception as e:
+            logger.log_error(e, f"종목 {symbol} 거래 상태 확인 중 오류")
+            # 오류 발생 시 안전을 위해 거래 정지로 간주
+            return {
+                "rt_cd": "9999",
+                "msg1": str(e),
+                "output": {"status": "SUSPENDED"}  # 안전을 위해 거래 정지로 취급
+            }
+    
+    def get_trading_restrictions(self, symbol: str) -> Dict[str, Any]:
+        """종목의 매도 제한 여부 확인
+        
+        Args:
+            symbol: 종목 코드
+            
+        Returns:
+            Dict[str, Any]: API 응답 결과. 주요 필드:
+                - rt_cd: 응답 코드 ("0": 정상)
+                - output: 종목 매도 제한 정보
+                    - sell_restricted: 매도 제한 여부 (True/False)
+                    - reason: 매도 제한 사유 (있는 경우)
+        """
+        try:
+            # 토큰 확인
+            self._ensure_token()
+            
+            # 종목 정보 API로 매도 제한 여부 확인
+            stock_info = self.get_stock_info(symbol)
+            
+            # 응답 코드 확인
+            if stock_info.get("rt_cd") != "0":
+                # API 요청 자체가 실패한 경우
+                return {
+                    "rt_cd": stock_info.get("rt_cd", "9999"),
+                    "msg1": stock_info.get("msg1", "종목 정보 조회 실패"),
+                    "output": {"sell_restricted": True}  # 안전을 위해 매도 제한으로 간주
+                }
+            
+            # 종목 정보에서 매도 제한 관련 정보 확인
+            output = stock_info.get("output", {})
+            
+            # 매도 제한 관련 필드들 확인
+            is_restricted = False
+            restriction_reason = ""
+            
+            # 가능한 필드명들 시도
+            restriction_fields = [
+                "short_sell_restricted", "lmtd_ord_yn", "risk_mgmt_yn", "caution_yn", 
+                "warning_yn", "sell_restriction", "is_sell_restricted"
+            ]
+            
+            # 필드값 확인
+            for field in restriction_fields:
+                if field in output:
+                    field_value = str(output[field]).lower()
+                    if field_value in ["y", "1", "true", "yes"]:
+                        is_restricted = True
+                        restriction_reason = f"{field} 필드 값: {output[field]}"
+                        break
+            
+            # 시장 정보로 추가 확인 (거래 이전/이후, 휴장 등)
+            current_time = datetime.now().time()
+            if current_time < time_class(8, 30) or current_time > time_class(16, 0):
+                # 장 시간 외에는 매도 제한으로 간주할 수 있음
+                # 단, 미국장과 같은 야간 거래 종목은 예외적으로 처리 필요
+                pass
+            
+            # 결과 반환
+            return {
+                "rt_cd": "0",
+                "msg1": "정상 처리되었습니다.",
+                "output": {
+                    "sell_restricted": is_restricted,
+                    "reason": restriction_reason if is_restricted else "",
+                    "symbol": symbol
+                }
+            }
+            
+        except Exception as e:
+            logger.log_error(e, f"종목 {symbol} 매도 제한 확인 중 오류")
+            # 오류 발생 시 안전을 위해 매도 제한으로 간주
+            return {
+                "rt_cd": "9999",
+                "msg1": str(e),
+                "output": {"sell_restricted": True}  # 안전을 위해 매도 제한으로 취급
+            }
+            
+    async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """종목 정보 조회 (비동기 버전)"""
         # 기본 응답 생성 헬퍼 함수
         def create_default_response(error_suffix="", error_msg=""):
             return {
