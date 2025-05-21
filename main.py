@@ -621,35 +621,88 @@ class TradingBot:
             # 기본 주문 단위 (실제로는 API 조회 필요)
             order_unit = 1
             
-            # 기본 주문 수량 계산
-            quantity = max(1, int(available_amount / current_price))
+            # 최대 주문 가능 금액 결정 (가용 자금의 90%로 제한하여 안전 마진 확보)
+            max_safe_amount = available_amount * 0.9
+            
+            # 수수료 및 슬리피지 고려 (약 0.3% 추가 비용)
+            fee_rate = 0.003  # 0.3%
+            available_for_order = max_safe_amount / (1 + fee_rate)
+            
+            # 로깅 - 계산 과정 추적
+            logger.log_system(f"주문 계산: {symbol}, 가격={current_price:,.0f}원, 가용금액={available_amount:,.0f}원, 수수료고려={available_for_order:,.0f}원")
+            
+            # 기본 주문 수량 계산 - 보수적으로 내림
+            initial_quantity = int(available_for_order / current_price)
+            
+            # 주문 가능한 최소 수량 체크
+            if initial_quantity <= 0:
+                logger.log_system(f"주문 불가: {symbol}, 가용 금액으로 최소 1주도 구매할 수 없습니다.")
+                return {"can_order": False}
             
             # 안전 제한 적용
-            max_order_value = 2000000  # 최대 200만원
-            if quantity * current_price > max_order_value:
+            max_order_value = min(1000000, available_for_order)  # 최대 100만원 또는 가용 금액 중 작은 값
+            if initial_quantity * current_price > max_order_value:
                 quantity = int(max_order_value / current_price)
+                logger.log_system(f"주문 조정: {symbol}, 최대 주문 금액 제한으로 수량 조정 {initial_quantity}→{quantity}주")
+            else:
+                quantity = initial_quantity
                 
             # 최대 주문 수량 제한
-            max_quantity_limit = 5000  # 5천주
+            max_quantity_limit = 1000  # 1천주로 제한
             if quantity > max_quantity_limit:
+                quantity_before = quantity
                 quantity = max_quantity_limit
+                logger.log_system(f"주문 조정: {symbol}, 최대 주문 수량 제한으로 수량 조정 {quantity_before}→{quantity}주")
             
-            # 최소 주문 확인
+            # 최소 주문 재확인
             if quantity <= 0:
-                logger.log_system(f"주문 불가: {symbol}, 계산된 주문 수량이 0입니다.")
+                logger.log_system(f"주문 불가: {symbol}, 조정 후 계산된 주문 수량이 0입니다.")
                 return {"can_order": False}
             
             # 주문 단위 조정
             if order_unit > 1 and quantity % order_unit != 0:
+                quantity_before = quantity
                 quantity = (quantity // order_unit) * order_unit
+                logger.log_system(f"주문 조정: {symbol}, 주문 단위 조정으로 수량 조정 {quantity_before}→{quantity}주")
                 if quantity <= 0:
                     logger.log_system(f"주문 불가: {symbol}, 주문 단위 조정 후 수량이 0입니다.")
                     return {"can_order": False}
             
+            # 최종 주문 금액 계산
+            order_amount = current_price * quantity
+            
+            # 예상 수수료 계산
+            estimated_fee = order_amount * fee_rate
+            total_cost = order_amount + estimated_fee
+            
+            # 최종 안전성 검증 - 총 비용이 가용 금액을 초과하는지
+            if total_cost > available_amount:
+                # 수량 추가 조정
+                safe_quantity = int((available_amount / (current_price * (1 + fee_rate))))
+                
+                # 안전 마진 추가 (80%로 조정)
+                safe_quantity = int(safe_quantity * 0.8)
+                
+                # 주문 단위 조정
+                if order_unit > 1:
+                    safe_quantity = (safe_quantity // order_unit) * order_unit
+                
+                if safe_quantity > 0:
+                    quantity = safe_quantity
+                    order_amount = current_price * quantity
+                    logger.log_system(f"주문 최종 조정: {symbol}, 가용 금액 초과로 안전하게 수량 재조정 → {quantity}주")
+                else:
+                    logger.log_system(f"주문 불가: {symbol}, 가용 금액 내에서 주문 가능한 수량이 없습니다.")
+                    return {"can_order": False}
+            
+            # 최종 주문 정보 로깅
+            logger.log_system(f"주문 계산 완료: {symbol}, 수량={quantity}주, 주문금액={order_amount:,.0f}원, 예상수수료={estimated_fee:,.0f}원")
+            
             return {
                 "can_order": True,
                 "quantity": quantity,
-                "order_amount": current_price * quantity
+                "order_amount": order_amount,
+                "estimated_total": total_cost
             }
         except Exception as e:
             logger.log_error(e, f"주문 수량 계산 중 오류: {symbol}")
@@ -691,7 +744,7 @@ class TradingBot:
             
             # 주문 실행
             quantity = order_info["quantity"]
-            order_amount = current_price * quantity
+            order_amount = order_info["order_amount"]  # order_info에서 직접 가져옴
             
             logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={order_amount:,.0f}원")
             
