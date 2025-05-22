@@ -405,11 +405,113 @@ class TradingBot:
         sell_reason = "2% 익절 자동 매도"
         force_sell = False
         
-        # 0. 손실 상태인 경우 매도하지 않음 (손실 컷 조건 없음)
-        if calc_profit_rate < 0 or current_profit_rate < 0:
-            logger.log_system(f"[매도 보류] {symbol}: 손실 상태({calc_profit_rate:.2f}%)로 매도하지 않음")
-            return {"should_sell": False, "reason": "손실 상태로 매도 보류"}
+        # 손절매 설정 가져오기 (기본값 -2%)
+        stop_loss_threshold = getattr(self.trading_config, "stop_loss", -2.0)
         
+        # 손익률 중 더 낮은 값 사용 (보수적 접근)
+        profit_rate = min(calc_profit_rate, current_profit_rate)
+        
+        # 매수 시간 확인 (DB에서 최근 매수 기록 조회)
+        time_since_buy = 0
+        buy_record = None
+        try:
+            buy_record = database_manager.get_latest_trade(symbol, "BUY")
+            if buy_record:
+                # 최근 매수 시간 추출
+                buy_time_str = buy_record.get("time", "")
+                if buy_time_str:
+                    # 현재 날짜와 시간 문자열 결합
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    buy_datetime_str = f"{today} {buy_time_str}"
+                    try:
+                        buy_datetime = datetime.strptime(buy_datetime_str, "%Y-%m-%d %H:%M:%S")
+                        # 매수 후 경과 시간 계산 (분 단위)
+                        time_since_buy = (datetime.now() - buy_datetime).total_seconds() / 60
+                        logger.log_system(f"[시간 확인] {symbol}: 매수 후 {time_since_buy:.1f}분 경과")
+                    except Exception as time_error:
+                        logger.log_error(time_error, f"{symbol} 매수 시간 파싱 오류")
+        except Exception as db_error:
+            logger.log_error(db_error, f"{symbol} 매수 기록 조회 오류")
+        
+        # 전략 신호 한 번만 조회 (중복 호출 방지)
+        strategy_status = None
+        signal_info = None
+        signal_direction = "NEUTRAL"  # 기본값
+        signal_score = 0  # 기본값
+        
+        try:
+            strategy_status = combined_strategy.get_strategy_status(symbol)
+            
+            if "signals" in strategy_status and symbol in strategy_status["signals"]:
+                signal_info = strategy_status["signals"][symbol]
+                signal_direction = signal_info.get("direction", "NEUTRAL")
+                signal_score = signal_info.get("score", 0)
+                logger.log_system(f"[전략 상태] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
+        except Exception as strategy_error:
+            logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
+        
+        # 손실 상태인 경우 손절매 로직 적용
+        if profit_rate < 0:
+            # 손실 비율 계산 (음수 값)
+            loss_rate = profit_rate
+            
+            # 1. 매수 직후 급락 처리 (5분 이내의 초기 하락은 더 큰 하락 허용)
+            if time_since_buy < 5:
+                # 초기 5분 내 급락이면 더 강화된 손절 기준 적용 (-5% 이하)
+                if loss_rate <= -5.0:
+                    should_sell = True
+                    sell_reason = f"매수 직후 급락으로 긴급 손절 ({loss_rate:.2f}%)"
+                    logger.log_system(f"[손절매 결정] {symbol}: 매수 직후 급락 ({loss_rate:.2f}%)")
+                else:
+                    # 초기 하락은 좀 더 지켜봄
+                    logger.log_system(f"[손절매 보류] {symbol}: 매수 직후 초기 하락 대기 중 ({loss_rate:.2f}%)")
+                    return {"should_sell": False, "reason": "매수 직후 하락 관망"}
+            
+            # 2. 손절매 기준점 초과 손실 확인
+            elif loss_rate <= stop_loss_threshold:
+                # 전략 신호 재확인
+                logger.log_system(f"[손절매 검토] {symbol}: 손실률={loss_rate:.2f}%, 전략방향={signal_direction}, 점수={signal_score:.1f}")
+                
+                # 2-1. 전략이 매도/중립이면 바로 손절
+                if signal_direction in ["SELL", "NEUTRAL"]:
+                    should_sell = True
+                    sell_reason = f"손절매 기준 도달 ({loss_rate:.2f}%), 전략 {signal_direction}"
+                    logger.log_system(f"[손절매 결정] {symbol}: 손실률 {loss_rate:.2f}% + {signal_direction} 신호")
+                
+                # 2-2. 전략이 매수지만 손실이 심각하면 손절 (-7% 이하)
+                elif signal_direction == "BUY" and loss_rate <= -7.0:
+                    should_sell = True
+                    sell_reason = f"매수 신호 불구 심각한 손실 ({loss_rate:.2f}%)"
+                    logger.log_system(f"[손절매 결정] {symbol}: 매수 신호 있으나 심각한 손실 ({loss_rate:.2f}%)")
+                
+                # 2-3. 매수 신호 점수가 낮고 손실이 기준치 이하면 손절
+                elif signal_direction == "BUY" and signal_score < 3.0 and loss_rate <= stop_loss_threshold:
+                    should_sell = True
+                    sell_reason = f"약한 매수 신호({signal_score:.1f})와 손실 ({loss_rate:.2f}%)"
+                    logger.log_system(f"[손절매 결정] {symbol}: 약한 매수 신호({signal_score:.1f}) + 손실 ({loss_rate:.2f}%)")
+                
+                # 2-4. 매수 신호 점수가 높으면 조금 더 기다림
+                else:
+                    logger.log_system(f"[손절매 보류] {symbol}: 강한 매수 신호(점수={signal_score:.1f})로 홀딩 유지")
+                    return {"should_sell": False, "reason": "강한 매수 신호로 홀딩 유지"}
+            
+            # 3. 장기 보유 종목 중 지속적 하락세 처리
+            elif time_since_buy > 60 and loss_rate <= -3.0:  # 1시간 이상 보유, 3% 이상 손실
+                # 거래량 확인 등 추가 지표 활용 가능
+                should_sell = True
+                sell_reason = f"장기 보유 중 지속 하락 ({loss_rate:.2f}%)"
+                logger.log_system(f"[손절매 결정] {symbol}: 장기 보유({time_since_buy:.1f}분) 중 지속 하락 ({loss_rate:.2f}%)")
+            
+            # 4. 그 외 손실은 계속 모니터링
+            else:
+                logger.log_system(f"[손절매 보류] {symbol}: 손절 기준 미달 손실 ({loss_rate:.2f}%)")
+                return {"should_sell": False, "reason": "손절 기준 미달"}
+            
+            # 손절매 결정된 경우 바로 반환
+            if should_sell:
+                return {"should_sell": should_sell, "reason": sell_reason}
+        
+        # 아래는 기존 익절 로직 유지
         # 0.5. 긴급 급등 매도 조건 (초단기 급등)
         if calc_profit_rate >= 4.5 or current_profit_rate >= 4.5:
             should_sell = True
@@ -434,54 +536,36 @@ class TradingBot:
         # 2. 손익률 기본 검증 - 최소 2% 이상 (1.5%는 매도하지 않고 홀딩)
         if ((calc_profit_rate >= 2.0 and current_profit_rate >= 1.5) or 
             (current_profit_rate >= 2.0 and calc_profit_rate >= 1.5)) and not force_sell:
-            # 3. 전략 신호 확인
-            try:
-                # logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
-                strategy_status = combined_strategy.get_strategy_status(symbol)
-                
-                if "signals" in strategy_status and symbol in strategy_status["signals"]:
-                    signal_info = strategy_status["signals"][symbol]
-                    signal_direction = signal_info.get("direction", "NEUTRAL")
-                    signal_score = signal_info.get("score", 0)
-                    
-                    logger.log_system(f"[전략 결과] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
-                    
-                    # 전략 신호에 따른 매도 결정
-                    if signal_direction == "SELL":
-                        # 매도 신호가 있으면 매도
-                        should_sell = True
-                        sell_reason = f"전략 매도 신호에 따른 익절 (점수: {signal_score:.1f})"
-                        logger.log_system(f"[전략 매도] {symbol}: 매도 신호로 익절")
-                    elif signal_direction == "NEUTRAL":
-                        # 중립 신호이고 2% 이상이면 매도
-                        should_sell = True
-                        sell_reason = "중립 신호 상태에서 2% 익절"
-                        logger.log_system(f"[전략 매도] {symbol}: 중립 신호 + 2% 이상으로 익절")
-                    elif signal_direction == "BUY":
-                        # 매수 신호면 3.5% 미만일 경우 홀딩 (3.5% 이상이면 매도)
-                        if calc_profit_rate >= 3.5 or current_profit_rate >= 3.5:
-                            should_sell = True
-                            sell_reason = f"매수 신호지만 3.5% 이상 수익 확정 (전략 점수: {signal_score:.1f})"
-                            logger.log_system(f"[전략 매도] {symbol}: 매수 신호지만 3.5% 이상 수익으로 매도")
-                        else:
-                            logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
+            # 3. 전략 신호 확인 (이미 위에서 조회했으므로 중복 호출 제거)
+            logger.log_system(f"[전략 결과] {symbol}: 방향={signal_direction}, 점수={signal_score:.1f}")
+            
+            # 전략 신호에 따른 매도 결정
+            if signal_direction == "SELL":
+                # 매도 신호가 있으면 매도
+                should_sell = True
+                sell_reason = f"전략 매도 신호에 따른 익절 (점수: {signal_score:.1f})"
+                logger.log_system(f"[전략 매도] {symbol}: 매도 신호로 익절")
+            elif signal_direction == "NEUTRAL":
+                # 중립 신호이고 2% 이상이면 매도
+                should_sell = True
+                sell_reason = "중립 신호 상태에서 2% 익절"
+                logger.log_system(f"[전략 매도] {symbol}: 중립 신호 + 2% 이상으로 익절")
+            elif signal_direction == "BUY":
+                # 매수 신호면 3.5% 미만일 경우 홀딩 (3.5% 이상이면 매도)
+                if calc_profit_rate >= 3.5 or current_profit_rate >= 3.5:
+                    should_sell = True
+                    sell_reason = f"매수 신호지만 3.5% 이상 수익 확정 (전략 점수: {signal_score:.1f})"
+                    logger.log_system(f"[전략 매도] {symbol}: 매수 신호지만 3.5% 이상 수익으로 매도")
                 else:
-                    # 신호 데이터가 없으면 더 보수적 기준으로 익절 (2.5% 이상)
-                    if calc_profit_rate >= 2.5 or current_profit_rate >= 2.5:
-                        should_sell = True
-                        sell_reason = "전략 데이터 없음, 2.5% 익절 진행"
-                        logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 2.5% 익절")
-                    else:
-                        logger.log_system(f"[전략 홀딩] {symbol}: 전략 데이터 없으나 2.5% 미만이라 홀딩")
-                    
-            except Exception as strategy_error:
-                # 전략 오류 시 2.5% 이상일 때만 익절 진행 (안전 장치)
-                logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
+                    logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
+            else:
+                # 신호 데이터가 없거나 인식할 수 없는 경우
                 if calc_profit_rate >= 2.5 or current_profit_rate >= 2.5:
                     should_sell = True
-                    sell_reason = "전략 확인 오류, 2.5% 익절 진행"
+                    sell_reason = "전략 데이터 미확인, 2.5% 익절 진행"
+                    logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 2.5% 익절")
                 else:
-                    logger.log_system(f"[전략 오류 홀딩] {symbol}: 전략 오류 발생했으나 2.5% 미만이라 홀딩")
+                    logger.log_system(f"[전략 홀딩] {symbol}: 전략 데이터 없으나 2.5% 미만이라 홀딩")
         
         return {"should_sell": should_sell, "reason": sell_reason}
 

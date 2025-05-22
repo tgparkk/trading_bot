@@ -43,8 +43,8 @@ class TradingConfig:
                 "volume_multiplier": 1.5,
                 "price_change_threshold": 0.002,
                 "hold_time": 60,
-                "stop_loss": 0.02,  # -2% 손절
-                "take_profit": 0.015,  # 1.5% 익절
+                "stop_loss": 0.015,  # -1.5% 손절
+                "take_profit": 0.02,  # 2% 익절
             }
         if self.filters is None:
             self.filters = {
@@ -61,7 +61,7 @@ class TradingConfig:
                 # 포지션 크기 제한
                 "max_position_size": 10_000_000,  # 최대 포지션 크기 (1천만원)
                 "max_position_per_symbol": 5_000_000,  # 종목별 최대 포지션 (5백만원)
-                "position_size_ratio": 0.1,  # 계좌 잔고 대비 포지션 크기 비율 (10%)
+                "position_size_ratio": 0.5 ,  # 계좌 잔고 대비 포지션 크기 비율 (50%)
                 
                 # 리스크 제한
                 "max_loss_rate": 0.02,  # 최대 손실률 (2%)
@@ -76,7 +76,7 @@ class TradingConfig:
                 
                 # 진입/청산 임계값
                 "profit_taking_threshold": 0.018,  # 이익실현 임계값 (1.8%)
-                "stop_loss_threshold": 0.02,  # 손절 임계값 (2%)
+                "stop_loss_threshold": 0.15,  # 손절 임계값 (1.5%)
                 "trailing_stop_activation": 0.01,  # 트레일링 스탑 활성화 임계값 (1%)
                 "trailing_stop_distance": 0.005,  # 트레일링 스탑 거리 (0.5%)
             }
