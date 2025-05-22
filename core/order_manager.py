@@ -675,7 +675,7 @@ class OrderManager:
                             pnl_rate = (current_price - position["avg_price"]) / position["avg_price"] if position["avg_price"] > 0 else 0
                         
                         # 손절/익절 체크
-                        max_loss_rate = self.trading_config.risk_params.get("max_loss_rate", 0.02)
+                        max_loss_rate = self.trading_config.risk_params.get("max_loss_rate", 0.15)
                         max_profit_rate = self.trading_config.scalping_params.get("take_profit", 0.015)
                         
                         # 보유 수량이 0인 경우 처리 건너뜀 (이중 체크)

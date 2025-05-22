@@ -93,27 +93,17 @@ class TradingBot:
             database_manager.update_system_status("INITIALIZING")
             
             # 계좌 상태 관리자 초기화
-            logger.log_system("계좌 상태 관리자 초기화 중...")
+            #logger.log_system("계좌 상태 관리자 초기화 중...")
             await account_state.initialize()
-            logger.log_system("계좌 상태 관리자 초기화 완료")
+            # logger.log_system("계좌 상태 관리자 초기화 완료")
             
             # 주문 관리자 초기화
             await order_manager.initialize()
             
             # 전략들이 제대로 로드되었는지 확인
-            logger.log_system("전략 확인 시작...")
+            # logger.log_system("전략 확인 시작...")
             strategies = combined_strategy.strategies
             logger.log_system(f"전략 갯수: {len(strategies)}")
-            
-            for name, strategy in strategies.items():
-                if strategy:
-                    logger.log_system(f"전략 {name}: OK")
-                    if hasattr(strategy, 'get_signal'):
-                        logger.log_system(f"전략 {name}: get_signal 메서드 존재")
-                    else:
-                        logger.log_warning(f"전략 {name}: get_signal 메서드 부재")
-                else:
-                    logger.log_warning(f"전략 {name}: None")
             
             # 계좌 정보 확인 및 로깅
             account_balance = await order_manager.get_account_balance()
@@ -188,9 +178,6 @@ class TradingBot:
             # 1. 초기 종목 스캔 - 5개 전략 사용하여 상위 100개 선정
             await self._initial_symbol_scan()
             
-            # 2. 메인 루프 시작
-            logger.log_system("메인 루프 시작 - 주기적 종목 모니터링 실행")
-            
             while self.running:
                 try:
                     current_time = datetime.now().time()
@@ -256,67 +243,6 @@ class TradingBot:
         """익절 조건 체크 및 매도 주문 실행"""
         logger.log_system("======== 익절 조건 체크 시작 ========")
         
-        # 매수 후 최소 대기 시간 (10분) 확인
-        current_time = datetime.now()
-        min_holding_time = 10  # 분 단위
-        
-        # 최근 매수 시간 확인 (모든 종목)
-        recent_buys = {}
-        try:
-            # 오늘 날짜 기준으로 매수 기록 확인
-            today = current_time.strftime("%Y-%m-%d")
-            with database_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                # 오늘 날짜의 매수 기록 조회
-                query = """
-                SELECT symbol, time, created_at 
-                FROM trades 
-                WHERE side = 'BUY' AND created_at >= ? 
-                ORDER BY created_at DESC
-                """
-                cursor.execute(query, (f"{today} 00:00:00",))
-                for row in cursor.fetchall():
-                    symbol = row['symbol']
-                    time_str = row['time']
-                    
-                    # time_str이 None이면 created_at 필드에서 시간 추출
-                    if time_str is None or time_str == "None" or time_str == "":
-                        # created_at에서 시간 부분만 추출
-                        created_at = row['created_at']
-                        if created_at and isinstance(created_at, str):
-                            # created_at 형식이 "YYYY-MM-DD HH:MM:SS"라고 가정
-                            try:
-                                # created_at에서 시간 부분만 추출
-                                time_parts = created_at.split(" ")
-                                if len(time_parts) > 1:
-                                    time_str = time_parts[1]  # "HH:MM:SS" 부분
-                                else:
-                                    # 시간 정보가 없는 경우 건너뜀
-                                    logger.log_warning(f"{symbol} 매수 기록에 시간 정보 없음: {created_at}")
-                                    continue
-                            except Exception as time_parse_error:
-                                logger.log_warning(f"{symbol} created_at 파싱 실패: {created_at}")
-                                continue
-                    
-                    # 여전히 time_str이 없는 경우 건너뜀
-                    if not time_str or time_str == "None":
-                        logger.log_warning(f"{symbol} 매수 시간 정보를 찾을 수 없음")
-                        continue
-                        
-                    if symbol not in recent_buys:
-                        try:
-                            # 최근 매수 시간 저장
-                            buy_time = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %H:%M:%S")
-                            recent_buys[symbol] = buy_time
-                        except ValueError as time_error:
-                            logger.log_warning(f"{symbol} 매수 시간 파싱 오류: {time_str}, {str(time_error)}")
-                            continue
-            
-            if recent_buys:
-                logger.log_system(f"오늘 매수한 종목 수: {len(recent_buys)}개")
-        except Exception as e:
-            logger.log_error(e, "최근 매수 기록 조회 중 오류")
-        
         # 포지션 정보 가져오기
         try:
             positions = await order_manager.get_positions()
@@ -342,7 +268,8 @@ class TradingBot:
                         held_symbols[symbol] = {
                             "qty": qty,
                             "avg_price": float(position.get("pchs_avg_pric", "0")),
-                            "profit_rate": float(position.get("evlu_pfls_rt", "0"))
+                            "profit_rate": float(position.get("evlu_pfls_rt", "0")),
+                            "pchs_amt": float(position.get("pchs_amt", "0"))
                         }
                 
                 # 보유 종목이 실제로 있는지 다시 확인
@@ -460,34 +387,6 @@ class TradingBot:
                 # 각 종목에 대해 비동기 태스크 생성
                 tasks = []
                 for symbol, position_data in held_symbols.items():
-                    # 최근 매수한 종목인지 확인하고 최소 대기 시간을 충족하는지 검사
-                    if symbol in recent_buys:
-                        # 매수 후 경과 시간 계산 (분 단위)
-                        elapsed_minutes = (current_time - recent_buys[symbol]).total_seconds() / 60
-                        
-                        # 현재 수익률 확인
-                        profit_rate = position_data.get("profit_rate", 0)
-                        
-                        # 수익률에 따른 유연한 홀딩 시간 적용
-                        min_hold_time = 10  # 기본 10분
-                        
-                        # 수익률이 높을수록 최소 홀딩 시간 감소
-                        if profit_rate >= 4.0:  # 4% 이상
-                            min_hold_time = 2  # 2분만 홀딩
-                            logger.log_system(f"[수익률 높음] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 2분 적용")
-                        elif profit_rate >= 3.0:  # 3% 이상
-                            min_hold_time = 4  # 4분만 홀딩
-                            logger.log_system(f"[수익률 양호] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 4분 적용")
-                        elif profit_rate >= 2.0:  # 2% 이상
-                            min_hold_time = 6  # 6분만 홀딩
-                            logger.log_system(f"[수익률 보통] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 6분 적용")
-                            
-                        if elapsed_minutes < min_hold_time:
-                            logger.log_system(f"[매도 검토 제외] {symbol}: 매수 후 {elapsed_minutes:.1f}분 경과 (최소 {min_hold_time}분 필요)")
-                            continue
-                        else:
-                            logger.log_system(f"[매도 검토] {symbol}: 매수 후 {elapsed_minutes:.1f}분 경과 (최소 대기 시간 충족)")
-                    
                     tasks.append(process_sell_position(symbol, position_data))
                 
                 # 모든 태스크 완료 대기 및 결과 수집
@@ -542,7 +441,7 @@ class TradingBot:
             (current_profit_rate >= 2.0 and calc_profit_rate >= 1.5)) and not force_sell:
             # 3. 전략 신호 확인
             try:
-                logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
+                # logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
                 strategy_status = combined_strategy.get_strategy_status(symbol)
                 
                 if "signals" in strategy_status and symbol in strategy_status["signals"]:
@@ -1083,8 +982,8 @@ class TradingBot:
             logger.log_system("=== 초기 종목 스캔 시작 (5개 전략 사용) ===")
             
             # 전략들이 준비될 때까지 잠시 대기
-            logger.log_system("전략 초기화 대기 중...")
-            await asyncio.sleep(3)
+            #logger.log_system("전략 초기화 대기 중...")
+            #await asyncio.sleep(3)
             
             # 1. 5개 전략으로 종목 분석
             top_symbols = await self._analyze_symbols_with_strategies()
@@ -1105,14 +1004,14 @@ class TradingBot:
             LAST_SYMBOL_UPDATE = datetime.now()
             
             logger.log_system(f"초기 종목 스캔 완료: {len(MONITORED_SYMBOLS)}개 종목 선정")
-            logger.log_system(f"상위 10개 종목: {', '.join(MONITORED_SYMBOLS[:10])}")
+            #logger.log_system(f"상위 10개 종목: {', '.join(MONITORED_SYMBOLS[:10])}")
             
-            # 3. 통합 전략에 종목 업데이트 (50개만 사용)
-            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:50])
+            # 3. 통합 전략에 종목 업데이트 (30개만 사용)
+            await combined_strategy.update_symbols(MONITORED_SYMBOLS[:30])
             
             # 4. 전략 시작 (이미 시작된 경우 무시됨)
             if not combined_strategy.running:
-                await combined_strategy.start(MONITORED_SYMBOLS[:50])
+                await combined_strategy.start(MONITORED_SYMBOLS[:30])
                 logger.log_system("통합 전략 시작 완료")
             else:
                 logger.log_system("통합 전략이 이미 실행 중입니다")
@@ -1193,7 +1092,7 @@ class TradingBot:
                 try:
                     # 전략별로 초기 데이터 준비
                     if hasattr(strategy, '_load_initial_data'):
-                        logger.log_system(f"{strategy_name} 전략 초기 데이터 로딩 중...")
+                        #logger.log_system(f"{strategy_name} 전략 초기 데이터 로딩 중...")
                         
                         # 각 심볼에 대해 초기 데이터 로딩
                         for symbol in analysis_symbols[:30]:
@@ -1249,14 +1148,14 @@ class TradingBot:
                 except Exception as e:
                     logger.log_error(e, f"{strategy_name} 전략 데이터 준비 실패")
             
-            logger.log_system("전략 데이터 준비 완료")
+            #logger.log_system("전략 데이터 준비 완료")
             # *** 초기화 끝 ***
             
             for idx, symbol in enumerate(analysis_symbols):
                 try:
                     # 진행률 로깅 (20개마다)
-                    if idx % 20 == 0:
-                        logger.log_system(f"종목 분석 진행률: {idx}/{len(analysis_symbols)}")
+                    #if idx % 20 == 0:
+                    #    logger.log_system(f"종목 분석 진행률: {idx}/{len(analysis_symbols)}")
                     
                     total_score = 0
                     buy_votes = 0
@@ -1281,7 +1180,7 @@ class TradingBot:
                                 if signal.get('direction') == 'BUY':
                                     buy_votes += 1
                                 
-                                logger.log_system(f"{symbol} - {strategy_name}: signal={signal_value:.1f}, direction={signal.get('direction')}")
+                                # logger.log_system(f"{symbol} - {strategy_name}: signal={signal_value:.1f}, direction={signal.get('direction')}")
                             else:
                                 logger.log_system(f"{symbol} - {strategy_name}: 신호 없음")
                                 
@@ -1314,9 +1213,9 @@ class TradingBot:
             top_symbols = [item[0] for item in sorted_symbols[:30]]
             
             logger.log_system(f"전략 분석 완료: {len(top_symbols)}개 종목 선정")
-            logger.log_system(f"상위 5개 종목 상세:")
-            for i, (symbol, score_data) in enumerate(sorted_symbols[:5]):
-                logger.log_system(f"{i+1}. {symbol}: BUY={score_data['buy_votes']}, 점수={score_data['total_score']:.1f}")
+            #logger.log_system(f"상위 5개 종목 상세:")
+            #for i, (symbol, score_data) in enumerate(sorted_symbols[:5]):
+            #    logger.log_system(f"{i+1}. {symbol}: BUY={score_data['buy_votes']}, 점수={score_data['total_score']:.1f}")
             
             return top_symbols
             
@@ -1551,7 +1450,7 @@ async def main(force_update: bool = False) -> int:
     
     # 워치독 타이머 설정
     last_heartbeat = datetime.now()
-    watchdog_interval = 30 * 60  # 30분 (초 단위)
+    watchdog_interval = 30 * 60 * 2 # 60분 (초 단위)
     logger.log_system(f"워치독 타이머 설정: {watchdog_interval/60}분")
 
     try:
@@ -1673,7 +1572,7 @@ async def _run_trading_bot(bot: TradingBot, force_update: bool = False):
     try:
         # 봇 초기화
         await bot.initialize()
-        logger.log_system("API 초기화 성공!")
+        # logger.log_system("API 초기화 성공!")
         
         # API 접속 성공 알림
         await _send_api_success_notification()
@@ -1846,7 +1745,7 @@ async def _heartbeat_monitor(last_heartbeat, interval):
                 
                 # 여기에 시스템 복구 로직 추가 가능
                 # 예: 프로세스 재시작, API 토큰 갱신 등
-                logger.log_system("하트비트 타임아웃으로 인한 복구 조치 시작...")
+                # logger.log_system("하트비트 타임아웃으로 인한 복구 조치 시작...")
                 
                 # 토큰 갱신 시도
                 try:

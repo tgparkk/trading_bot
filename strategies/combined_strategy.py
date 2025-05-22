@@ -1382,9 +1382,9 @@ class CombinedStrategy:
         """관심 종목 업데이트"""
         try:
             # 종목 스캔 시작 로그 (백엔드에 표시)
-            logger.log_system("=" * 50)
+            #logger.log_system("=" * 50)
             logger.log_system(f"🔍 종목 스캔 시작 - 통합 전략 update_symbols 호출")
-            logger.log_system("=" * 50)
+            #logger.log_system("=" * 50)
             
             # 종목 스캔 시작 trade 로그 기록
             logger.log_trade(

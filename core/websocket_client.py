@@ -117,14 +117,14 @@ class KISWebSocketClient:
                             websockets.connect(self.ws_url, **connection_options),
                             timeout=20.0  # 연결 타임아웃 증가
                         )
-                        logger.log_system("웹소켓 초기 연결 성공")
+                        #logger.log_system("웹소켓 초기 연결 성공")
                         
                         # 웹소켓 연결이 확립된 상태
                         self.running = True
                         self.reconnect_attempts = 0  # 재연결 시도 횟수 초기화
                         
                         # 인증 과정
-                        logger.log_system("웹소켓 접속키 발급 시도...")
+                        #logger.log_system("웹소켓 접속키 발급 시도...")
                         try:
                             await self._get_approval_key()
                             logger.log_system("웹소켓 접속키 발급 성공")
