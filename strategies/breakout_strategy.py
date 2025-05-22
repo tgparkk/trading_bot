@@ -482,20 +482,21 @@ class BreakoutStrategy:
             logger.log_error(e, f"{symbol} - 브레이크아웃 전략 초기 데이터 로딩 오류")
     
     def get_signal_strength(self, symbol: str) -> float:
-        """신호 강도 측정 (0 ~ 10)"""
+        """신호 강도 반환"""
         try:
-            if symbol not in self.price_data or not self.price_data[symbol]:
-                return 0
-                
-            # 초기화 안 된 경우 초기화 시도
+            # 초기화가 완료되지 않았으면 0 반환
             if not self.initialization_complete.get(symbol, False):
-                # 비동기 초기화를 동기적으로 실행
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._load_initial_data(symbol))
                 return 0
-                
-            current_price = self.price_data[symbol][-1]["price"]
+            
+            # 현재가 확인
+            current_price = 0
+            if symbol in self.price_data and self.price_data[symbol]:
+                current_price = self.price_data[symbol][-1]["price"]
+            
+            # 브레이크아웃 레벨 확인
+            if symbol not in self.breakout_levels:
+                return 0
+            
             breakout_data = self.breakout_levels[symbol]
             
             # 돌파 레벨 미설정 시 재계산 시도
@@ -519,18 +520,33 @@ class BreakoutStrategy:
             # 상방 돌파 점수
             if current_price > breakout_data['high_level']:
                 # 얼마나 많이 돌파했는지 계산 (최대 5%)
-                breakout_pct = (current_price - breakout_data['high_level']) / breakout_data['high_level']
+                high_level = breakout_data['high_level']
+                if high_level <= 0:  # 안전 체크
+                    high_level = 0.0001
+                breakout_pct = (current_price - high_level) / high_level
                 return min(10, breakout_pct * 200)  # 최대 5% 돌파 시 10점
                 
             # 하방 돌파 점수
             elif current_price < breakout_data['low_level']:
                 # 얼마나 많이 돌파했는지 계산 (최대 5%)
-                breakout_pct = (breakout_data['low_level'] - current_price) / breakout_data['low_level']
+                low_level = breakout_data['low_level']
+                if low_level <= 0:  # 안전 체크
+                    low_level = 0.0001
+                breakout_pct = (low_level - current_price) / low_level
                 return min(10, breakout_pct * 200)  # 최대 5% 돌파 시 10점
             
             # 돌파 근접도 점수 (돌파 레벨까지 남은 거리, 최대 1%)
-            high_proximity = (breakout_data['high_level'] - current_price) / breakout_data['high_level']
-            low_proximity = (current_price - breakout_data['low_level']) / breakout_data['low_level']
+            high_level = breakout_data['high_level']
+            low_level = breakout_data['low_level']
+            
+            # 나누기 연산 전 안전 체크
+            if high_level <= 0:
+                high_level = 0.0001
+            if low_level <= 0:
+                low_level = 0.0001
+                
+            high_proximity = (high_level - current_price) / high_level
+            low_proximity = (current_price - low_level) / low_level
             
             if high_proximity < 0.01:  # 상방 돌파에 1% 내로 근접
                 return min(5, (0.01 - high_proximity) * 500)  # 최대 5점
@@ -592,9 +608,12 @@ class BreakoutStrategy:
             # 현재가가 없으면 API에서 가져오기
             if current_price <= 0:
                 try:
-                    symbol_info = await api_client.get_symbol_info(symbol)
-                    if symbol_info and "current_price" in symbol_info:
-                        current_price = float(symbol_info["current_price"])
+                    price_data = api_client.get_current_price(symbol)
+                    if price_data and price_data.get("rt_cd") == "0" and "output" in price_data:
+                        current_price = float(price_data["output"]["stck_prpr"])
+                    else:
+                        logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 현재가 조회 실패, 중립 신호 반환")
+                        return {"signal": 0, "direction": "NEUTRAL"}
                 except Exception as e:
                     logger.log_error(e, f"{symbol} - 브레이크아웃 현재가 조회 실패")
                     return {"signal": 0, "direction": "NEUTRAL"}
@@ -612,27 +631,56 @@ class BreakoutStrategy:
             direction = "NEUTRAL"
             signal_strength = 0
             
+            # 가격 범위 확인
+            price_range = breakout_data.get('range', 0)
+            if price_range <= 0:
+                # range가 없을 경우 high_level과 low_level 사이의 거리로 계산
+                price_range = high_level - low_level
+                if price_range <= 0:  # 여전히 0 이하면 기본값 설정
+                    # 현재가의 일정 비율을 가격 범위로 사용
+                    price_range = max(current_price * 0.02, 0.0001)  # 현재가의 2% 또는 최소값
+                    logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 가격 범위가 0 이하여서 기본값({price_range:.4f})으로 설정")
+            
+            # 안전장치: 가격 범위가 매우 작은 경우 최소값 설정
+            if price_range < 0.0001:
+                price_range = 0.0001  # 최소 가격 범위 설정
+            
             if current_price > high_level:  # 상향 돌파
                 direction = "BUY"
                 # 돌파 정도에 따른 신호 강도 계산 (최대 10)
-                price_range = breakout_data.get('range', 0)
-                if price_range > 0:
-                    excess = current_price - high_level
-                    signal_strength = min(10, (excess / price_range) * 10)
-                else:
-                    signal_strength = 5  # 기본값
+                excess = current_price - high_level
+                # 제로 나누기 방지
+                if price_range <= 0.0001:
+                    price_range = 0.0001  # 매우 작은 값으로 설정하여 나누기 오류 방지
+                signal_strength = min(10, (excess / price_range) * 20)  # 배수 증가
             
             elif current_price < low_level:  # 하향 돌파
                 direction = "SELL"
                 # 돌파 정도에 따른 신호 강도 계산 (최대 10)
-                price_range = breakout_data.get('range', 0)
-                if price_range > 0:
-                    excess = low_level - current_price
-                    signal_strength = min(10, (excess / price_range) * 10)
-                else:
-                    signal_strength = 5  # 기본값
+                excess = low_level - current_price
+                # 제로 나누기 방지
+                if price_range <= 0.0001:
+                    price_range = 0.0001  # 매우 작은 값으로 설정하여 나누기 오류 방지
+                signal_strength = min(10, (excess / price_range) * 20)  # 배수 증가
             
-            logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}")
+            # 돌파 근접도 추가 (돌파 레벨에 가까울수록 점수 추가)
+            elif high_level - current_price < price_range * 0.02:  # 상방 돌파에 근접 (2% 이내)
+                direction = "BUY"
+                # 제로 나누기 방지
+                if price_range <= 0.0001:
+                    price_range = 0.0001
+                proximity = (high_level - current_price) / price_range
+                signal_strength = max(1, 5 * (1 - (proximity / 0.02)))  # 최소 1점, 최대 5점
+            
+            elif current_price - low_level < price_range * 0.02:  # 하방 돌파에 근접 (2% 이내)
+                direction = "SELL"
+                # 제로 나누기 방지
+                if price_range <= 0.0001:
+                    price_range = 0.0001
+                proximity = (current_price - low_level) / price_range
+                signal_strength = max(1, 5 * (1 - (proximity / 0.02)))  # 최소 1점, 최대 5점
+            
+            logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength:.2f}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}, 가격범위={price_range}")
             return {"signal": signal_strength, "direction": direction}
             
         except Exception as e:

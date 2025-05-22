@@ -58,13 +58,27 @@ class TradingConfig:
             }
         if self.risk_params is None:
             self.risk_params = {
+                # 포지션 크기 제한
                 "max_position_size": 10_000_000,  # 최대 포지션 크기 (1천만원)
                 "max_position_per_symbol": 5_000_000,  # 종목별 최대 포지션 (5백만원)
-                "max_loss_rate": 0.02,  # 일일 최대 손실률 (2%)
+                "position_size_ratio": 0.1,  # 계좌 잔고 대비 포지션 크기 비율 (10%)
+                
+                # 리스크 제한
+                "max_loss_rate": 0.02,  # 최대 손실률 (2%)
                 "max_volatility": 0.05,  # 최대 허용 변동성 (5%)
+                "max_daily_risk": 1_000_000,  # 일일 최대 리스크 금액 (100만원)
+                
+                # 거래 제한
                 "min_daily_volume": 100_000,  # 최소 일일 거래량
                 "max_trades_per_day": 50,  # 일일 최대 거래 횟수
                 "max_open_positions": 10,  # 최대 동시 포지션 수
+                "daily_sell_limit": 100_000_000,  # 일일 매도 한도 (1억원)
+                
+                # 진입/청산 임계값
+                "profit_taking_threshold": 0.018,  # 이익실현 임계값 (1.8%)
+                "stop_loss_threshold": 0.02,  # 손절 임계값 (2%)
+                "trailing_stop_activation": 0.01,  # 트레일링 스탑 활성화 임계값 (1%)
+                "trailing_stop_distance": 0.005,  # 트레일링 스탑 거리 (0.5%)
             }
 
 @dataclass

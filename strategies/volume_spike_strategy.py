@@ -719,9 +719,26 @@ class VolumeStrategy:
             # 평균 분봉 거래량 계산
             avg_minute_volume = volume_data['avg_volume'] / 390  # 6.5시간 = 390분
             
-            # 최근 거래량 피크 확인
-            max_recent_volume = max(item['volume'] for item in recent_volumes) if recent_volumes else 0
-            volume_ratio = max_recent_volume / avg_minute_volume if avg_minute_volume > 0 else 0
+            # 최근 거래량 피크 확인 - 안전장치 추가
+            try:
+                if not recent_volumes:
+                    max_recent_volume = 0
+                else:
+                    # 음수 볼륨 값이 있는지 확인
+                    volumes = [item['volume'] for item in recent_volumes]
+                    # 음수 값은 0으로 치환
+                    volumes = [max(0, vol) for vol in volumes]
+                    max_recent_volume = max(volumes) if volumes else 0
+                    
+                # 평균이 0보다 작거나 같으면 대체값 사용
+                if avg_minute_volume <= 0:
+                    avg_minute_volume = 1  # 0으로 나누는 것 방지
+                    
+                volume_ratio = max_recent_volume / avg_minute_volume
+            except Exception as e:
+                logger.log_error(e, f"{symbol} - 거래량 비율 계산 중 오류")
+                max_recent_volume = 0
+                volume_ratio = 0
             
             logger.log_system(f"{symbol} - 최근 최대 거래량: {max_recent_volume}, 평균: {avg_minute_volume:.0f}, 배수: {volume_ratio:.2f}")
             

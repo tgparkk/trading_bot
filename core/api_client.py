@@ -45,7 +45,6 @@ class KISAPIClient:
             self.access_token = None
             self.token_expire_time = None  # 만료 시간 (Unix timestamp)
             self.token_issue_time = None   # 발급 시간 (Unix timestamp)
-            self._token_lock = asyncio.Lock()  # 토큰 발급 및 검증을 위한 락
             
             # 환경 변수에서 읽어오기
             self.base_url = os.getenv("KIS_BASE_URL")
@@ -260,10 +259,10 @@ class KISAPIClient:
             # 만료 시간이 임계값 미만이면 경고 로그 출력
             if time_remaining < TOKEN_RENEWAL_THRESHOLD:
                 logger.log_system(f"유효한 토큰이지만 만료까지 {hours_remaining:.1f}시간만 남았습니다. (임계값: {TOKEN_RENEWAL_THRESHOLD/3600:.1f}시간)")
-            else:
+            #else:
                 # 토큰이 유효하고 충분한 시간이 남은 경우 로그 최소화 (시간당 1번만 출력)
-                if int(hours_remaining) % 6 == 0 or hours_remaining < 1.0:
-                    logger.log_system(f"파일에서 유효한 토큰을 로드했습니다. 만료까지 {hours_remaining:.1f}시간 남음")
+                #if int(hours_remaining) % 6 == 0 or hours_remaining < 1.0:
+                #    logger.log_system(f"파일에서 유효한 토큰을 로드했습니다. 만료까지 {hours_remaining:.1f}시간 남음")
             
             return True
                 
@@ -277,7 +276,16 @@ class KISAPIClient:
     
     async def _get_access_token_async(self):
         """비동기 방식으로 액세스 토큰 획득"""
-        async with self._token_lock:
+        # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        # 스레드별 락 생성 (기존 _token_lock 대신 임시 락 생성)
+        async with asyncio.Lock():
             # 파일에서 토큰 정보 다시 확인
             token_loaded = self.load_token_from_file()
             
@@ -315,7 +323,14 @@ class KISAPIClient:
             # 새 토큰 발급 필요
             try:
                 logger.log_system("[토큰발급] 새 토큰 발급 시작...")
-                loop = asyncio.get_event_loop()
+                # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
                 new_token = await loop.run_in_executor(None, self._get_access_token)
                 logger.log_system("[토큰발급] 새 토큰 발급 완료")
                 return new_token
@@ -425,7 +440,16 @@ class KISAPIClient:
     
     async def ensure_token(self) -> str:
         """토큰이 있고 유효한지 확인하고, 없거나 유효하지 않으면 새로 발급"""
-        async with self._token_lock:
+        # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        # 스레드별 락 생성
+        async with asyncio.Lock():
             # 토큰 유효성 먼저 확인
             if await self.is_token_valid():
                 logger.log_system("토큰이 유효함. 새로 발급하지 않고 기존 토큰 사용")
@@ -438,17 +462,33 @@ class KISAPIClient:
     
     async def issue_token(self) -> str:
         """비동기적으로 토큰 발급 (Python 3.7+ 호환)"""
-        async with self._token_lock:
+        # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        # 스레드별 락 생성
+        async with asyncio.Lock():
             try:
+                # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
                 # 동기 함수 _get_access_token을 실행하여 토큰 발급 (run_in_executor 사용)
-                loop = asyncio.get_event_loop()
                 token = await loop.run_in_executor(None, self._get_access_token)
                 logger.log_system("토큰 발급 성공")
                 return token
             except Exception as e:
                 logger.log_error(e, "토큰 발급 실패")
                 raise
-                
+    
     def get_token_file_info(self) -> Dict[str, Any]:
         """토큰 파일 정보 반환"""
         try:
@@ -830,7 +870,7 @@ class KISAPIClient:
             "FID_INPUT_ISCD": symbol
         }
         
-        logger.log_system(f"[현재가조회] {symbol} 현재가 조회 시도")
+        #logger.log_system(f"[현재가조회] {symbol} 현재가 조회 시도")
         # raise_on_error=False로 설정하여 예외를 발생시키지 않고 오류 정보 반환
         result = self._make_request("GET", path, headers=headers, params=params, raise_on_error=False)
         
@@ -1021,8 +1061,15 @@ class KISAPIClient:
             # 비동기 토큰 확보
             token = await self._get_access_token_async()
             
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
             # 동기 함수를 비동기적으로 실행
-            loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, self.get_account_balance)
             
             # 결과 반환
@@ -1045,8 +1092,15 @@ class KISAPIClient:
         텔레그램 봇 핸들러와의 호환성을 위한 메서드
         """
         try:
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
             # 동기 함수를 비동기적으로 실행
-            loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, self.get_account_balance)
             return result
         except Exception as e:
@@ -1126,31 +1180,66 @@ class KISAPIClient:
         # 매수일 경우 계좌 잔고 확인 (최대 구매 가능 수량 검증)
         if side.upper() == "BUY" and price > 0:
             try:
-                # 계좌 잔고 조회
+                # 계좌 잔고 조회 - 주문 직전 최신 정보로 강제 갱신
                 balance_data = self.get_account_balance()
+                
+                # 주문가능금액 초기화
                 available_cash = 0
+                ord_psbl_cash = 0  # 실제 주문가능금액
                 
                 # 다양한 형식의 응답 처리
-                # balance_data가 리스트인 경우 처리
-                if isinstance(balance_data, list):
-                    if balance_data and isinstance(balance_data[0], dict):
-                        available_cash = float(balance_data[0].get("dnca_tot_amt", "0"))
-                # 딕셔너리인 경우 처리
-                elif isinstance(balance_data, dict):
+                if isinstance(balance_data, dict):
+                    # 주문가능금액(ord_psbl_cash) 필드 찾기 시도 - output2에서 우선 확인
+                    if "output2" in balance_data and balance_data["output2"]:
+                        output2 = balance_data["output2"]
+                        if isinstance(output2, list) and output2:
+                            item = output2[0]
+                            # 주문가능금액 필드 확인
+                            if "ord_psbl_cash" in item:
+                                ord_psbl_cash = float(item.get("ord_psbl_cash", "0"))
+                                logger.log_system(f"[주문검증] {symbol} {side} - API 주문가능금액: {ord_psbl_cash:,.0f}원")
+                            # 예수금 필드 확인
+                            if "dnca_tot_amt" in item:
+                                available_cash = float(item.get("dnca_tot_amt", "0"))
+                        elif isinstance(output2, dict):
+                            # 주문가능금액 필드 확인
+                            if "ord_psbl_cash" in output2:
+                                ord_psbl_cash = float(output2.get("ord_psbl_cash", "0"))
+                                logger.log_system(f"[주문검증] {symbol} {side} - API 주문가능금액: {ord_psbl_cash:,.0f}원")
+                            # 예수금 필드 확인
+                            if "dnca_tot_amt" in output2:
+                                available_cash = float(output2.get("dnca_tot_amt", "0"))
+                    
+                    # output1에서도 확인
                     if "output1" in balance_data:
-                        available_cash = float(balance_data["output1"].get("dnca_tot_amt", "0"))
-                    else:
-                        # 최상위 레벨에 필드가 있는 경우
-                        available_cash = float(balance_data.get("dnca_tot_amt", "0"))
+                        output1 = balance_data["output1"]
+                        if isinstance(output1, list) and output1:
+                            for item in output1:
+                                if isinstance(item, dict):
+                                    # 주문가능금액 필드 확인
+                                    if "ord_psbl_cash" in item and ord_psbl_cash == 0:
+                                        ord_psbl_cash = float(item.get("ord_psbl_cash", "0"))
+                                        logger.log_system(f"[주문검증] {symbol} {side} - output1 주문가능금액: {ord_psbl_cash:,.0f}원")
+                                    # 예수금 필드 확인
+                                    if "dnca_tot_amt" in item and available_cash == 0:
+                                        available_cash = float(item.get("dnca_tot_amt", "0"))
+                        elif isinstance(output1, dict):
+                            # 주문가능금액 필드 확인
+                            if "ord_psbl_cash" in output1 and ord_psbl_cash == 0:
+                                ord_psbl_cash = float(output1.get("ord_psbl_cash", "0"))
+                                logger.log_system(f"[주문검증] {symbol} {side} - output1 주문가능금액: {ord_psbl_cash:,.0f}원")
+                            # 예수금 필드 확인
+                            if "dnca_tot_amt" in output1 and available_cash == 0:
+                                available_cash = float(output1.get("dnca_tot_amt", "0"))
                 
-                # 안전 마진 적용 (예수금의 95%만 사용)
-                available_cash = available_cash * 0.95
+                # 최종 주문가능금액 결정 (API가 제공하는 주문가능금액 우선 사용)
+                final_available_cash = ord_psbl_cash if ord_psbl_cash > 0 else available_cash * 0.98
                 
-                # 주문 금액 계산
-                order_amount = price * quantity
+                # 주문 금액 계산 (수수료 고려)
+                order_amount = price * quantity * 1.005  # 0.5% 수수료 고려
                 
-                # 최대 주문 금액 제한 (500만원) - 안전장치 추가
-                MAX_ORDER_VALUE = 5000000  # 500만원
+                # 최대 주문 금액 제한 (100만원)
+                MAX_ORDER_VALUE = 1000000  # 100만원
                 if order_amount > MAX_ORDER_VALUE:
                     max_units_by_value = int(MAX_ORDER_VALUE / price)
                     max_units_by_value = (max_units_by_value // order_unit) * order_unit if order_unit > 1 else max_units_by_value
@@ -1165,32 +1254,28 @@ class KISAPIClient:
                     
                     logger.log_system(f"[주문수량조정] {symbol} {side} - 최대 주문 금액 제한으로 수량 조정: {quantity}주({order_amount:,.0f}원) → {max_units_by_value}주({max_units_by_value*price:,.0f}원)")
                     quantity = max_units_by_value
-                    order_amount = price * quantity
+                    order_amount = price * quantity * 1.005
                 
-                # 매수 주문 가능 최대 수량 계산
-                max_quantity = int(available_cash / price) if price > 0 else 0
+                # 주문가능금액 검증
+                if order_amount > final_available_cash:
+                    # 주문가능금액 내에서 최대 수량 계산
+                    max_quantity = int((final_available_cash / price) / 1.005)
+                    max_quantity = (max_quantity // order_unit) * order_unit if order_unit > 1 else max_quantity
+                    
+                    if max_quantity <= 0:
+                        logger.log_system(f"[주문거부] {symbol} {side} - 주문가능금액 부족: 필요={order_amount:,.0f}원, 가능={final_available_cash:,.0f}원")
+                        return {
+                            "rt_cd": "9999",
+                            "msg1": "주문가능금액이 부족합니다",
+                            "output": {}
+                        }
+                    
+                    # 수량 자동 조정
+                    logger.log_system(f"[주문수량조정] {symbol} {side} - 주문가능금액 기준 수량 조정: {quantity}주 → {max_quantity}주")
+                    quantity = max_quantity
+                    order_amount = price * quantity * 1.005
                 
-                # 주문 단위 적용 (최대 수량도 주문 단위로 조정)
-                if order_unit > 1 and max_quantity > 0:
-                    max_quantity = (max_quantity // order_unit) * order_unit
-                
-                logger.log_system(f"[주문검증] {symbol} {side} - 주문금액: {order_amount:,.0f}원, 가용잔고: {available_cash:,.0f}원, 최대가능수량: {max_quantity:,}주")
-                
-                if max_quantity <= 0:
-                    logger.log_system(f"[주문거부] {symbol} {side} - 매수 가능 수량이 없습니다 (가용 잔고: {available_cash:,.0f}원)")
-                    return {
-                        "rt_cd": "9999",
-                        "msg1": "매수 가능 수량이 없습니다",
-                        "output": {}
-                    }
-                
-                if quantity > max_quantity:
-                    logger.log_system(f"[주문거부] {symbol} {side} - 주문 가능한 최대 수량({max_quantity:,}주)을 초과했습니다: {quantity:,}주")
-                    return {
-                        "rt_cd": "9999",
-                        "msg1": "주문 가능한 수량을 초과했습니다",
-                        "output": {}
-                    }
+                logger.log_system(f"[주문검증] {symbol} {side} - 주문 검증 성공: 주문금액={order_amount:,.0f}원, 주문가능금액={final_available_cash:,.0f}원")
             
             except Exception as balance_e:
                 # 계좌 잔고 조회 실패 시 경고만 로깅하고 진행
@@ -1705,7 +1790,7 @@ class KISAPIClient:
             }
 
     async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        """종목 정보 조회"""
+        """종목 정보 조회 (비동기 버전)"""
         # 기본 응답 생성 헬퍼 함수
         def create_default_response(error_suffix="", error_msg=""):
             return {
@@ -1743,8 +1828,15 @@ class KISAPIClient:
                 "FID_INPUT_ISCD": symbol
             }
             
+            # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
             # 동기 함수를 비동기적으로 실행
-            loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, 
                 lambda: self._make_request("GET", path, headers=headers, params=params, max_retries=3)
