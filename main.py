@@ -188,33 +188,28 @@ class TradingBot:
                     
                     # 4. 장 시간 체크 및 거래 실행
                     if self._is_market_open(current_time):
-                        # 포지션 체크
-                        await order_manager.check_positions()
+                        # 포지션 체크 - 중복 호출 제거 (check_sell_signals에서 이미 실행됨)
                         
                         # 매도 신호 체크 및 주문 실행 로직 추가
-                        now = datetime.now()
-                        if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                            try:
-                                await self.check_sell_signals()
-                            except Exception as sell_error:
-                                logger.log_error(sell_error, "매도 신호 체크 중 예외 발생")
-                                await alert_system.notify_system_status(
-                                    "ERROR", 
-                                    f"매도 신호 체크 중 오류: {str(sell_error)}\n자세한 내용은 로그를 확인하세요."
-                                )
+                        try:
+                            await self.check_sell_signals()
+                        except Exception as sell_error:
+                            logger.log_error(sell_error, "매도 신호 체크 중 예외 발생")
+                            await alert_system.notify_system_status(
+                                "ERROR", 
+                                f"매도 신호 체크 중 오류: {str(sell_error)}\n자세한 내용은 로그를 확인하세요."
+                            )
                             
                         if len(MONITORED_SYMBOLS) > 0:
-                            # 2분마다 신호 체크
-                            now = datetime.now()
-                            if now.minute % 2 == 0 and now.second < 10:  # 2분마다, 매 분의 처음 10초 내에 실행
-                                try:
-                                    await self.check_buy_signals()
-                                except Exception as buy_error:
-                                    logger.log_error(buy_error, "매수 신호 체크 중 예외 발생")
-                                    await alert_system.notify_system_status(
-                                        "ERROR", 
-                                        f"매수 신호 체크 중 오류: {str(buy_error)}\n자세한 내용은 로그를 확인하세요."
-                                    )
+                            # 매수 신호 체크
+                            try:
+                                await self.check_buy_signals()
+                            except Exception as buy_error:
+                                logger.log_error(buy_error, "매수 신호 체크 중 예외 발생")
+                                await alert_system.notify_system_status(
+                                    "ERROR", 
+                                    f"매수 신호 체크 중 오류: {str(buy_error)}\n자세한 내용은 로그를 확인하세요."
+                                )
                                                 
                         # 시스템 상태 업데이트
                         database_manager.update_system_status("RUNNING")
@@ -227,8 +222,8 @@ class TradingBot:
                         if current_time > self.trading_config.market_close:
                             await self._handle_market_close()
                     
-                    # 5초 대기
-                    await asyncio.sleep(5)
+                    # 30초 대기 (API 호출 빈도 조절)
+                    await asyncio.sleep(30)
                     
                 except Exception as loop_error:
                     logger.log_error(loop_error, "메인 루프 내부 처리 중 오류 발생")
