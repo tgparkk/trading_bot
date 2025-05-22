@@ -680,7 +680,7 @@ class BreakoutStrategy:
                 proximity = (current_price - low_level) / price_range
                 signal_strength = max(1, 5 * (1 - (proximity / 0.02)))  # 최소 1점, 최대 5점
             
-            logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength:.2f}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}, 가격범위={price_range}")
+            #logger.log_system(f"[DEBUG] {symbol} - 브레이크아웃 신호: 방향={direction}, 강도={signal_strength:.2f}, 현재가={current_price}, 상향레벨={high_level}, 하향레벨={low_level}, 가격범위={price_range}")
             return {"signal": signal_strength, "direction": direction}
             
         except Exception as e:

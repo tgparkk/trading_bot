@@ -169,47 +169,7 @@ class AccountState:
                             except (ValueError, TypeError) as e:
                                 logger.log_warning(f"총평가금액 정보 변환 오류: {e}")
                 
-                # 주문가능금액/예수금 정보가 없는 경우 output1에서 검색
-                if (ord_psbl_cash <= 0 or dnca_tot_amt <= 0) and "output1" in balance_data:
-                    output1 = balance_data["output1"]
-                    
-                    # output1이 리스트인 경우
-                    if isinstance(output1, list) and output1:
-                        for item in output1:
-                            # 주문가능금액 확인
-                            if "ord_psbl_cash" in item and ord_psbl_cash <= 0:
-                                try:
-                                    ord_psbl_cash = float(item["ord_psbl_cash"])
-                                    logger.log_system(f"주문가능금액 정보(output1): {ord_psbl_cash:,.0f}원")
-                                except (ValueError, TypeError) as e:
-                                    logger.log_warning(f"주문가능금액 정보 변환 오류: {e}")
-                            
-                            # 예수금 확인
-                            if "dnca_tot_amt" in item and dnca_tot_amt <= 0:
-                                try:
-                                    dnca_tot_amt = float(item["dnca_tot_amt"])
-                                    logger.log_system(f"계좌 예수금 정보(output1): {dnca_tot_amt:,.0f}원")
-                                except (ValueError, TypeError) as e:
-                                    logger.log_warning(f"예수금 정보 변환 오류: {e}")
-                    
-                    # output1이 딕셔너리인 경우
-                    elif isinstance(output1, dict):
-                        # 주문가능금액 확인
-                        if "ord_psbl_cash" in output1 and ord_psbl_cash <= 0:
-                            try:
-                                ord_psbl_cash = float(output1["ord_psbl_cash"])
-                                logger.log_system(f"주문가능금액 정보(output1 dict): {ord_psbl_cash:,.0f}원")
-                            except (ValueError, TypeError) as e:
-                                logger.log_warning(f"주문가능금액 정보 변환 오류: {e}")
-                        
-                        # 예수금 확인
-                        if "dnca_tot_amt" in output1 and dnca_tot_amt <= 0:
-                            try:
-                                dnca_tot_amt = float(output1["dnca_tot_amt"])
-                                logger.log_system(f"계좌 예수금 정보(output1 dict): {dnca_tot_amt:,.0f}원")
-                            except (ValueError, TypeError) as e:
-                                logger.log_warning(f"예수금 정보 변환 오류: {e}")
-                
+
                 # API 응답에서 추출한 값으로 내부 상태 업데이트
                 self.available_cash = dnca_tot_amt
                 self.ord_psbl_cash = ord_psbl_cash  # 주문가능금액 저장
@@ -217,16 +177,6 @@ class AccountState:
                 
                 # 동기화 완료 시간 기록
                 self.last_sync_time = datetime.now()
-                
-                # 하드코딩된 테스트 금액 설정 (테스트용)
-                # 실제 환경에서는 제거 필요
-                if self.available_cash <= 0:
-                    logger.log_warning("API에서 계좌 잔고가 0원으로 반환되었습니다. 테스트를 위해 160,000원으로 설정합니다.")
-                    self.available_cash = 160000  # 테스트용 금액 설정
-                    
-                if self.ord_psbl_cash <= 0:
-                    logger.log_warning("API에서 주문가능금액이 0원으로 반환되었습니다. 예수금의 95%로 설정합니다.")
-                    self.ord_psbl_cash = self.available_cash * 0.95
                 
                 # 보류 중인 주문 금액 반영 (내부 가용 금액 계산 시)
                 logger.log_system(f"계좌 잔고 동기화 완료: 실제잔고={self.available_cash:,.0f}원, "
@@ -536,8 +486,8 @@ class AccountState:
                 "available_cash": self.available_cash,
                 "ord_psbl_cash": ord_psbl_cash,  # 주문가능금액 추가
                 "total_balance": self.total_balance,
-                "internal_available_cash": self.get_internal_available_cash(),
                 "ordered_amount": self.ordered_amount,
+                "internal_available_cash": self.get_internal_available_cash(),
                 "pending_orders_count": len(self.pending_orders),
                 "last_sync_time": self.last_sync_time.strftime("%Y-%m-%d %H:%M:%S") if self.last_sync_time else None
             }
