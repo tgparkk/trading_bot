@@ -8,6 +8,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from config.settings import config
 from core.api_client import api_client
+from core.account_state import account_state
+from core.risk_manager import risk_manager
 from utils.logger import logger
 from utils.database import database_manager
 from monitoring.alert_system import alert_system
@@ -26,7 +28,6 @@ class OrderManager:
                 cls._instance._initialized = False
         return cls._instance
     
-
     def __init__(self):
         """생성자는 인스턴스가 처음 생성될 때만 실행됨을 보장"""
         if not hasattr(self, '_initialized') or not self._initialized:
@@ -48,10 +49,30 @@ class OrderManager:
             self.max_order_wait_time = 30  # 주문 체결 최대 대기 시간 (초)
             self.order_check_interval = 1  # 주문 상태 체크 간격 (초)
             self._initialized = True
-        
+    
     async def initialize(self):
         """초기화 - 포지션/잔고 로드"""
         try:
+            # 계좌 상태 관리자 초기화 확인 - 초기화되지 않았다면 초기화 실행
+            if not hasattr(account_state, 'initialized') or not account_state.initialized:
+                logger.log_system("계좌 상태 관리자 초기화가 필요합니다.")
+                await account_state.initialize()
+                logger.log_system("계좌 상태 관리자 초기화 완료")
+            
+            # 리스크 관리자 초기화 확인
+            if not hasattr(risk_manager, '_initialized') or not risk_manager._initialized:
+                logger.log_system("리스크 관리자 초기화가 필요합니다.")
+                await risk_manager.initialize()
+                logger.log_system("리스크 관리자 초기화 완료")
+            
+            # 계좌 잔고 강제 동기화
+            await account_state.sync_with_api(force=True)
+            
+            # 계좌 잔고 정보 로깅
+            account_info = await account_state.get_account_info()
+            logger.log_system(f"계좌 잔고 정보: 실제잔고={account_info['available_cash']:,.0f}원, "
+                            f"내부가용잔고={account_info['internal_available_cash']:,.0f}원")
+            
             # 계좌 잔고 조회
             balance_data = api_client.get_account_balance()
             
@@ -101,28 +122,90 @@ class OrderManager:
             return True
         return False
     
-    async def place_order(self, symbol: str, side: str, quantity: int, 
-                         price: float = None, order_type: str = "MARKET",
-                         strategy: str = None, reason: str = None, 
-                         bypass_pause: bool = False) -> Dict[str, Any]:
-        """주문 실행"""
-        try:
-            logger.log_system(f"[주문시도] {symbol} {side} 주문 시작 - 수량: {quantity}주, 가격: {price}, 타입: {order_type}")
+    async def place_order(self, symbol: str, side: str, quantity: int = None, 
+                          price: float = None, order_type: str = "MARKET",
+                          strategy: str = None, reason: str = None, 
+                          bypass_pause: bool = False,
+                          signal_strength: float = 5.0) -> Dict[str, Any]:
+        """주문 실행
+        
+        Args:
+            symbol: 종목코드
+            side: 매수/매도 구분 (BUY/SELL)
+            quantity: 주문 수량 (매수의 경우 None으로 설정 시 리스크 관리자가 계산)
+            price: 주문 가격 (지정가 주문 시 필수)
+            order_type: 주문 유형 (MARKET/LIMIT)
+            strategy: 전략 이름
+            reason: 주문 사유
+            bypass_pause: 거래 중지 상태 무시 (긴급 매도 등에 사용)
+            signal_strength: 신호 강도 (0~10, 기본값 5)
             
-            # 매도 주문인 경우 사전 검증
-            if side == "SELL":
-                # 보유 수량 확인
+        Returns:
+            Dict[str, Any]: 주문 결과
+        """
+        # 거래 중지 상태 확인
+        if self.is_trading_paused() and not bypass_pause:
+            return {"status": "failed", "reason": "거래가 일시 중지되었습니다"}
+        
+        try:
+            logger.log_system(f"[주문시도] {symbol} {side} 주문 시작 - 초기 요청 수량: {quantity}주, 가격: {price}, 타입: {order_type}")
+            
+            # 가격 정보 확인 - 주문 처리를 위해 price 값 필요
+            if price is None or price <= 0:
+                # 현재가 조회 필요
+                try:
+                    price_data = api_client.get_current_price(symbol)
+                    if price_data and price_data.get("rt_cd") == "0" and "output" in price_data:
+                        price = float(price_data["output"]["stck_prpr"])
+                        logger.log_system(f"[주문정보] {symbol} - 현재가 조회 결과: {price:,.0f}원")
+                    else:
+                        logger.log_system(f"[주문실패] {symbol} - 현재가 조회 실패")
+                        return {"status": "failed", "reason": "현재가 조회 실패"}
+                except Exception as price_e:
+                    logger.log_error(price_e, f"{symbol} 현재가 조회 중 오류")
+                    return {"status": "failed", "reason": "현재가 조회 오류"}
+            
+            # BUY 주문이고 수량이 지정되지 않은 경우 리스크 관리자를 통해 수량 계산
+            if side.upper() == "BUY" and (quantity is None or quantity <= 0):
+                quantity, order_amount = await risk_manager.calculate_position_size(
+                    symbol=symbol,
+                    side=side,
+                    current_price=price,
+                    strategy=strategy,
+                    signal_strength=signal_strength
+                )
+                
+                # 계산된 수량이 0인 경우 (리스크 제한 등의 이유로)
+                if quantity <= 0:
+                    logger.log_system(f"[주문취소] {symbol} - 리스크 관리자가 0주 수량 계산, 주문 취소")
+                    return {"status": "rejected", "reason": "리스크 관리 제한으로 주문 수량이 0입니다"}
+                
+                logger.log_system(f"[주문정보] {symbol} - 리스크 관리자 계산 수량: {quantity}주")
+            
+            # 매도 주문인 경우 사전 검증 - 보유 수량 확인
+            if side.upper() == "SELL":
+                # 보유 수량 확인 (데이터베이스와 API 둘 다 확인)
                 current_position = self.positions.get(symbol, {"quantity": 0})
+                
+                # API를 통해 실제 보유 수량 다시 확인 (실시간 데이터 우선)
+                try:
+                    positions_data = await self.get_positions()
+                    if positions_data and "output1" in positions_data:
+                        for position in positions_data["output1"]:
+                            if position.get("pdno") == symbol:
+                                # API에서 조회한 실제 보유 수량으로 업데이트
+                                current_position["quantity"] = int(position.get("hldg_qty", 0))
+                                break
+                except Exception as e:
+                    logger.log_error(e, f"{symbol} 실제 보유 수량 조회 중 오류")
+                
                 if current_position["quantity"] < quantity:
                     error_msg = f"보유 수량 부족 (보유: {current_position['quantity']}주, 요청: {quantity}주)"
                     logger.log_system(f"[매도실패] {symbol} - {error_msg}")
+                    
+                    # 실패 횟수 증가 처리
+                    self._increment_failure_count(symbol, "INSUFFICIENT_QUANTITY", error_msg)
                     return {"status": "failed", "reason": error_msg}
-                
-                # 매도 가능 여부 확인 (예: 주문 제한, 거래 정지 등)
-                # if not await self._check_sell_availability(symbol, quantity):
-                #     error_msg = "매도 제한 상태"
-                #     logger.log_system(f"[매도실패] {symbol} - {error_msg}")
-                #     return {"status": "failed", "reason": error_msg}
             
             # 블랙리스트 체크 - 특정 종목이 블랙리스트에 있는지 확인
             current_time = time.time()
@@ -130,7 +213,8 @@ class OrderManager:
                 expire_time = self.order_blacklist[symbol]
                 if current_time < expire_time:
                     remaining_time = int((expire_time - current_time) / 60)
-                    logger.log_system(f"[주문거부] {symbol}: 이 종목은 주문 실패 횟수 초과로 {remaining_time}분간 거래가 중지되었습니다.")
+                    error_msg = f"이 종목은 주문 실패 횟수 초과로 {remaining_time}분간 거래가 중지되었습니다."
+                    logger.log_system(f"[주문거부] {symbol}: {error_msg}")
                     return {"status": "rejected", "reason": "symbol_blacklisted", "remaining_time": remaining_time}
                 else:
                     # 블랙리스트 만료되면 제거
@@ -145,6 +229,111 @@ class OrderManager:
                     logger.log_system(f"[주문거부] {symbol}: 거래가 일시 중지 상태입니다.")
                     return {"status": "rejected", "reason": "trading_paused"}
 
+            # 리스크 한도 검증 (매도는 예외 - 포지션 정리 목적)
+            if side.upper() == "BUY":
+                risk_check = await risk_manager.check_risk_limits(symbol, side, quantity, price)
+                if not risk_check["allowed"]:
+                    logger.log_system(f"[주문거부] {symbol}: {risk_check['reason']}")
+                    return {"status": "rejected", "reason": risk_check["reason"]}
+            
+            # 주문 금액 계산 및 내부 잔고 검증
+            if side.upper() == "BUY":
+                # 시장가 주문은 계산 금액에 여유 필요 (시장가 10%, 지정가 3%로 여유 적절히 조정)
+                calculated_price = price * 1.03 if order_type.upper() == "LIMIT" else price * 1.10
+                order_amount = calculated_price * quantity
+                
+                # 로그 추가 - 보다 자세한 정보
+                logger.log_system(f"[매수금액계산] {symbol} - 현재가: {price:,.0f}원, 수량: {quantity}주, "
+                                f"계산가격(마진적용): {calculated_price:,.0f}원, 주문총액: {order_amount:,.0f}원")
+                
+                # 계좌 잔고 최신화 (주문 전 실시간 동기화)
+                try:
+                    # 계좌 정보 강제 동기화 - 오류 처리 강화
+                    try:
+                        sync_result = await account_state.sync_with_api(force=True)
+                        if not sync_result:
+                            logger.log_warning(f"[매수주의] {symbol} - 계좌 동기화 실패, 기존 정보로 진행")
+                    except RuntimeError as loop_error:
+                        # 이벤트 루프 관련 오류 처리
+                        error_msg = str(loop_error)
+                        if "different loop" in error_msg:
+                            logger.log_warning(f"[이벤트루프오류] {symbol} - 이벤트 루프 불일치 오류 발생, 강제 진행")
+                        else:
+                            logger.log_error(loop_error, f"{symbol} 계좌 동기화 중 이벤트 루프 오류")
+                    except Exception as sync_error:
+                        logger.log_error(sync_error, f"{symbol} 계좌 동기화 중 예외 발생")
+                    
+                    account_info = await account_state.get_account_info()
+                    
+                    # 주문 가능 금액 확인
+                    available_cash = account_info["available_cash"]  # 예수금
+                    internal_available_cash = account_info["internal_available_cash"]  # 내부 가용 잔고
+                    
+                    # 실제 주문가능금액 조회 (API)
+                    api_balance = api_client.get_account_balance()
+                    api_ord_psbl_cash = 0  # API 주문가능금액
+                    
+                    if api_balance.get("rt_cd") == "0":
+                        # 주문가능금액 추출
+                        if "output2" in api_balance and api_balance["output2"]:
+                            output2 = api_balance["output2"]
+                            if isinstance(output2, list) and output2:
+                                item = output2[0]
+                                if "ord_psbl_cash" in item:
+                                    api_ord_psbl_cash = float(item.get("ord_psbl_cash", "0"))
+                            elif isinstance(output2, dict) and "ord_psbl_cash" in output2:
+                                api_ord_psbl_cash = float(output2.get("ord_psbl_cash", "0"))
+                    
+                    # API 주문가능금액 검증 (가장 우선)
+                    if api_ord_psbl_cash > 0:
+                        if order_amount > api_ord_psbl_cash:
+                            logger.log_system(f"[매수실패] {symbol} - 주문금액({order_amount:,.0f}원)이 API 주문가능금액({api_ord_psbl_cash:,.0f}원)을 초과합니다.")
+                            self._increment_failure_count(symbol, "INSUFFICIENT_BALANCE", "주문가능금액 초과 (API 주문가능금액 부족)")
+                            return {"status": "failed", "reason": "주문가능금액 초과 (API 주문가능금액 부족)"}
+                        else:
+                            logger.log_system(f"[매수검증성공] {symbol} - API 주문가능금액 검증 통과: 주문금액={order_amount:,.0f}원, API주문가능금액={api_ord_psbl_cash:,.0f}원")
+                    
+                    # 내부 가용 잔고 검증 (백업)
+                    elif order_amount > internal_available_cash:
+                        logger.log_system(f"[매수실패] {symbol} - 주문금액({order_amount:,.0f}원)이 내부 가용 잔고({internal_available_cash:,.0f}원)를 초과합니다.")
+                        self._increment_failure_count(symbol, "INSUFFICIENT_BALANCE", "주문가능금액 초과 (내부 가용 잔고 부족)")
+                        return {"status": "failed", "reason": "주문가능금액 초과 (내부 가용 잔고 부족)"}
+                    
+                    logger.log_system(f"[매수검증] {symbol} - 주문금액: {order_amount:,.0f}원, 실제잔고: {available_cash:,.0f}원, 내부가용잔고: {internal_available_cash:,.0f}원")
+                except Exception as balance_e:
+                    logger.log_error(balance_e, f"{symbol} 계좌 잔고 확인 중 오류")
+                    self._increment_failure_count(symbol, "BALANCE_CHECK_ERROR", "계좌 잔고 확인 중 오류")
+                    return {"status": "failed", "reason": "계좌 잔고 확인 중 오류"}
+                
+                # 주문 ID 생성 (예약용)
+                temp_order_id = account_state.generate_temp_order_id()
+                
+                # 내부 잔고 검증 및 예약 - 반드시 API 호출 전에 수행
+                # 오류 처리 강화
+                try:
+                    reserve_result = await account_state.reserve_amount(symbol, temp_order_id, order_amount)
+                    if not reserve_result:
+                        self._increment_failure_count(symbol, "RESERVE_FAILED", "주문가능금액 예약 실패 (내부 검증 실패)")
+                        return {"status": "failed", "reason": "주문가능금액 초과 (내부 검증 실패)"}
+                except RuntimeError as loop_error:
+                    # 이벤트 루프 관련 오류 처리
+                    error_msg = str(loop_error)
+                    if "different loop" in error_msg:
+                        logger.log_warning(f"[이벤트루프오류] {symbol} - 금액 예약 중 이벤트 루프 불일치, 예약 없이 진행")
+                        # 예약 실패 시에도 진행 (API에서 재검증됨)
+                    else:
+                        logger.log_error(loop_error, f"{symbol} 금액 예약 중 이벤트 루프 오류")
+                        self._increment_failure_count(symbol, "RESERVE_ERROR", f"주문가능금액 예약 오류: {error_msg}")
+                        return {"status": "failed", "reason": f"주문가능금액 예약 오류: {error_msg}"}
+                except Exception as reserve_error:
+                    logger.log_error(reserve_error, f"{symbol} 금액 예약 중 예외 발생")
+                    self._increment_failure_count(symbol, "RESERVE_ERROR", f"주문가능금액 예약 오류: {str(reserve_error)}")
+                    return {"status": "failed", "reason": f"주문가능금액 예약 오류: {str(reserve_error)}"}
+            else:
+                # 매도 주문의 경우 금액 계산만 (예약 과정 없음)
+                order_amount = price * quantity
+                temp_order_id = account_state.generate_temp_order_id()
+
             # 주문 실행 (재시도 로직 포함)
             retry_count = 0
             last_error = None
@@ -155,6 +344,7 @@ class OrderManager:
                         logger.log_system(f"[주문재시도] {symbol} {side} 주문 재시도 ({retry_count}/{self.max_retries})")
                         await asyncio.sleep(self.retry_delay)
                     
+                    # API를 통한 주문 실행
                     if order_type.upper() == "MARKET":
                         order_result = api_client.place_order(
                             symbol=symbol,
@@ -163,10 +353,6 @@ class OrderManager:
                             quantity=quantity
                         )
                     else:
-                        if price is None:
-                            price_data = api_client.get_current_price(symbol)
-                            price = float(price_data["output"]["stck_prpr"])
-                        
                         order_result = api_client.place_order(
                             symbol=symbol,
                             order_type="LIMIT",
@@ -198,8 +384,13 @@ class OrderManager:
                             "created_at": datetime.now()
                         }
                         
+                        # DB에 주문 정보 저장
                         database_manager.save_order(order_data)
                         self.pending_orders[order_id] = order_data
+                        
+                        # 내부 계좌 상태 업데이트 (임시 ID를 실제 주문 ID로 갱신)
+                        if side.upper() == "BUY":
+                            await account_state.update_after_order(temp_order_id, success=True)
                         
                         # 주문 체결 대기 및 모니터링
                         if order_type.upper() == "MARKET":
@@ -211,80 +402,28 @@ class OrderManager:
                         
                         return {"status": "success", "order_id": order_id}
                     
-                    # 주문 실패
+                    # 주문 실패 - 내부 잔고 업데이트 (예약 취소)
+                    if side.upper() == "BUY":
+                        await account_state.update_after_order(temp_order_id, success=False)
+                    
+                    # 오류 메시지 처리
                     error_msg = order_result.get("msg1", "Unknown error")
                     error_code = order_result.get("rt_cd", "9999")
                     
-                    # 매도 주문 실패 특화 처리
-                    if side == "SELL":
-                        if error_code in ["9999", "9998"]:  # 타임아웃 또는 네트워크 오류
-                            if retry_count < self.max_retries:
-                                retry_count += 1
-                                last_error = f"Timeout/Network error: {error_msg}"
-                                continue
-                        elif error_code in ["M001", "M002"]:  # 매도 제한 관련 오류
-                            logger.log_system(f"[매도제한] {symbol} - 매도 제한 상태: {error_msg}")
-                            return {"status": "failed", "reason": f"매도 제한: {error_msg}"}
-                        elif error_code in ["M003", "M004"]:  # 수량 관련 오류
-                            logger.log_system(f"[매도수량오류] {symbol} - 수량 오류: {error_msg}")
-                            return {"status": "failed", "reason": f"수량 오류: {error_msg}"}
-                    
-                    # 실패 원인별 처리
+                    # 특정 오류 코드에 대한 재시도 여부 결정
                     if error_code in ["9999", "9998"]:  # 타임아웃 또는 네트워크 오류
                         if retry_count < self.max_retries:
                             retry_count += 1
                             last_error = f"Timeout/Network error: {error_msg}"
                             continue
                     
-                    # 재시도 불가능한 오류 또는 최대 재시도 횟수 초과
-                    current_time = time.time()
+                    # 주문가능금액 초과 오류 (rt_cd: 7)인 경우 계좌 잔고 강제 동기화
+                    if error_code == "7" and "주문가능금액을 초과" in error_msg:
+                        logger.log_warning(f"{symbol} - 주문가능금액 초과 오류, 계좌 잔고 강제 동기화")
+                        await account_state.sync_with_api(force=True)
                     
-                    if symbol not in self.order_failures:
-                        self.order_failures[symbol] = {
-                            "최근_실패_시간": current_time,
-                            "횟수": 1,
-                            "실패_원인": [{"시간": current_time, "원인": error_msg, "코드": error_code}]
-                        }
-                    else:
-                        last_failure_time = self.order_failures[symbol]["최근_실패_시간"]
-                        time_diff = current_time - last_failure_time
-                        
-                        if time_diff > self.failure_reset_time:
-                            self.order_failures[symbol] = {
-                                "최근_실패_시간": current_time,
-                                "횟수": 1,
-                                "실패_원인": [{"시간": current_time, "원인": error_msg, "코드": error_code}]
-                            }
-                        else:
-                            self.order_failures[symbol]["횟수"] += 1
-                            self.order_failures[symbol]["최근_실패_시간"] = current_time
-                            self.order_failures[symbol]["실패_원인"].append({
-                                "시간": current_time,
-                                "원인": error_msg,
-                                "코드": error_code
-                            })
-                    
-                    # 블랙리스트 조건 체크 (실패 원인에 따라 차등 적용)
-                    failures_count = self.order_failures[symbol]["횟수"]
-                    if failures_count >= self.max_consecutive_failures:
-                        # 실패 원인 분석
-                        recent_failures = self.order_failures[symbol]["실패_원인"][-3:]  # 최근 3개 실패만 확인
-                        timeout_count = sum(1 for f in recent_failures if f["코드"] in ["9999", "9998"])
-                        
-                        # 타임아웃이 많은 경우 더 짧은 블랙리스트 기간 적용
-                        blacklist_duration = self.blacklist_duration // 2 if timeout_count >= 2 else self.blacklist_duration
-                        
-                        self.order_blacklist[symbol] = time.time() + blacklist_duration
-                        logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {failures_count}회 주문 실패로 {blacklist_duration//60}분간 주문 중지")
-                        
-                        # 알림 전송
-                        try:
-                            await alert_system.notify_system_status(
-                                "WARNING",
-                                f"{symbol} 연속 {failures_count}회 주문 실패로 블랙리스트 등록 ({blacklist_duration//60}분간 주문 중지)"
-                            )
-                        except Exception as alert_error:
-                            logger.log_error(alert_error, f"{symbol} 블랙리스트 알림 전송 실패")
+                    # 실패 정보 기록 및 블랙리스트 처리
+                    failures_count = self._increment_failure_count(symbol, error_code, error_msg)
                     
                     logger.log_system(f"[주문실패] {symbol} 주문 실패 ({failures_count}/{self.max_consecutive_failures}회) - 오류: {error_msg}")
                     return {"status": "failed", "reason": error_msg, "failure_count": failures_count}
@@ -295,23 +434,40 @@ class OrderManager:
                         last_error = "API timeout"
                         continue
                     else:
+                        # 매수 주문이었다면 내부 예약 취소
+                        if side.upper() == "BUY":
+                            await account_state.cancel_reservation(temp_order_id)
                         raise
                 except Exception as api_e:
+                    # 예상치 못한 오류 발생 시
+                    logger.log_error(api_e, f"{symbol} 주문 처리 중 오류")
+                    
+                    # 매수 주문이었다면 내부 예약 취소
+                    if side.upper() == "BUY":
+                        await account_state.cancel_reservation(temp_order_id)
+                        
                     if retry_count < self.max_retries:
                         retry_count += 1
                         last_error = str(api_e)
                         continue
                     else:
-                        raise
+                        return {"status": "failed", "reason": f"API 오류: {str(api_e)}"}
             
             # 모든 재시도 실패
-            logger.log_system(f"[주문실패] {symbol} 모든 재시도 실패 - 마지막 오류: {last_error}")
-            return {"status": "error", "reason": f"All retries failed: {last_error}"}
+            logger.log_system(f"[주문실패] {symbol} 최대 재시도 횟수 초과: {last_error}")
+            
+            # 실패 정보 기록
+            failures_count = self._increment_failure_count(symbol, "MAX_RETRY_EXCEEDED", last_error or "최대 재시도 횟수 초과")
+            
+            return {"status": "failed", "reason": last_error or "최대 재시도 횟수 초과", "failure_count": failures_count}
             
         except Exception as e:
-            logger.log_system(f"[주문오류] {symbol} 주문 처리 중 예외 발생: {str(e)}")
-            logger.log_error(e, "Order placement error")
-            return {"status": "error", "reason": str(e)}
+            logger.log_error(e, f"{symbol} 주문 요청 처리 중 오류")
+            
+            # 예상치 못한 오류에 대해서도 실패 정보 기록
+            failures_count = self._increment_failure_count(symbol, "UNEXPECTED_ERROR", str(e))
+            
+            return {"status": "failed", "reason": str(e), "failure_count": failures_count}
     
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """주문 취소"""
@@ -374,11 +530,17 @@ class OrderManager:
                 # 매도 - 실현손익 계산
                 sell_quantity = min(quantity, current_position["quantity"])
                 if sell_quantity > 0:
-                    # 총 매도 금액 업데이트
+                    # 총 매도 금액 업데이트 (total_sell_amount 키가 없으면 초기화)
+                    if "total_sell_amount" not in current_position:
+                        current_position["total_sell_amount"] = 0
+                        
                     current_position["total_sell_amount"] += price * sell_quantity
                     
                     # 실현 손익 계산 (FIFO 방식)
                     realized_pnl = sell_quantity * (price - current_position["avg_price"])
+                    if "realized_pnl" not in current_position:
+                        current_position["realized_pnl"] = 0
+                        
                     current_position["realized_pnl"] += realized_pnl
                     self.daily_pnl += realized_pnl
                     
@@ -477,6 +639,21 @@ class OrderManager:
                 
                 for symbol, position in valid_positions.items():
                     try:
+                        # 블랙리스트에 있는 종목은 건너뛰기
+                        current_time = time.time()
+                        if symbol in self.order_blacklist:
+                            expire_time = self.order_blacklist[symbol]
+                            if current_time < expire_time:
+                                remaining_time = int((expire_time - current_time) / 60)
+                                logger.log_system(f"[포지션체크] {symbol}: 블랙리스트에 등록된 종목(앞으로 {remaining_time}분), 처리 건너뜀")
+                                continue
+                            else:
+                                # 블랙리스트 만료되면 제거
+                                del self.order_blacklist[symbol]
+                                if symbol in self.order_failures:
+                                    self.order_failures[symbol] = {"최근_실패_시간": 0, "횟수": 0, "실패_원인": []}
+                                logger.log_system(f"[블랙리스트 해제] {symbol}: 거래 재개 가능")
+                        
                         # 현재가 조회 - API 응답에 현재가가 없거나 정확하지 않은 경우 별도 조회
                         if position["current_price"] <= 0:
                             price_data = api_client.get_current_price(symbol)
@@ -617,78 +794,31 @@ class OrderManager:
             return {"rt_cd": "E", "msg1": str(e)}
             
     async def get_account_balance(self) -> Dict[str, Any]:
-        """계좌 잔고 조회
-        
-        Returns:
-            Dict[str, Any]: 계좌 잔고 정보를 담은 딕셔너리
-                - cash_balance: 주문 가능한 현금 잔고
-                - total_balance: 총 평가금액
-                - positions: 보유 종목 목록
-                - status: 처리 상태 ('success' 또는 'error')
-                - message: 상태 메시지
-        """
-        # 기본 반환 구조
-        result = {
-            "cash_balance": 0.0,
-            "total_balance": 0.0,
-            "positions": [],
-            "status": "success",
-            "message": ""
-        }
-        
+        """계좌 잔고 조회"""
         try:
-            # 비동기 환경에서 동기 함수 호출
-            loop = asyncio.get_event_loop()
-            raw_result = await loop.run_in_executor(None, api_client.get_account_balance)
+            # 계좌 상태 동기화 (5분 이상 경과 시 자동 동기화됨)
+            account_info = await account_state.get_account_info()
             
-            # API 응답 유효성 확인
-            if raw_result and raw_result.get("rt_cd") == "0":
-                #logger.log_system("계좌 잔고 조회 성공")
-                
-                # 1. 보유 종목 처리 (output1)
-                if "output1" in raw_result:
-                    # 단일 항목이든 리스트든 항상 리스트로 변환
-                    output1_items = raw_result["output1"]
-                    if not isinstance(output1_items, list):
-                        output1_items = [output1_items]
-                    
-                    # 종목 정보 복사
-                    result["positions"] = output1_items
-                
-                # 2. 계좌 요약 정보 처리 (output2)
-                if "output2" in raw_result and raw_result["output2"]:
-                    # 단일 항목이든 리스트든 첫 번째 요소 추출
-                    account_data = raw_result["output2"]
-                    if isinstance(account_data, list) and account_data:
-                        account_data = account_data[0]
-                    
-                    if isinstance(account_data, dict):
-                        # 예수금 및 총 평가금액 추출
-                        try:
-                            result["cash_balance"] = float(account_data.get("dnca_tot_amt", "0"))
-                            result["total_balance"] = float(account_data.get("tot_evlu_amt", "0"))
-                        except (ValueError, TypeError):
-                            # 변환 실패 시 기본값 유지
-                            pass
-            else:
-                # API 오류 처리
-                error_msg = raw_result.get("msg1", "알 수 없는 오류")
-                logger.log_system(f"계좌 잔고 조회 실패: {error_msg}", level="WARNING")
-                result["status"] = "error"
-                result["message"] = f"API 오류: {error_msg}"
+            # API 응답 형식에 맞게 반환
+            return {
+                "rt_cd": "0",
+                "msg1": "계좌 정보 조회 성공",
+                "cash_balance": account_info["available_cash"],
+                "total_balance": account_info["total_balance"],
+                "internal_available_cash": account_info["internal_available_cash"],
+                "output1": [{
+                    "dnca_tot_amt": str(account_info["available_cash"]),
+                    "tot_evlu_amt": str(account_info["total_balance"])
+                }]
+            }
             
-            # 결과 정보 로깅
-            logger.log_system(f"계좌 잔고 정보: 예수금={result['cash_balance']:,.0f}원, "
-                            f"총평가={result['total_balance']:,.0f}원, "
-                            f"보유종목={len(result['positions'])}개")
-            
-            return result
-                
         except Exception as e:
-            logger.log_error(e, "계좌 잔고 조회 중 예외 발생")
-            result["status"] = "error"
-            result["message"] = f"처리 오류: {str(e)}"
-            return result
+            logger.log_error(e, "계좌 잔고 조회 실패")
+            return {
+                "rt_cd": "9999", 
+                "msg1": f"계좌 정보 조회 실패: {str(e)}", 
+                "output1": []
+            }
 
     async def _check_sell_availability(self, symbol: str, quantity: int) -> bool:
         """매도 가능 여부 확인"""
@@ -870,6 +1000,9 @@ class OrderManager:
             # 트레이드 DB에 저장
             database_manager.save_trade(trade_data)
             
+            # 리스크 관리자에 거래 정보 업데이트
+            await risk_manager.update_after_trade(trade_data)
+            
             # 알림 전송
             await alert_system.notify_trade(trade_data)
             
@@ -883,6 +1016,73 @@ class OrderManager:
             
         except Exception as e:
             logger.log_error(e, f"Error handling order execution: {order_id}")
+
+    # 주기적인 계좌 정보 동기화 기능 추가
+    async def sync_account_state(self, force: bool = False) -> None:
+        """계좌 상태 동기화"""
+        await account_state.sync_with_api(force=force)
+
+    def _increment_failure_count(self, symbol: str, error_code: str, error_msg: str) -> int:
+        """
+        실패 횟수 증가 및 블랙리스트 처리
+        
+        Args:
+            symbol: 종목 코드
+            error_code: 오류 코드
+            error_msg: 오류 메시지
+            
+        Returns:
+            int: 증가된 후의 실패 횟수
+        """
+        current_time = time.time()
+        
+        # 보유 수량 부족 오류는 블랙리스트 카운트에서 제외
+        if "보유 수량 부족" in error_msg or "INSUFFICIENT_QUANTITY" in error_code:
+            logger.log_system(f"[오류무시] {symbol} - 보유 수량 부족 오류는 블랙리스트 카운트에서 제외합니다.")
+            return 0  # 블랙리스트 카운트 증가하지 않음
+        
+        if symbol not in self.order_failures:
+            self.order_failures[symbol] = {
+                "최근_실패_시간": current_time,
+                "횟수": 1,
+                "실패_원인": [{"시간": current_time, "원인": error_msg, "코드": error_code}]
+            }
+        else:
+            last_failure_time = self.order_failures[symbol]["최근_실패_시간"]
+            time_diff = current_time - last_failure_time
+            
+            if time_diff > self.failure_reset_time:
+                self.order_failures[symbol] = {
+                    "최근_실패_시간": current_time,
+                    "횟수": 1,
+                    "실패_원인": [{"시간": current_time, "원인": error_msg, "코드": error_code}]
+                }
+            else:
+                self.order_failures[symbol]["횟수"] += 1
+                self.order_failures[symbol]["최근_실패_시간"] = current_time
+                self.order_failures[symbol]["실패_원인"].append({
+                    "시간": current_time,
+                    "원인": error_msg,
+                    "코드": error_code
+                })
+        
+        # 블랙리스트 조건 체크
+        failures_count = self.order_failures[symbol]["횟수"]
+        if failures_count >= self.max_consecutive_failures:
+            # 블랙리스트 등록
+            self.order_blacklist[symbol] = time.time() + self.blacklist_duration
+            logger.log_system(f"[블랙리스트 등록] {symbol}: 연속 {failures_count}회 주문 실패로 {self.blacklist_duration//60}분간 주문 중지")
+            
+            # 알림 전송
+            try:
+                asyncio.create_task(alert_system.notify_system_status(
+                    "WARNING",
+                    f"{symbol} 연속 {failures_count}회 주문 실패로 블랙리스트 등록 ({self.blacklist_duration//60}분간 주문 중지)"
+                ))
+            except Exception as alert_error:
+                logger.log_error(alert_error, f"{symbol} 블랙리스트 알림 전송 실패")
+                
+        return failures_count
 
 # 싱글톤 인스턴스
 order_manager = OrderManager()

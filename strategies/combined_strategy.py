@@ -297,7 +297,7 @@ class CombinedStrategy:
             # 3. 통합 신호 계산
             self._update_combined_signal(symbol)
             
-            logger.log_system(f"[전략] {symbol} - 신호 업데이트 완료: 점수={self.signals[symbol]['score']:.2f}, 방향={self.signals[symbol]['direction']}")
+            #logger.log_system(f"[전략] {symbol} - 신호 업데이트 완료: 점수={self.signals[symbol]['score']:.2f}, 방향={self.signals[symbol]['direction']}")
             
         except Exception as e:
             logger.log_warning(f"[전략] {symbol} - 신호 업데이트 중 오류: {str(e)}")
@@ -392,7 +392,7 @@ class CombinedStrategy:
     async def _get_single_strategy_signal(self, symbol: str, strategy_name: str, strategy):
         """단일 전략의 신호 계산 (타임아웃 처리 포함)"""
         try:
-            logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호 요청 시작")
+            #logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호 요청 시작")
             
             try:
                 # 타임아웃 설정
@@ -459,7 +459,7 @@ class CombinedStrategy:
                     'direction': direction_value
                 }
                 
-                logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호: {signal_value:.2f}, 방향: {direction_value}")
+                # logger.log_debug(f"[전략] {symbol} - {strategy_name} 전략 신호: {signal_value:.2f}, 방향: {direction_value}")
             else:
                 # 유효하지 않은 신호 형식
                 logger.log_warning(f"[전략] {symbol} - {strategy_name} 전략 신호 형식 오류: {signal}")
@@ -731,12 +731,12 @@ class CombinedStrategy:
             if symbol in self.price_data and self.price_data[symbol]:
                 current_price = self.price_data[symbol][-1]["price"]
                 price_source = "price_data"
-                logger.log_system(f"[거래] {symbol} - price_data에서 가격 확인: {current_price:,}원")
+                # logger.log_system(f"[거래] {symbol} - price_data에서 가격 확인: {current_price:,}원")
             # 2. signals에서 last_price 확인
             elif symbol in self.signals and "last_price" in self.signals[symbol]:
                 current_price = self.signals[symbol]["last_price"]
                 price_source = "signals"
-                logger.log_system(f"[거래] {symbol} - signals의 last_price에서 가격 확인: {current_price:,}원")
+                # logger.log_system(f"[거래] {symbol} - signals의 last_price에서 가격 확인: {current_price:,}원")
             # 3. API에서 직접 조회
             else:
                 try:
@@ -795,7 +795,7 @@ class CombinedStrategy:
             
             # 전략 신호 강제 업데이트
             await self._update_signals(symbol)
-            logger.log_system(f"[거래] {symbol} - 신호 강제 업데이트 완료")
+            #logger.log_system(f"[거래] {symbol} - 신호 강제 업데이트 완료")
             
             # 신호 계산
             try:
@@ -1275,8 +1275,13 @@ class CombinedStrategy:
                 
                 # 비동기 함수를 동기적으로 실행하기 위한 이벤트 루프 얻기
                 try:
-                    # 현재 이벤트 루프 가져오기 시도
-                    loop = asyncio.get_event_loop()
+                    # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        # 현재 스레드에 이벤트 루프가 없는 경우 새로 생성
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
                     
                     # 루프가 실행중인지 확인
                     if loop.is_running():
@@ -1285,7 +1290,7 @@ class CombinedStrategy:
                             future = asyncio.run_coroutine_threadsafe(self._update_signals(symbol), loop)
                             # 타임아웃 증가: 2초 → 5초
                             future.result(timeout=5.0)  # 타임아웃 시간 증가
-                            logger.log_system(f"[전략] {symbol} - run_coroutine_threadsafe로 신호 업데이트 완료")
+                            #logger.log_system(f"[전략] {symbol} - run_coroutine_threadsafe로 신호 업데이트 완료")
                         except concurrent.futures._base.TimeoutError:
                             # 타임아웃 발생 시 기존 신호 정보 사용
                             logger.log_system(f"[전략] {symbol} - 신호 업데이트 타임아웃 발생, 기존 신호 정보 사용")
@@ -1305,10 +1310,10 @@ class CombinedStrategy:
                             
                             # 타임아웃 설정으로 실행
                             update_success = loop.run_until_complete(run_with_timeout())
-                            if update_success:
-                                logger.log_system(f"[전략] {symbol} - run_until_complete로 신호 업데이트 완료")
-                            else:
-                                logger.log_warning(f"[전략] {symbol} - 신호 업데이트 타임아웃")
+                            #if update_success:
+                            #    logger.log_system(f"[전략] {symbol} - run_until_complete로 신호 업데이트 완료")
+                            #else:
+                            #    logger.log_warning(f"[전략] {symbol} - 신호 업데이트 타임아웃")
                         except Exception as timeout_error:
                             logger.log_warning(f"[전략] {symbol} - 신호 업데이트 중 예외 발생: {str(timeout_error)}")
                 except Exception as loop_error:
@@ -1622,6 +1627,45 @@ class CombinedStrategy:
             )
             
             await alert_system.notify_error(e, "Symbol update error in combined strategy")
+
+    async def enter_position(self, symbol: str, direction: str, strategy_name: str, signal_strength: float, price: float = None):
+        """포지션 진입"""
+        try:
+            # 매수/매도 결정
+            side = "BUY" if direction == "LONG" else "SELL"
+            
+            if price is None:
+                # 현재가 조회
+                price_data = api_client.get_current_price(symbol)
+                if price_data.get("rt_cd") == "0" and "output" in price_data:
+                    price = float(price_data["output"]["stck_prpr"])
+                else:
+                    logger.log_system(f"[포지션진입실패] {symbol} - 현재가 조회 실패")
+                    return {"status": "failed", "reason": "현재가 조회 실패"}
+            
+            # 수량은 OrderManager가 RiskManager를 통해 자동 계산하도록 None으로 전달
+            # 신호 강도 전달 (0~10 범위)
+            result = await order_manager.place_order(
+                symbol=symbol,
+                side=side,
+                quantity=None,  # 리스크 관리자가 자동 계산
+                price=price,
+                order_type="MARKET",
+                strategy=strategy_name,
+                reason=f"signal_{strategy_name}",
+                signal_strength=signal_strength  # 신호 강도 전달
+            )
+            
+            if result["status"] == "success":
+                logger.log_system(f"[포지션진입성공] {symbol} - {side} 포지션 진입 성공")
+                return {"status": "success", "symbol": symbol, "side": side}
+            else:
+                logger.log_system(f"[포지션진입실패] {symbol} - {result.get('reason', '알 수 없는 오류')}")
+                return result
+                
+        except Exception as e:
+            logger.log_error(e, f"{symbol} 포지션 진입 중 오류")
+            return {"status": "failed", "reason": str(e)}
 
 # 싱글톤 인스턴스
 combined_strategy = CombinedStrategy()

@@ -675,11 +675,11 @@ class KISWebSocketClient:
                 self.reconnect_attempts = 0  # 재연결 성공 시 카운터 초기화
                 
                 # 메시지 수신 루프 시작
-                logger.log_system("메시지 수신 루프 재시작...")
+                #logger.log_system("메시지 수신 루프 재시작...")
                 asyncio.create_task(self._receive_messages())
                 
                 # 핑 루프 시작 - 연결 상태 확인용
-                logger.log_system("핑 루프 재시작...")
+                #logger.log_system("핑 루프 재시작...")
                 asyncio.create_task(self._ping_loop())
                 
                 logger.log_system("기본 재연결 성공!")
@@ -883,3 +883,6 @@ class KISWebSocketClient:
 
 # 싱글톤 인스턴스
 ws_client = KISWebSocketClient()
+
+# 별칭 추가 (main.py 등에서 import 오류 해결)
+websocket_client = ws_client

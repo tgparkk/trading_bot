@@ -1,16 +1,26 @@
 """
-주식 자동매매 프로그램 메인
+자동 매매 봇 메인 모듈
 """
+
 import asyncio
+import concurrent.futures
 import signal
 import sys
 import os
-import json
 import time
-import concurrent.futures
-from pathlib import Path
-from datetime import datetime, time as datetime_time, timedelta
-from typing import List, Optional, Dict, Any, Tuple
+import random
+from datetime import datetime, timedelta, time as datetime_time
+from typing import Dict, List, Any, Optional, Tuple
+
+from core.api_client import api_client
+from core.order_manager import order_manager
+from core.account_state import account_state
+from core.websocket_client import websocket_client
+from strategies.combined_strategy import combined_strategy
+from monitoring.alert_system import alert_system
+from utils.logger import logger
+from utils.database import database_manager
+from utils.market_hours import is_market_open, get_next_market_open, format_market_time
 
 # Windows에서 asyncio 관련 경고 해결을 위한 패치
 if sys.platform.startswith('win'):
@@ -82,6 +92,11 @@ class TradingBot:
             # DB 초기화
             database_manager.update_system_status("INITIALIZING")
             
+            # 계좌 상태 관리자 초기화
+            logger.log_system("계좌 상태 관리자 초기화 중...")
+            await account_state.initialize()
+            logger.log_system("계좌 상태 관리자 초기화 완료")
+            
             # 주문 관리자 초기화
             await order_manager.initialize()
             
@@ -99,6 +114,14 @@ class TradingBot:
                         logger.log_warning(f"전략 {name}: get_signal 메서드 부재")
                 else:
                     logger.log_warning(f"전략 {name}: None")
+            
+            # 계좌 정보 확인 및 로깅
+            account_balance = await order_manager.get_account_balance()
+            cash_balance = account_balance.get("cash_balance", 0)
+            if cash_balance > 0:
+                logger.log_system(f"계좌 잔고 확인: {cash_balance:,.0f}원")
+            else:
+                logger.log_warning(f"계좌 잔고 확인 실패 또는 잔고 부족: {cash_balance:,.0f}원")
             
             # 웹소켓 연결 - 개선된 재시도 로직
             websocket_connected = False
@@ -233,6 +256,67 @@ class TradingBot:
         """익절 조건 체크 및 매도 주문 실행"""
         logger.log_system("======== 익절 조건 체크 시작 ========")
         
+        # 매수 후 최소 대기 시간 (10분) 확인
+        current_time = datetime.now()
+        min_holding_time = 10  # 분 단위
+        
+        # 최근 매수 시간 확인 (모든 종목)
+        recent_buys = {}
+        try:
+            # 오늘 날짜 기준으로 매수 기록 확인
+            today = current_time.strftime("%Y-%m-%d")
+            with database_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # 오늘 날짜의 매수 기록 조회
+                query = """
+                SELECT symbol, time, created_at 
+                FROM trades 
+                WHERE side = 'BUY' AND created_at >= ? 
+                ORDER BY created_at DESC
+                """
+                cursor.execute(query, (f"{today} 00:00:00",))
+                for row in cursor.fetchall():
+                    symbol = row['symbol']
+                    time_str = row['time']
+                    
+                    # time_str이 None이면 created_at 필드에서 시간 추출
+                    if time_str is None or time_str == "None" or time_str == "":
+                        # created_at에서 시간 부분만 추출
+                        created_at = row['created_at']
+                        if created_at and isinstance(created_at, str):
+                            # created_at 형식이 "YYYY-MM-DD HH:MM:SS"라고 가정
+                            try:
+                                # created_at에서 시간 부분만 추출
+                                time_parts = created_at.split(" ")
+                                if len(time_parts) > 1:
+                                    time_str = time_parts[1]  # "HH:MM:SS" 부분
+                                else:
+                                    # 시간 정보가 없는 경우 건너뜀
+                                    logger.log_warning(f"{symbol} 매수 기록에 시간 정보 없음: {created_at}")
+                                    continue
+                            except Exception as time_parse_error:
+                                logger.log_warning(f"{symbol} created_at 파싱 실패: {created_at}")
+                                continue
+                    
+                    # 여전히 time_str이 없는 경우 건너뜀
+                    if not time_str or time_str == "None":
+                        logger.log_warning(f"{symbol} 매수 시간 정보를 찾을 수 없음")
+                        continue
+                        
+                    if symbol not in recent_buys:
+                        try:
+                            # 최근 매수 시간 저장
+                            buy_time = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %H:%M:%S")
+                            recent_buys[symbol] = buy_time
+                        except ValueError as time_error:
+                            logger.log_warning(f"{symbol} 매수 시간 파싱 오류: {time_str}, {str(time_error)}")
+                            continue
+            
+            if recent_buys:
+                logger.log_system(f"오늘 매수한 종목 수: {len(recent_buys)}개")
+        except Exception as e:
+            logger.log_error(e, "최근 매수 기록 조회 중 오류")
+        
         # 포지션 정보 가져오기
         try:
             positions = await order_manager.get_positions()
@@ -278,6 +362,44 @@ class TradingBot:
                         avg_price = position_data["avg_price"]
                         current_profit_rate = position_data["profit_rate"]
                         sell_result = {"symbol": symbol, "executed": False}
+                        
+                        # 매수 시간 확인 (DB에서 최근 매수 기록 조회)
+                        try:
+                            buy_record = database_manager.get_latest_trade(symbol, "BUY")
+                            if buy_record:
+                                # 최근 매수 시간 추출
+                                buy_time_str = buy_record.get("time", "")
+                                if buy_time_str:
+                                    # 현재 날짜와 시간 문자열 결합
+                                    today = datetime.now().strftime("%Y-%m-%d")
+                                    buy_datetime_str = f"{today} {buy_time_str}"
+                                    try:
+                                        buy_datetime = datetime.strptime(buy_datetime_str, "%Y-%m-%d %H:%M:%S")
+                                        # 매수 후 경과 시간 계산 (분 단위)
+                                        time_since_buy = (datetime.now() - buy_datetime).total_seconds() / 60
+                                        
+                                        # 수익률에 따른 유연한 홀딩 시간 적용
+                                        min_hold_time = 10  # 기본 10분
+                                        
+                                        # 수익률이 높을수록 최소 홀딩 시간 감소
+                                        if current_profit_rate >= 4.0:  # 4% 이상
+                                            min_hold_time = 2  # 2분만 홀딩
+                                            logger.log_system(f"[수익률 높음] {symbol}: {current_profit_rate:.2f}% 수익으로 최소 홀딩 시간 2분 적용")
+                                        elif current_profit_rate >= 3.0:  # 3% 이상
+                                            min_hold_time = 4  # 4분만 홀딩
+                                            logger.log_system(f"[수익률 양호] {symbol}: {current_profit_rate:.2f}% 수익으로 최소 홀딩 시간 4분 적용")
+                                        elif current_profit_rate >= 2.0:  # 2% 이상
+                                            min_hold_time = 6  # 6분만 홀딩
+                                            logger.log_system(f"[수익률 보통] {symbol}: {current_profit_rate:.2f}% 수익으로 최소 홀딩 시간 6분 적용")
+                                        
+                                        if time_since_buy < min_hold_time:
+                                            logger.log_system(f"[매도 보류] {symbol}: 매수 후 {time_since_buy:.1f}분 경과 (최소 {min_hold_time}분 홀딩 필요)")
+                                            return sell_result
+                                        logger.log_system(f"[매도 검토] {symbol}: 매수 후 {time_since_buy:.1f}분 경과 (최소 대기 시간 충족)")
+                                    except Exception as time_error:
+                                        logger.log_error(time_error, f"{symbol} 매수 시간 파싱 오류")
+                        except Exception as db_error:
+                            logger.log_error(db_error, f"{symbol} 매수 기록 조회 오류")
                         
                         # 손익률이 2% 이상인지 확인
                         if current_profit_rate < 2.0 or qty <= 0:
@@ -338,6 +460,34 @@ class TradingBot:
                 # 각 종목에 대해 비동기 태스크 생성
                 tasks = []
                 for symbol, position_data in held_symbols.items():
+                    # 최근 매수한 종목인지 확인하고 최소 대기 시간을 충족하는지 검사
+                    if symbol in recent_buys:
+                        # 매수 후 경과 시간 계산 (분 단위)
+                        elapsed_minutes = (current_time - recent_buys[symbol]).total_seconds() / 60
+                        
+                        # 현재 수익률 확인
+                        profit_rate = position_data.get("profit_rate", 0)
+                        
+                        # 수익률에 따른 유연한 홀딩 시간 적용
+                        min_hold_time = 10  # 기본 10분
+                        
+                        # 수익률이 높을수록 최소 홀딩 시간 감소
+                        if profit_rate >= 4.0:  # 4% 이상
+                            min_hold_time = 2  # 2분만 홀딩
+                            logger.log_system(f"[수익률 높음] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 2분 적용")
+                        elif profit_rate >= 3.0:  # 3% 이상
+                            min_hold_time = 4  # 4분만 홀딩
+                            logger.log_system(f"[수익률 양호] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 4분 적용")
+                        elif profit_rate >= 2.0:  # 2% 이상
+                            min_hold_time = 6  # 6분만 홀딩
+                            logger.log_system(f"[수익률 보통] {symbol}: {profit_rate:.2f}% 수익으로 최소 홀딩 시간 6분 적용")
+                            
+                        if elapsed_minutes < min_hold_time:
+                            logger.log_system(f"[매도 검토 제외] {symbol}: 매수 후 {elapsed_minutes:.1f}분 경과 (최소 {min_hold_time}분 필요)")
+                            continue
+                        else:
+                            logger.log_system(f"[매도 검토] {symbol}: 매수 후 {elapsed_minutes:.1f}분 경과 (최소 대기 시간 충족)")
+                    
                     tasks.append(process_sell_position(symbol, position_data))
                 
                 # 모든 태스크 완료 대기 및 결과 수집
@@ -361,6 +511,19 @@ class TradingBot:
         sell_reason = "2% 익절 자동 매도"
         force_sell = False
         
+        # 0. 손실 상태인 경우 매도하지 않음 (손실 컷 조건 없음)
+        if calc_profit_rate < 0 or current_profit_rate < 0:
+            logger.log_system(f"[매도 보류] {symbol}: 손실 상태({calc_profit_rate:.2f}%)로 매도하지 않음")
+            return {"should_sell": False, "reason": "손실 상태로 매도 보류"}
+        
+        # 0.5. 긴급 급등 매도 조건 (초단기 급등)
+        if calc_profit_rate >= 4.5 or current_profit_rate >= 4.5:
+            should_sell = True
+            force_sell = True
+            sell_reason = f"급등 수익 확정 매도 ({max(calc_profit_rate, current_profit_rate):.2f}%)"
+            logger.log_system(f"[긴급 매도] {symbol}: 급등으로 인한 즉시 매도 결정 (수익률: {max(calc_profit_rate, current_profit_rate):.2f}%)")
+            return {"should_sell": should_sell, "reason": sell_reason}
+        
         # 1. 고수익 안전장치 - 5% 이상이면 무조건 매도
         if calc_profit_rate >= 5.0 or current_profit_rate >= 5.0:
             should_sell = True
@@ -369,8 +532,14 @@ class TradingBot:
             logger.log_system(f"[전략 무관 매도] {symbol}: 5% 이상 고수익으로 전략 신호와 관계없이 매도")
             return {"should_sell": should_sell, "reason": sell_reason}
         
-        # 2. 손익률 기본 검증 - 최소 2% 이상
-        if (calc_profit_rate >= 2.0 or current_profit_rate >= 2.0) and not force_sell:
+        # 1.5. 낮은 수익률(0.5% 이상 1.0% 미만)인 경우 매도하지 않음 (홀딩 장려)
+        if 0.5 <= calc_profit_rate < 1.0 or 0.5 <= current_profit_rate < 1.0:
+            logger.log_system(f"[매도 보류] {symbol}: 낮은 수익률({calc_profit_rate:.2f}%)로 홀딩 유지")
+            return {"should_sell": False, "reason": "낮은 수익률로 홀딩 유지"}
+        
+        # 2. 손익률 기본 검증 - 최소 2% 이상 (1.5%는 매도하지 않고 홀딩)
+        if ((calc_profit_rate >= 2.0 and current_profit_rate >= 1.5) or 
+            (current_profit_rate >= 2.0 and calc_profit_rate >= 1.5)) and not force_sell:
             # 3. 전략 신호 확인
             try:
                 logger.log_system(f"[전략 확인] {symbol}에 대한 전략 신호 조회 중...")
@@ -403,16 +572,22 @@ class TradingBot:
                         else:
                             logger.log_system(f"[전략 홀딩] {symbol}: 매수 신호로 3.5% 미만 수익 홀딩 (점수: {signal_score:.1f})")
                 else:
-                    # 신호 데이터가 없으면 기본 익절 (안전 장치)
-                    should_sell = True
-                    sell_reason = "전략 데이터 없음, 2% 익절 진행"
-                    logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 기본 익절")
+                    # 신호 데이터가 없으면 더 보수적 기준으로 익절 (2.5% 이상)
+                    if calc_profit_rate >= 2.5 or current_profit_rate >= 2.5:
+                        should_sell = True
+                        sell_reason = "전략 데이터 없음, 2.5% 익절 진행"
+                        logger.log_system(f"[전략 미확인] {symbol}: 전략 데이터 없어 2.5% 익절")
+                    else:
+                        logger.log_system(f"[전략 홀딩] {symbol}: 전략 데이터 없으나 2.5% 미만이라 홀딩")
                     
             except Exception as strategy_error:
-                # 전략 오류 시 기본 익절 진행 (안전 장치)
+                # 전략 오류 시 2.5% 이상일 때만 익절 진행 (안전 장치)
                 logger.log_error(strategy_error, f"{symbol} 전략 신호 확인 중 오류")
-                should_sell = True
-                sell_reason = "전략 확인 오류, 2% 익절 진행"
+                if calc_profit_rate >= 2.5 or current_profit_rate >= 2.5:
+                    should_sell = True
+                    sell_reason = "전략 확인 오류, 2.5% 익절 진행"
+                else:
+                    logger.log_system(f"[전략 오류 홀딩] {symbol}: 전략 오류 발생했으나 2.5% 미만이라 홀딩")
         
         return {"should_sell": should_sell, "reason": sell_reason}
 
@@ -556,7 +731,7 @@ class TradingBot:
             # 계좌 잔고 조회
             account_balance = await order_manager.get_account_balance()
             
-            # 예수금 정보 가져오기
+            # API 응답에서 예수금 정보 가져오기
             cash_balance = account_balance.get("cash_balance", 0.0)
             total_balance = account_balance.get("total_balance", 0.0)
             
@@ -567,12 +742,22 @@ class TradingBot:
                 logger.log_warning(f"예수금이 부족합니다: {cash_balance:,.0f}원")
                 return {"can_invest": False}
             
-            # 투자 금액 설정 (예수금의 50%)
-            total_amount = cash_balance * 0.5
-            max_stocks_to_buy = 3
-            per_stock_amount = total_amount / max_stocks_to_buy
+            # 투자 금액 설정 (예수금의 30% - 기존 50%에서 감소)
+            total_amount = cash_balance * 0.3
             
-            logger.log_system(f"투자 가능 금액: {total_amount:,.0f}원 (예수금의 50%), 종목당 {per_stock_amount:,.0f}원")
+            # 최대 매수 종목 수 증가 (더 작은 금액으로 분산)
+            max_stocks_to_buy = 5  # 3에서 5로 증가
+            
+            # 종목당 금액 계산시 추가 안전 마진 적용 (85%)
+            per_stock_amount = (total_amount / max_stocks_to_buy) * 0.85
+            
+            # 종목당 최대 투자 금액 제한 (30만원)
+            max_per_stock = 300000
+            if per_stock_amount > max_per_stock:
+                per_stock_amount = max_per_stock
+                logger.log_system(f"종목당 투자 금액이 상한선({max_per_stock:,.0f}원)으로 제한되었습니다")
+            
+            logger.log_system(f"투자 가능 금액: {total_amount:,.0f}원 (예수금의 30%), 종목당 최대 {per_stock_amount:,.0f}원, 최대 {max_stocks_to_buy}개 종목")
             
             return {
                 "can_invest": True,
@@ -582,12 +767,12 @@ class TradingBot:
             }
         except Exception as e:
             logger.log_error(e, "계좌 잔고 조회 실패")
-            # 기본값으로 계속 진행
+            # 기본값으로 계속 진행 (더 보수적인 값으로 설정)
             return {
                 "can_invest": True,
-                "total_amount": 1000000,  # 기본값 100만원
-                "per_stock_amount": 333333,  # 기본 종목당 약 33만원
-                "max_stocks_to_buy": 3
+                "total_amount": 500000,  # 기본값 50만원 (100만원에서 감소)
+                "per_stock_amount": 100000,  # 기본 종목당 약 10만원 (33만원에서 감소)
+                "max_stocks_to_buy": 5
             }
 
     def check_buy_signal(self, symbol):
@@ -621,11 +806,11 @@ class TradingBot:
             # 기본 주문 단위 (실제로는 API 조회 필요)
             order_unit = 1
             
-            # 최대 주문 가능 금액 결정 (가용 자금의 90%로 제한하여 안전 마진 확보)
-            max_safe_amount = available_amount * 0.9
+            # 최대 주문 가능 금액 결정 (가용 자금의 80%로 제한하여 안전 마진 확보)
+            max_safe_amount = available_amount * 0.8  # 90%에서 80%로 수정하여 안전 마진 강화
             
-            # 수수료 및 슬리피지 고려 (약 0.3% 추가 비용)
-            fee_rate = 0.003  # 0.3%
+            # 수수료 및 슬리피지 고려 (약 0.5% 추가 비용)
+            fee_rate = 0.005  # 0.5%로 증가 (0.3%에서)
             available_for_order = max_safe_amount / (1 + fee_rate)
             
             # 로깅 - 계산 과정 추적
@@ -640,7 +825,7 @@ class TradingBot:
                 return {"can_order": False}
             
             # 안전 제한 적용
-            max_order_value = min(1000000, available_for_order)  # 최대 100만원 또는 가용 금액 중 작은 값
+            max_order_value = min(500000, available_for_order)  # 최대 50만원으로 제한(100만원에서 변경)
             if initial_quantity * current_price > max_order_value:
                 quantity = int(max_order_value / current_price)
                 logger.log_system(f"주문 조정: {symbol}, 최대 주문 금액 제한으로 수량 조정 {initial_quantity}→{quantity}주")
@@ -648,7 +833,7 @@ class TradingBot:
                 quantity = initial_quantity
                 
             # 최대 주문 수량 제한
-            max_quantity_limit = 1000  # 1천주로 제한
+            max_quantity_limit = 500  # 1천주에서 500주로 제한 감소
             if quantity > max_quantity_limit:
                 quantity_before = quantity
                 quantity = max_quantity_limit
@@ -680,8 +865,8 @@ class TradingBot:
                 # 수량 추가 조정
                 safe_quantity = int((available_amount / (current_price * (1 + fee_rate))))
                 
-                # 안전 마진 추가 (80%로 조정)
-                safe_quantity = int(safe_quantity * 0.8)
+                # 안전 마진 추가 (70%로 조정 - 80%에서 감소)
+                safe_quantity = int(safe_quantity * 0.7)
                 
                 # 주문 단위 조정
                 if order_unit > 1:
@@ -728,24 +913,118 @@ class TradingBot:
                 prev_close = symbol_info["prev_close"]
                 price_change_rate = (current_price - prev_close) / prev_close * 100
                 
-                # 급등 종목 필터링 (전일 대비 10% 이상 상승)
-                if price_change_rate > 10.0:
+                # 급등 종목 필터링 (전일 대비 7% 이상 상승 - 10%에서 하향 조정)
+                if price_change_rate > 7.0:
                     logger.log_system(f"가격 급등으로 매수 제한: {symbol}, 전일대비={price_change_rate:.1f}%")
                     return {"success": False}
             
             # 점수에 따른 투자금액 조정 (6.0-10.0점 범위)
-            score_weight = min(1.0, (signal_score - 6.0) / 4.0 + 0.7)  # 0.7-1.0 범위
+            score_weight = min(1.0, (signal_score - 6.0) / 4.0 + 0.6)  # 0.6-1.0 범위로 조정
             adjusted_amount = min(per_stock_amount * score_weight, remaining_investment)
             
+            # 보수적인 주문을 위해 금액 추가 조정 (최대 70%만 사용)
+            conservative_amount = adjusted_amount * 0.7
+            
+            # 계좌 상태 확인
+            logger.log_system(f"매수 시도 전 계좌 상태 확인: {symbol}")
+            await order_manager.sync_account_state()
+            
             # 주문 수량 및 금액 계산
-            order_info = self.calculate_order_quantity(symbol, current_price, adjusted_amount)
+            order_info = self.calculate_order_quantity(symbol, current_price, conservative_amount)
             if not order_info["can_order"]:
+                logger.log_system(f"주문 수량 계산 결과 주문 불가: {symbol}")
                 return {"success": False}
             
             # 주문 실행
             quantity = order_info["quantity"]
-            order_amount = order_info["order_amount"]  # order_info에서 직접 가져옴
+            order_amount = order_info["order_amount"]
             
+            # 주문 시작 전 충분한 대기 시간 추가 (이전 주문 처리 완료 대기)
+            await asyncio.sleep(1.0)
+            
+            # 대량 주문인 경우 분할 주문 적용
+            if quantity > 200:  # 200주 이상이면 분할 주문
+                split_qty = quantity // 2
+                remainder_qty = quantity - split_qty
+                logger.log_system(f"대량 주문 분할: {symbol}, 원래 수량={quantity}주 → 1차 {split_qty}주 + 2차 {remainder_qty}주")
+                
+                # 1차 주문
+                logger.log_system(f"매수 주문 실행 (1차): {symbol}, 가격={current_price:,.0f}원, 수량={split_qty}주")
+                try:
+                    first_order = await asyncio.wait_for(
+                        order_manager.place_order(
+                            symbol=symbol,
+                            side="BUY",
+                            quantity=split_qty,
+                            price=current_price,
+                            order_type="LIMIT",
+                            strategy="main_bot",
+                            reason="strategy_signal_split_1"
+                        ),
+                        timeout=5.0
+                    )
+                    
+                    if first_order and first_order.get("status") == "success":
+                        logger.log_system(f"✅ 매수 주문 성공 (1차): {symbol}, 주문ID={first_order.get('order_id')}")
+                        
+                        # 1차 주문 성공 후 잠시 대기 (5초로 증가)
+                        await asyncio.sleep(5.0)
+                        
+                        # 2차 주문
+                        logger.log_system(f"매수 주문 실행 (2차): {symbol}, 가격={current_price:,.0f}원, 수량={remainder_qty}주")
+                        second_order = await asyncio.wait_for(
+                            order_manager.place_order(
+                                symbol=symbol,
+                                side="BUY",
+                                quantity=remainder_qty,
+                                price=current_price,
+                                order_type="LIMIT",
+                                strategy="main_bot",
+                                reason="strategy_signal_split_2"
+                            ),
+                            timeout=5.0
+                        )
+                        
+                        if second_order and second_order.get("status") == "success":
+                            logger.log_system(f"✅ 매수 주문 성공 (2차): {symbol}, 주문ID={second_order.get('order_id')}")
+                            success = True
+                        else:
+                            # 2차 주문만 실패 (1차 주문 성공)
+                            error_reason = second_order.get("reason", "알 수 없는 오류")
+                            logger.log_system(f"❌ 매수 주문 실패 (2차): {symbol}, 사유={error_reason}")
+                            # 1차 주문은 성공했으므로 부분 성공으로 처리
+                            success = True
+                            order_amount = split_qty * current_price  # 금액 조정
+                    else:
+                        # 1차 주문 실패
+                        error_reason = first_order.get("reason", "알 수 없는 오류")
+                        logger.log_system(f"❌ 매수 주문 실패 (1차): {symbol}, 사유={error_reason}")
+                        return {"success": False}
+                        
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.log_error(e, f"{symbol} 분할 주문 처리 중 오류")
+                    return {"success": False}
+                
+                # 주문 정보 로깅
+                logger.log_trade(
+                    action="BUY",
+                    symbol=symbol,
+                    price=current_price,
+                    quantity=quantity,  # 원래 의도한 총 수량
+                    reason="전략 신호에 따른 자동 매수 (분할 주문)",
+                    strategy="main_bot",
+                    score=f"{signal_score:.1f}",
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    status="SUCCESS"
+                )
+                
+                # 주문 후 계좌 상태 동기화 (5초 대기 후)
+                await asyncio.sleep(5.0)
+                await order_manager.sync_account_state(force=True)
+                
+                return {"success": True, "order_amount": order_amount}
+            
+            # 일반 주문 (200주 미만)
             logger.log_system(f"매수 주문 실행: {symbol}, 가격={current_price:,.0f}원, 수량={quantity}주, 총액={order_amount:,.0f}원")
             
             try:
@@ -777,6 +1056,10 @@ class TradingBot:
                         time=datetime.now().strftime("%H:%M:%S"),
                         status="SUCCESS"
                     )
+                    
+                    # 주문 후 계좌 상태 동기화 (3초 대기 후)
+                    await asyncio.sleep(3.0)
+                    await order_manager.sync_account_state(force=True)
                     
                     return {"success": True, "order_amount": order_amount}
                 else:

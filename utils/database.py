@@ -213,6 +213,7 @@ class DatabaseManager:
                     current_price REAL,
                     unrealized_pnl REAL,
                     realized_pnl REAL DEFAULT 0,
+                    total_buy_amount REAL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT (kst_datetime()),
                     updated_at TIMESTAMP DEFAULT (kst_datetime())
                 )
@@ -232,7 +233,8 @@ class DatabaseManager:
                     exit_reason TEXT,
                     order_id TEXT,
                     order_type TEXT,
-                    status TEXT
+                    status TEXT,
+                    time TEXT
                 )
             """,
             "performance": """
@@ -308,10 +310,64 @@ class DatabaseManager:
             cursor = conn.cursor()
             for schema in table_schemas.values():
                 cursor.execute(schema)
+            
+            # 기존 테이블에 새 컬럼 추가
+            self._add_missing_columns(conn)
+            
             logger.log_system("Database initialized successfully")
             self._update_timestamps_to_kst(conn)
             conn.commit()
-
+            
+    def _add_missing_columns(self, conn):
+        """기존 테이블에 누락된 컬럼 추가"""
+        try:
+            cursor = conn.cursor()
+            
+            # positions 테이블에 total_buy_amount 컬럼 추가
+            try:
+                cursor.execute("SELECT total_buy_amount FROM positions LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.log_system("positions 테이블에 total_buy_amount 컬럼 추가 중...")
+                cursor.execute("ALTER TABLE positions ADD COLUMN total_buy_amount REAL DEFAULT 0")
+                logger.log_system("positions 테이블에 total_buy_amount 컬럼 추가 완료")
+            
+            # positions 테이블에 total_sell_amount 컬럼 추가
+            try:
+                cursor.execute("SELECT total_sell_amount FROM positions LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.log_system("positions 테이블에 total_sell_amount 컬럼 추가 중...")
+                cursor.execute("ALTER TABLE positions ADD COLUMN total_sell_amount REAL DEFAULT 0")
+                logger.log_system("positions 테이블에 total_sell_amount 컬럼 추가 완료")
+            
+            # positions 테이블에 profit_rate 컬럼 추가
+            try:
+                cursor.execute("SELECT profit_rate FROM positions LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.log_system("positions 테이블에 profit_rate 컬럼 추가 중...")
+                cursor.execute("ALTER TABLE positions ADD COLUMN profit_rate REAL DEFAULT 0")
+                logger.log_system("positions 테이블에 profit_rate 컬럼 추가 완료")
+            
+            # trades 테이블에 time 컬럼 추가
+            try:
+                cursor.execute("SELECT time FROM trades LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.log_system("trades 테이블에 time 컬럼 추가 중...")
+                cursor.execute("ALTER TABLE trades ADD COLUMN time TEXT")
+                logger.log_system("trades 테이블에 time 컬럼 추가 완료")
+            
+            # trades 테이블에 reason 컬럼 추가
+            try:
+                cursor.execute("SELECT reason FROM trades LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.log_system("trades 테이블에 reason 컬럼 추가 중...")
+                cursor.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
+                logger.log_system("trades 테이블에 reason 컬럼 추가 완료")
+                
+            conn.commit()
+        except Exception as e:
+            logger.log_error(e, "컬럼 추가 중 오류 발생")
+            raise
+    
     def _update_timestamps_to_kst(self, conn):
         """기존 데이터베이스의 타임스탬프를 KST로 변환"""
         try:
@@ -379,6 +435,21 @@ class DatabaseManager:
         if end_date:
             conditions["created_at"] = ("<=", end_date)
         return self._execute_query("SELECT", "trades", conditions=conditions, order_by="-created_at")
+    
+    def get_latest_trade(self, symbol: str, side: str = None) -> Optional[Dict[str, Any]]:
+        """특정 종목의 최근 거래 기록 조회
+        
+        Args:
+            symbol: 종목 코드
+            side: 거래 방향 (BUY/SELL)
+            
+        Returns:
+            최신 거래 기록 또는 None
+        """
+        conditions = {"symbol": symbol}
+        if side:
+            conditions["side"] = side
+        return self._execute_query("SELECT", "trades", conditions=conditions, order_by="-created_at", limit=1, single=True)
     
     def save_performance(self, performance_data: Dict[str, Any]):
         """성과 기록 저장"""
@@ -649,5 +720,57 @@ class DatabaseManager:
             logger.log_error(e, "최신 토큰 조회 실패")
             return None
 
+    def update_database_schema(self):
+        """데이터베이스 스키마 강제 업데이트"""
+        try:
+            logger.log_system("데이터베이스 스키마 강제 업데이트 시작...")
+            with self.get_connection() as conn:
+                self._add_missing_columns(conn)
+            logger.log_system("데이터베이스 스키마 업데이트 완료")
+            return True
+        except Exception as e:
+            logger.log_error(e, "데이터베이스 스키마 업데이트 실패")
+            return False
+
+    def get_recent_trades_by_strategy(self, strategy: str, limit: int = 20):
+        """특정 전략의 최근 거래 내역 조회"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM trades 
+                    WHERE strategy = ? 
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (strategy, limit))
+                
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.log_error(e, f"Failed to get recent trades for strategy {strategy}")
+            return []
+    
+    def get_recent_trades_by_symbol(self, symbol: str, limit: int = 10):
+        """특정 종목의 최근 거래 내역 조회"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM trades 
+                    WHERE symbol = ? 
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (symbol, limit))
+                
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.log_error(e, f"Failed to get recent trades for symbol {symbol}")
+            return []
+
 # 싱글톤 인스턴스 생성
 database_manager = DatabaseManager()
+
+# 데이터베이스 스키마 즉시 업데이트 실행
+try:
+    database_manager.update_database_schema()
+except Exception as e:
+    logger.log_error(e, "자동 스키마 업데이트 실패 - 나중에 다시 시도하세요")
