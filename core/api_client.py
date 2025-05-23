@@ -53,11 +53,11 @@ class KISAPIClient:
             self.account_no = os.getenv("KIS_ACCOUNT_NO")
             
             # 설정에서 값 가져오기
-            self.config = config.get("api", APIConfig.from_env())
-            self.base_url = self.config.base_url
-            self.app_key = self.config.app_key
-            self.app_secret = self.config.app_secret
-            self.account_no = self.config.account_no
+            #self.config = config.get("api", APIConfig.from_env())
+            #self.base_url = self.config.base_url
+            #self.app_key = self.config.app_key
+            #self.app_secret = self.config.app_secret
+            #self.account_no = self.config.account_no
             
             # 앱 시작 시 파일에서 유효한 토큰 로드
             self.load_token_from_file()

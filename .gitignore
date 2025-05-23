@@ -10,6 +10,7 @@ ENV/
 
 # Environment variables
 .env
+token_info.json
 
 # Logs
 logs/
