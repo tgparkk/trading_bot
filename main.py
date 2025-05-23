@@ -770,7 +770,7 @@ class TradingBot:
             signal_score = signal_info.get("score", 0)
             
             # 매수 신호 및 최소 점수(6.0) 확인
-            if signal_direction == "BUY" and signal_score >= 6.0:
+            if signal_direction == "BUY" and signal_score >= 5.0:
                 return {"has_signal": True, "score": signal_score}
                 
             return {"has_signal": False}
